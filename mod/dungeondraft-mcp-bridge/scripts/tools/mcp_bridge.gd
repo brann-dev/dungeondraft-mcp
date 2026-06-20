@@ -21,7 +21,7 @@ var script_class = "tool"
 
 const HOST := "127.0.0.1"
 const PORT := 8787
-const PROTOCOL_VERSION := 5
+const PROTOCOL_VERSION := 6
 
 # Commands that get wrapped in a Dungeondraft undo record (see _record_and_dispatch).
 const CREATE_CMDS := [
@@ -29,7 +29,7 @@ const CREATE_CMDS := [
 	"add_portal", "add_roof", "add_text", "duplicate_object",
 ]
 const TRANSFORM_CMDS := ["move_element", "modify_object"]
-const TERRAIN_CMDS := ["fill_terrain", "paint_terrain"]
+const TERRAIN_CMDS := ["fill_terrain", "fill_region", "paint_terrain"]
 
 # SelectTool.GetSelectableType() integer -> readable kind.
 const KIND_NAMES := {
@@ -268,6 +268,7 @@ func _safe_dispatch(req : Dictionary) -> Dictionary:
 		# --- terrain ---
 		"set_terrain_slot": return _set_terrain_slot(req)
 		"fill_terrain": return _fill_terrain(req)
+		"fill_region": return _fill_region(req)
 		"paint_terrain": return _paint_terrain(req)
 		# --- modify / delete ---
 		"move_element": return _move_element(req)
@@ -620,6 +621,127 @@ func _paint_terrain(req : Dictionary) -> Dictionary:
 	level.Terrain.Paint(slot, brush, offset, tex_pos, rate)
 	level.Terrain.UpdateSplat()
 	return _ok({ "painted_slot": slot, "experimental": true })
+
+
+# Fill a region (rectangle or polygon) with a terrain slot, in woxel coords.
+# Unlike fill_terrain (whole level), this paints only inside the shape, so you
+# can floor a single room. Pass `rect:[x,y,w,h]` OR `points:[[x,y]...]` (a
+# polygon, >= 3 points). The shape is mapped to texture space and rasterized
+# directly into the splat weight image (see below), not via Terrain.Paint.
+func _fill_region(req : Dictionary) -> Dictionary:
+	var level = Global.World.GetCurrentLevel()
+	if level == null: return _err("no map open")
+	var slot = int(req.get("slot", 0))
+	var rate = float(req.get("rate", 1.0))
+	if req.has("asset"):
+		var tex = _asset_tex("Terrain", req["asset"])
+		if tex == null: return _err("could not load terrain asset: " + str(req["asset"]))
+		level.Terrain.SetTexture(tex, slot)
+
+	# Gather the shape's world-space polygon (rect -> 4 corners).
+	var poly := []
+	if req.has("rect"):
+		var r = req["rect"]
+		if typeof(r) != TYPE_ARRAY or r.size() < 4:
+			return _err("'rect' must be [x, y, w, h]")
+		var x = float(r[0]); var y = float(r[1]); var w = float(r[2]); var h = float(r[3])
+		poly = [Vector2(x, y), Vector2(x + w, y), Vector2(x + w, y + h), Vector2(x, y + h)]
+	elif req.has("points"):
+		for p in req["points"]:
+			poly.append(Vector2(float(p[0]), float(p[1])))
+		if poly.size() < 3:
+			return _err("'points' needs >= 3 [x,y] pairs for a polygon")
+	else:
+		return _err("provide 'rect':[x,y,w,h] or 'points':[[x,y]...]")
+
+	# Map the polygon into texture space and find its pixel bounding box.
+	var tpoly := []
+	var mn = Vector2(INF, INF)
+	var mx = Vector2(-INF, -INF)
+	for wp in poly:
+		var tp = level.Terrain.WorldToTexture(wp)
+		tpoly.append(tp)
+		mn.x = min(mn.x, tp.x); mn.y = min(mn.y, tp.y)
+		mx.x = max(mx.x, tp.x); mx.y = max(mx.y, tp.y)
+	var origin = Vector2(floor(mn.x), floor(mn.y))
+	var bw = int(ceil(mx.x - origin.x))
+	var bh = int(ceil(mx.y - origin.y))
+	if bw < 1 or bh < 1:
+		return _err("region is too small in texture space")
+
+	# Terrain.Paint is a black box that didn't write the splat in testing, so we
+	# edit the splat image directly: splatImage RGBA = weights of slots 0..3,
+	# splatImage2 = slots 4..7. For each pixel inside the polygon, drive the
+	# target slot's channel toward 1 by `rate` and pull the other channels down,
+	# so the weights still blend (sum ~1). Then RestoreSplat to push it back.
+	var local := []
+	for tp in tpoly:
+		local.append(tp - origin)
+	var which = 0 if slot < 4 else 1
+	var ch = slot % 4  # 0=R,1=G,2=B,3=A within the chosen splat image
+	var img = level.Terrain.CloneSplatImage() if which == 0 else level.Terrain.CloneSplatImage2()
+	if img == null: return _err("could not read splat image for slot " + str(slot))
+	var iw = img.get_width()
+	var ih = img.get_height()
+	rate = clamp(rate, 0.0, 1.0)
+	var painted := 0
+	img.lock()
+	for py in range(bh):
+		var iy = int(origin.y) + py
+		if iy < 0 or iy >= ih:
+			continue
+		for px in range(bw):
+			var ix = int(origin.x) + px
+			if ix < 0 or ix >= iw:
+				continue
+			if not _point_in_poly(Vector2(px + 0.5, py + 0.5), local):
+				continue
+			img.set_pixel(ix, iy, _splat_set_channel(img.get_pixel(ix, iy), ch, rate))
+			painted += 1
+	img.unlock()
+	if which == 0:
+		level.Terrain.RestoreSplat(img)
+	else:
+		level.Terrain.RestoreSplat2(img)
+	level.Terrain.UpdateSplat()
+
+	return _ok({
+		"filled_slot": slot, "shape": ("rect" if req.has("rect") else "polygon"),
+		"texture_bbox": [_vec(origin), [origin.x + bw, origin.y + bh]],
+		"pixels": painted,
+	})
+
+
+# Push channel `ch` (0=R,1=G,2=B,3=A) of an RGBA splat weight toward 1 by `rate`,
+# scaling the remaining channels down so the four weights still sum to ~1.
+func _splat_set_channel(c : Color, ch : int, rate : float) -> Color:
+	var w = [c.r, c.g, c.b, c.a]
+	var target = w[ch] + (1.0 - w[ch]) * rate
+	var rest = 1.0 - target
+	var others = (w[0] + w[1] + w[2] + w[3]) - w[ch]
+	for i in range(4):
+		if i == ch:
+			w[i] = target
+		elif others > 0.0001:
+			w[i] = w[i] / others * rest
+		else:
+			w[i] = 0.0
+	return Color(w[0], w[1], w[2], w[3])
+
+
+# Even-odd point-in-polygon test (ray cast). `poly` is an array of Vector2.
+func _point_in_poly(pt : Vector2, poly : Array) -> bool:
+	var inside = false
+	var n = poly.size()
+	var j = n - 1
+	for i in range(n):
+		var a = poly[i]
+		var b = poly[j]
+		if ((a.y > pt.y) != (b.y > pt.y)) and \
+				(pt.x < (b.x - a.x) * (pt.y - a.y) / (b.y - a.y) + a.x):
+			inside = not inside
+		j = i
+	return inside
 
 
 # ---------------------------------------------------------------------------

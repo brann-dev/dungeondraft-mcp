@@ -303,6 +303,34 @@ def fill_terrain(slot: int = 0, asset: str = "") -> dict:
 
 
 @mcp.tool()
+def fill_region(
+    rect: Optional[list[float]] = None,
+    points: Optional[list[list[float]]] = None,
+    slot: int = 0,
+    asset: str = "",
+    rate: float = 1.0,
+) -> dict:
+    """Fill only a region with a terrain slot (e.g. floor a single room), in woxel coords.
+
+    Unlike fill_terrain (whole level), this paints inside a shape. Provide ONE of:
+      rect: [x, y, w, h] axis-aligned rectangle, or
+      points: [[x,y], ...] a polygon (>= 3 points).
+    asset: optional Terrain asset to assign to the slot first.
+    rate: paint strength 0..1 (1 = fully replace). Undoable via undo().
+    """
+    if (rect is None) == (points is None):
+        raise ValueError("provide exactly one of 'rect' or 'points'")
+    params: dict = {"slot": slot, "rate": rate}
+    if rect is not None:
+        params["rect"] = rect
+    if points is not None:
+        params["points"] = points
+    if asset:
+        params["asset"] = asset
+    return bridge.request("fill_region", **params)
+
+
+@mcp.tool()
 def paint_terrain(
     slot: int = 0,
     x: Optional[float] = None,
