@@ -3,6 +3,7 @@ name = "dungeondraft-mcp"
 version = "0.1.0"
 description = "MCP server bridging an LLM to a running Dungeondraft instance via its modding API"
 requires-python = ">=3.10"
+license = "MIT"
 dependencies = ["mcp>=1.2.0"]
 
 [project.scripts]

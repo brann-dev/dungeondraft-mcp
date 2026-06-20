@@ -182,7 +182,8 @@ mod/dungeondraft-mcp-bridge/   the Dungeondraft mod (copy into DD's mods folder)
 server/                        the Python MCP server
   dungeondraft_mcp/server.py   MCP tool definitions
   dungeondraft_mcp/bridge_client.py  TCP/JSON client
-  test_bridge.py               standalone smoke test (run this first)
+  test_bridge.py               standalone per-command smoke test
+  demo_build.py                builds a visible sample room and leaves it
 PROTOCOL.md                    wire protocol + implementation notes
 ```
 
@@ -190,3 +191,7 @@ PROTOCOL.md                    wire protocol + implementation notes
 
 Built against the [Dungeondraft Modding API](https://megasploot.github.io/DungeondraftModdingAPI/).
 Engine is Godot 3.4.2, so the GDScript uses Godot 3 networking class names.
+
+## License
+
+[MIT](LICENSE).
