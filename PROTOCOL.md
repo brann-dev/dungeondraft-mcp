@@ -53,6 +53,15 @@ Coordinates are **woxel** (world pixel) space; map center is in
 
 `kind` ∈ `objects, walls, lights, paths, portals, roofs, texts`. An element
 descriptor is `{ id, kind, position[x,y], rotation(deg), scale, asset? }`.
+
+`portals` includes **wall-mounted** portals (doors/windows), which live inside
+each wall's `Portals` array rather than `level.Portals` — `list_elements` walks
+the walls to surface them. A wall portal describes as `{ id, kind:"wall_portal",
+wall_id, position[x,y], normal[x,y], facing(deg), radius, closed, asset? }`
+where `position` is the door's gap center and `normal` is the outward unit
+vector (perpendicular to the wall, pointing out of the room). To route a road to
+a door, draw to `position`; offset along `normal` by a tile or so to stop just
+outside the threshold. `get_element` on a door id returns the same descriptor.
 Text elements describe as `{ id, kind:"text", position[x,y], text, size?,
 color?, font? }` (a DD Text extends LineEdit, so it has no `scale`/`rotation`/
 `asset` and is positioned by `rect_position`). Font name+size are applied

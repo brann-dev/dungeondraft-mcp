@@ -21,7 +21,7 @@ var script_class = "tool"
 
 const HOST := "127.0.0.1"
 const PORT := 8787
-const PROTOCOL_VERSION := 9
+const PROTOCOL_VERSION := 10
 
 # Commands that get wrapped in a Dungeondraft undo record (see _record_and_dispatch).
 const CREATE_CMDS := [
@@ -354,11 +354,72 @@ func _list_elements(req : Dictionary) -> Dictionary:
 		return _err("unknown kind '%s' (one of: %s)" % [kind, COLLECTIONS.keys()])
 	var limit = int(req.get("limit", 200))
 	var out := []
+	# Wall-mounted portals (doors/windows) live inside each wall's `Portals`
+	# array, NOT in level.Portals — so listing "portals" must also walk the
+	# walls, or hand-placed doors are invisible to query.
+	if kind == "portals":
+		for wall in level.Walls.get_children():
+			var wp = wall.get("Portals")
+			if wp == null:
+				continue
+			for portal in wp:
+				if out.size() >= limit:
+					break
+				out.append(_describe_wall_portal(portal, wall))
 	for node in _collection(level, kind).get_children():
 		if out.size() >= limit:
 			break
 		out.append(_describe(node))
 	return _ok({ "kind": kind, "count": out.size(), "elements": out })
+
+
+# Describe a wall-mounted portal (a door/window living in a wall's Portals
+# array). Reports its world `position`, the door's half-width `radius`, and an
+# outward `normal` (unit vector pointing OUT of the building) plus `facing` in
+# degrees. The normal is `Direction` (the along-wall tangent) rotated 90°,
+# oriented to point away from the wall's centroid — so a caller can route a road
+# to the door and offset along `normal` to stop at the threshold, with no
+# knowledge of how the door was placed (it's pure geometry from the data).
+func _describe_wall_portal(portal, wall) -> Dictionary:
+	var pos = portal.get("position")
+	if pos == null or not (pos is Vector2):
+		pos = Vector2()
+	var tangent = portal.get("Direction")
+	if tangent == null or not (tangent is Vector2) or tangent.length() < 0.001:
+		tangent = Vector2(1, 0)
+	else:
+		tangent = tangent.normalized()
+	# Outward normal = tangent rotated 90 degrees, flipped to face away from the
+	# wall's centroid (which is inside the enclosed room for a building loop).
+	var normal = Vector2(-tangent.y, tangent.x)
+	var centroid = _wall_centroid(wall)
+	if centroid != null and (pos - centroid).dot(normal) < 0.0:
+		normal = -normal
+	var d := {
+		"id": _id(portal), "kind": "wall_portal", "wall_id": _id(wall),
+		"position": _vec(pos), "normal": _vec(normal),
+		"facing": rad2deg(normal.angle()),
+		"closed": bool(portal.get("Closed")),
+	}
+	var r = portal.get("Radius")
+	if r != null:
+		d["radius"] = float(r)
+	var tex = portal.get("Texture")
+	if tex != null and tex is Texture:
+		d["asset"] = tex.resource_path
+	return d
+
+
+# Mean of a wall's points — used to orient a portal's normal outward. Returns
+# null for a wall with no usable points.
+func _wall_centroid(wall):
+	var pts = wall.get("Points")
+	if pts == null or pts.size() == 0:
+		return null
+	var sum = Vector2()
+	for p in pts:
+		sum += p
+	return sum / pts.size()
 
 
 func _get_element(req : Dictionary) -> Dictionary:
@@ -1346,6 +1407,12 @@ func _is_text(node) -> bool:
 
 
 func _describe(node) -> Dictionary:
+	# A wall-mounted portal carries a WallID script var and lives under its wall;
+	# describe it richly (position + outward normal) like list_elements does.
+	if node.get("WallID") != null and node.get("Direction") != null:
+		var parent = node.get_parent()
+		if parent != null:
+			return _describe_wall_portal(node, parent)
 	if _is_text(node):
 		# DD Text extends LineEdit (Control): position is rect_position, the
 		# string is the inherited `.text`, and size/color are the `fontSize` /
