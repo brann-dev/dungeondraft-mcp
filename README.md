@@ -82,24 +82,30 @@ working on Godot 3.4.2, so this should just pass.)
 
 ### 3. Install and wire up the MCP server
 
-```bash
-cd server
-pip install -e .        # or: uv pip install -e .
-```
-
-Register it with your MCP client. For **Claude Code**:
+Install into a dedicated venv (most distros' system Python is externally
+managed, so a venv keeps the entrypoint clean and stable):
 
 ```bash
-claude mcp add dungeondraft -- dungeondraft-mcp
+python -m venv .venv
+.venv/bin/pip install -e ./server
 ```
 
-Or add to a client config (e.g. Claude Desktop `claude_desktop_config.json`):
+This creates the `.venv/bin/dungeondraft-mcp` entrypoint. Register it with your
+MCP client using its **absolute path**. For **Claude Code**:
+
+```bash
+claude mcp add dungeondraft -s user -- "$PWD/.venv/bin/dungeondraft-mcp"
+```
+
+Restart Claude Code so the server loads (`/mcp` shows its status and tools).
+Or add to a client config (e.g. Claude Desktop `claude_desktop_config.json`),
+using the absolute path:
 
 ```json
 {
   "mcpServers": {
     "dungeondraft": {
-      "command": "dungeondraft-mcp"
+      "command": "/abs/path/to/dungeondraft-mcp/.venv/bin/dungeondraft-mcp"
     }
   }
 }
