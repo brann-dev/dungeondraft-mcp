@@ -1,0 +1,9 @@
+{
+	"name": "MCP Bridge",
+	"unique_id": "BrandonFlorian.MCPBridge",
+	"version": "0.1.0",
+	"author": "Brandon Florian",
+	"description": "Exposes a localhost TCP/JSON bridge so an external MCP server can drive the open map.",
+	"dd_version": "1.1.0.0",
+	"dependencies": []
+}
