@@ -116,11 +116,12 @@ frame what you want to inspect.
 | `get_camera` | — | `{ position[x,y], zoom, viewport_size[w,h] }` |
 | `set_camera` | `x?`, `y?`, `zoom?` | camera state |
 | `focus_element` | `id`, `zoom?` | `{ id, focused[x,y], camera{} }` — centers on the element (any kind) |
-| `fit_elements` | `ids[]`, `pad=0.15` | `{ fit, missing[], center[x,y], camera{} }` — frames the bounding box of the ids |
+| `fit_elements` | `ids[]`, `pad=0.15` | `{ fit, missing[], center[x,y], bounds[[minx,miny],[maxx,maxy]], camera{} }` — frames the union of the ids' world bounds |
 
-`focus_element`/`fit_elements` use a representative position per element:
-props/lights/portals use `position`, texts use `rect_position`, and walls/paths/
-roofs use the centroid of their `Points`.
+`focus_element`/`fit_elements` use each element's **world-space bounding rect**:
+`GlobalRect` for walls/paths, the Control rect for texts, a prop's `Rect`, or a
+zero-size rect at the node position as a fallback. `focus_element` centers on
+the rect's midpoint; `fit_elements` frames the union of all rects.
 
 ### History
 

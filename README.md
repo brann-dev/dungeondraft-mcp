@@ -133,8 +133,30 @@ Adding a capability is symmetric — one handler on each side:
 2. **Server** (`server/dungeondraft_mcp/server.py`): add an `@mcp.tool()` that
    calls `bridge.request("my_command", ...)`.
 
-Good next targets: wall-mounted portals (`Wall.AddPortal`), pattern shapes
-(floors), and grouping a batch of edits into a single undo step.
+Good next targets: pattern shapes (floors), region-scoped terrain fill, and
+grouping a batch of edits into a single undo step.
+
+### Dev loop (read this before iterating on the mod)
+
+Two things will bite you if you don't know them up front:
+
+- **Editing the mod and the server are different reload paths.** GDScript
+  changes in `mcp_bridge.gd` take effect when you **reload the mod inside
+  Dungeondraft** (or restart DD). New or changed `@mcp.tool()` definitions in
+  `server.py` only appear after the **MCP server process restarts** — in Claude
+  Code that means `/mcp` → reconnect `dungeondraft` (or restart the client).
+  The install is editable (`pip install -e`), so you never reinstall; you just
+  cycle the process. Adding a *new tool* needs **both** reloads (mod for the
+  handler, server for the tool registration); changing an *existing* handler's
+  behavior needs only the mod reload.
+
+- **There's no live `eval`/introspect command**, so you can't probe a running
+  node's properties without a mod reload per hypothesis. When a DD API behaves
+  unexpectedly (e.g. a setter that doesn't stick), the cheapest debugging trick
+  is to **return intermediate state in the response** — e.g. stash before/after
+  values in a `_dbg` field — so one reload tells you where a value changes
+  instead of guessing across several. That's how the text font-size bug
+  (TextTool.UpdateText overwriting the node) was pinned down in a single cycle.
 
 ## Layout
 

@@ -781,9 +781,11 @@ func _focus_element(req : Dictionary) -> Dictionary:
 	return _ok({ "id": req.get("id"), "focused": _vec(pos), "camera": _camera_state(cam) })
 
 
-# Frame a set of elements: center on their bounding box and zoom so it fits the
-# viewport with `pad` (fraction of extra margin, default 0.15). Ids that don't
-# resolve or lack a position are skipped and reported in `missing`.
+# Frame a set of elements: center on the UNION of their world-space bounding
+# rects and zoom so it fits the viewport with `pad` (fraction of extra margin,
+# default 0.15). Ids that don't resolve or lack bounds are skipped and reported
+# in `missing`. Using real rects (not anchor points) keeps wall loops and large
+# props correctly centered.
 func _fit_elements(req : Dictionary) -> Dictionary:
 	var cam = _camera()
 	if cam == null: return _err("camera not available")
@@ -794,49 +796,79 @@ func _fit_elements(req : Dictionary) -> Dictionary:
 	var missing := []
 	for ident in ids:
 		var node = Global.World.GetNodeByID(int(ident))
-		var pos = null
+		var rect = null
 		if node != null:
-			pos = _element_position(node)
-		if pos == null:
+			rect = _element_rect(node)
+		if rect == null:
 			missing.append(ident)
 			continue
-		mn.x = min(mn.x, pos.x); mn.y = min(mn.y, pos.y)
-		mx.x = max(mx.x, pos.x); mx.y = max(mx.y, pos.y)
+		mn.x = min(mn.x, rect.position.x); mn.y = min(mn.y, rect.position.y)
+		mx.x = max(mx.x, rect.end.x); mx.y = max(mx.y, rect.end.y)
 		used += 1
 	if used == 0:
-		return _err("no elements with a position to fit")
+		return _err("no elements with bounds to fit")
 	var center = (mn + mx) * 0.5
 	cam.global_position = center
 	# Zoom so the box fits: zoom (Camera2D) = world_span / viewport_span.
 	var pad = 1.0 + float(req.get("pad", 0.15))
-	var span = (mx - mn) * pad
+	var raw = mx - mn
 	var vp = _viewport_size()
-	# Guard against a zero-span (single point / colinear) box.
-	span.x = max(span.x, 1.0)
-	span.y = max(span.y, 1.0)
-	var z = max(span.x / max(vp.x, 1.0), span.y / max(vp.y, 1.0))
+	var z
+	if raw.length() < 1.0:
+		# Degenerate box (one point, no derivable bounds): use a sane close zoom
+		# instead of slamming to the minimum and burying the camera in a pixel.
+		z = 1.0
+	else:
+		var span = raw * pad
+		z = max(span.x / max(vp.x, 1.0), span.y / max(vp.y, 1.0))
 	_apply_zoom(cam, z)
 	return _ok({
 		"fit": used, "missing": missing,
-		"center": _vec(center), "camera": _camera_state(cam),
+		"center": _vec(center), "bounds": [_vec(mn), _vec(mx)],
+		"camera": _camera_state(cam),
 	})
 
 
-# Resolve a representative world position for any element kind. Props/lights/
-# portals carry it on `position`; a Text is a Control (rect_position); walls/
-# paths/roofs keep their geometry in `Points` with position often at origin, so
-# use the centroid of their points when available.
+# A representative world point for any element kind: the center of its bounding
+# rect (so walls/large props focus on their middle, not their anchor).
 func _element_position(node):
+	var rect = _element_rect(node)
+	if rect != null:
+		return rect.position + rect.size * 0.5
+	return null
+
+
+# A world-space Rect2 enclosing an element's visual extent, or null if none can
+# be determined. Prefers the engine's own bounds (GlobalRect on walls/paths,
+# get_global_rect on the LineEdit-based Text), then a prop's Rect, then a wall/
+# path's Points, finally a zero-size rect at the node position.
+func _element_rect(node):
 	if _is_text(node):
-		return node.rect_position
+		return node.get_global_rect()  # Control: world-space rect
+	var grect = node.get("GlobalRect")
+	if grect != null and grect is Rect2 and grect.size.length() > 0.0:
+		return grect
+	var prect = node.get("Rect")
+	if prect != null and prect is Rect2 and prect.size.length() > 0.0:
+		return prect
+	# A prop's Rect can be empty until DD computes it; derive bounds from the
+	# Sprite's texture size * node scale, centered on the node position.
+	if node is Node2D:
+		var spr = node.get("Sprite")
+		if spr != null and spr.has_method("get_texture") and spr.get_texture() != null:
+			var tsize = spr.get_texture().get_size() * node.scale
+			if tsize.length() > 0.0:
+				return Rect2(node.position - tsize * 0.5, tsize)
 	var pts = node.get("Points")
 	if pts != null and pts is PoolVector2Array and pts.size() > 0:
-		var sum = Vector2()
+		var mn = Vector2(INF, INF)
+		var mx = Vector2(-INF, -INF)
 		for p in pts:
-			sum += p
-		return sum / pts.size()
+			mn.x = min(mn.x, p.x); mn.y = min(mn.y, p.y)
+			mx.x = max(mx.x, p.x); mx.y = max(mx.y, p.y)
+		return Rect2(mn, mx - mn)
 	if node is Node2D:
-		return node.position
+		return Rect2(node.position, Vector2())
 	return null
 
 
