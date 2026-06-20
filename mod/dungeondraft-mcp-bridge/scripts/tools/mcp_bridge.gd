@@ -438,19 +438,83 @@ func _add_light(req : Dictionary) -> Dictionary:
 	return _ok({ "id": _id(light), "position": _vec(light.position) })
 
 
+# Find the wall segment nearest to `pos`. Returns
+# { wall, point_index, closest, direction, distance } or null if no walls.
+# A wall is a polyline of `Points`; segment i goes Points[i] -> Points[i+1]
+# (plus the closing segment when Loop). We pick the segment whose nearest
+# point to `pos` is closest overall, and report that segment's unit tangent.
+func _nearest_wall_segment(level, pos : Vector2):
+	var best = null
+	for wall in level.Walls.get_children():
+		var pts = wall.get("Points")
+		if pts == null or pts.size() < 2:
+			continue
+		var seg_count = pts.size() - 1
+		if wall.get("Loop"):
+			seg_count = pts.size()
+		for i in range(seg_count):
+			var a = pts[i]
+			var b = pts[(i + 1) % pts.size()]
+			var closest = _closest_point_on_segment(pos, a, b)
+			var dist = pos.distance_to(closest)
+			if best == null or dist < best.distance:
+				var dir = (b - a)
+				if dir.length() > 0.001:
+					dir = dir.normalized()
+				best = {
+					"wall": wall, "point_index": i, "closest": closest,
+					"direction": dir, "distance": dist,
+				}
+	return best
+
+
+func _closest_point_on_segment(p : Vector2, a : Vector2, b : Vector2) -> Vector2:
+	var ab = b - a
+	var len2 = ab.dot(ab)
+	if len2 < 0.0001:
+		return a
+	var t = clamp((p - a).dot(ab) / len2, 0.0, 1.0)
+	return a + ab * t
+
+
 func _add_portal(req : Dictionary) -> Dictionary:
 	var level = Global.World.GetCurrentLevel()
 	if level == null: return _err("no map open")
 	var tex = _asset_tex("Portals", req.get("asset", ""))
 	if tex == null: return _err("could not load portal asset: " + str(req.get("asset")))
 	var pos = _xy(req, Global.World.WoxelDimensions * 0.5)
+	var closed = bool(req.get("closed", false))
+	var radius = float(req.get("radius", 64.0))
+	# mount: "wall" (default) snaps onto the nearest wall and cuts a gap;
+	# "free" forces a freestanding portal. snap_max caps how far (woxels) a
+	# wall may be and still capture the portal.
+	var mount = str(req.get("mount", "wall"))
+	var snap_max = float(req.get("snap_max", 256.0))
+	if mount != "free":
+		var seg = _nearest_wall_segment(level, pos)
+		if seg != null and seg.distance <= snap_max:
+			# Mount onto the wall: snap to the segment, face along it, and let
+			# the wall remake its lines so the portal cuts a gap.
+			var flip = bool(req.get("flip", false))
+			var portal = seg.wall.AddPortal(
+				tex, closed, seg.closest, seg.direction,
+				seg.point_index, radius, flip)
+			seg.wall.RemakeLines()
+			if portal == null: return _err("Wall.AddPortal returned null")
+			return _ok({
+				"id": _id(portal), "kind": "wall_portal",
+				"position": _vec(seg.closest), "wall_id": _id(seg.wall),
+				"snapped": _vec(seg.closest), "snap_distance": seg.distance,
+			})
+		if mount == "wall" and not req.get("fallback_free", true):
+			return _err("no wall within snap_max (%d) of portal position" % int(snap_max))
+	# Freestanding fallback (no wall nearby, or mount == "free").
 	level.CreateFreestandingPortal(
-		tex, pos, bool(req.get("closed", false)),
-		float(req.get("radius", 64.0)), deg2rad(float(req.get("rotation", 0.0))))
+		tex, pos, closed, radius, deg2rad(float(req.get("rotation", 0.0))))
 	# CreateFreestandingPortal returns void; the new portal is the last child.
 	var kids = level.Portals.get_children()
 	if kids.empty(): return _err("portal was not created")
-	return _ok({ "id": _id(kids[kids.size() - 1]), "position": _vec(pos) })
+	return _ok({ "id": _id(kids[kids.size() - 1]), "kind": "portal", "position": _vec(pos) })
 
 
 func _add_roof(req : Dictionary) -> Dictionary:
@@ -466,24 +530,47 @@ func _add_roof(req : Dictionary) -> Dictionary:
 	return _ok({ "id": _id(roof), "point_count": pts.size() })
 
 
-# A Dungeondraft Text extends Godot LineEdit, so the string is the inherited
-# `.text` property. SetFont takes (name, size); SetFontSize/SetFontColor are setters.
+# A Dungeondraft Text extends Godot LineEdit: the string is the inherited
+# `.text`, position is `rect_position`, and size/color must be applied through
+# the TextTool (see below) because UpdateText repaints from the tool's settings.
 func _add_text(req : Dictionary) -> Dictionary:
 	var level = Global.World.GetCurrentLevel()
 	if level == null: return _err("no map open")
 	var text = level.Texts.CreateText()
-	text.position = _xy(req, Global.World.WoxelDimensions * 0.5)
+	# A Text extends LineEdit (a Control): place it via rect_position, not the
+	# Node2D `.position` (which silently does nothing on a Control).
+	text.rect_position = _xy(req, Global.World.WoxelDimensions * 0.5)
 	text.text = str(req.get("text", ""))
+	# Font/size/color: TextTool.UpdateText() repaints the focused Text from the
+	# TOOL's settings (FontSize/FontColor), overwriting anything set directly on
+	# the node. So drive it through the tool: stash the tool's values, set ours,
+	# repaint, then restore the tool so the user's UI state is unchanged.
+	# A fresh Text reports fontSize 0 until repainted, so default to 32 (DD's
+	# standard) rather than the node's pre-paint value when no size is given.
 	var size = int(req.get("size", 32))
-	if req.has("size"):
-		text.SetFontSize(size)
-	if req.has("color"):
-		text.SetFontColor(_color(req["color"], Color(1, 1, 1)))
+	if size <= 0:
+		size = 32
+	var col = _color(req.get("color", ""), Color(0, 0, 0, 1))
+	var font_name = str(req.get("font", text.fontName))
 	if req.has("font"):
-		text.SetFont(str(req["font"]), size)
+		text.SetFont(font_name, size)  # font name has no tool-member path
 	if Global.Editor.Tools.has("TextTool"):
-		Global.Editor.Tools["TextTool"].UpdateText(text)
-	return _ok({ "id": _id(text) })
+		var tt = Global.Editor.Tools["TextTool"]
+		var saved_size = tt.FontSize
+		var saved_color = tt.FontColor
+		tt.FontSize = size
+		tt.FontColor = col
+		tt.focus = text
+		tt.UpdateText(text)
+		tt.FontSize = saved_size
+		tt.FontColor = saved_color
+	else:
+		# No tool available: best-effort direct set.
+		text.fontSize = size
+		text.fontColor = col
+		text.SetFont(font_name, size)
+		text.SetFontColor(col)
+	return _ok({ "id": _id(text), "size": text.fontSize, "color": "#" + text.fontColor.to_html(false) })
 
 
 # ---------------------------------------------------------------------------
@@ -537,6 +624,9 @@ func _paint_terrain(req : Dictionary) -> Dictionary:
 func _move_element(req : Dictionary) -> Dictionary:
 	var node = _resolve(req)
 	if node == null: return _err("no element with id " + str(req.get("id")))
+	if _is_text(node):
+		node.rect_position = _xy(req, node.rect_position)
+		return _ok({ "id": req.get("id"), "position": _vec(node.rect_position) })
 	if not (node is Node2D): return _err("element is not movable")
 	node.position = _xy(req, node.position)
 	return _ok({ "id": req.get("id"), "position": _vec(node.position) })
@@ -670,7 +760,32 @@ func _resolve(req : Dictionary):
 	return Global.World.GetNodeByID(int(req["id"]))
 
 
+# A DD Text node extends LineEdit (a Control), so GetSelectableType doesn't
+# classify it and it has no Node2D `.position` — special-case it up front.
+func _is_text(node) -> bool:
+	return (node is Control) and node.has_method("SetFontSize")
+
+
 func _describe(node) -> Dictionary:
+	if _is_text(node):
+		# DD Text extends LineEdit (Control): position is rect_position, the
+		# string is the inherited `.text`, and size/color are the `fontSize` /
+		# `fontColor` members. LineEdit has no rotation, so none is reported.
+		var td := {
+			"id": _id(node), "kind": "text",
+			"position": _vec(node.rect_position),
+			"text": node.text,
+		}
+		var fsize = node.get("fontSize")
+		if fsize != null:
+			td["size"] = int(fsize)
+		var fcolor = node.get("fontColor")
+		if fcolor != null and fcolor is Color:
+			td["color"] = "#" + fcolor.to_html(false)
+		var fname = node.get("fontName")
+		if fname != null and str(fname) != "":
+			td["font"] = str(fname)
+		return td
 	var stool = Global.Editor.Tools["SelectTool"]
 	var t = stool.GetSelectableType(node)
 	var d := { "id": _id(node), "kind": KIND_NAMES.get(t, "unknown") }

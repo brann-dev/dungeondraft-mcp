@@ -204,13 +204,35 @@ def add_portal(
     y: Optional[float] = None,
     closed: bool = False,
     radius: float = 64.0,
+    mount: str = "wall",
+    snap_max: float = 256.0,
+    flip: bool = False,
+    fallback_free: bool = True,
     rotation: float = 0.0,
 ) -> dict:
-    """Add a freestanding portal (door/window) at a woxel position. Returns the new element id.
+    """Add a door/window portal at a woxel position. Returns the new element id.
 
-    asset: a Portals asset path. closed: blocks light. radius: half-width. rotation: degrees.
+    By default the portal MOUNTS on the nearest wall and the wall cuts a gap
+    around it (like placing a door by hand).
+
+    asset: a Portals asset path. closed: blocks light.
+    radius: door half-width (~128 ≈ 1-tile door, ~256 ≈ 2-tile door).
+    mount: 'wall' (snap to nearest wall, cut gap) or 'free' (freestanding).
+    snap_max: max woxel distance a wall may be and still capture the portal.
+    flip: reverse the door's facing. fallback_free: if mount='wall' but no wall
+    is within snap_max, place a freestanding portal instead of erroring.
+    rotation: degrees, freestanding only.
     """
-    params = {"asset": asset, "closed": closed, "radius": radius, "rotation": rotation}
+    params = {
+        "asset": asset,
+        "closed": closed,
+        "radius": radius,
+        "mount": mount,
+        "snap_max": snap_max,
+        "flip": flip,
+        "fallback_free": fallback_free,
+        "rotation": rotation,
+    }
     if x is not None:
         params["x"] = x
     if y is not None:
@@ -242,18 +264,22 @@ def add_text(
     color: str = "",
     font: str = "",
 ) -> dict:
-    """(Experimental) Add a text label at a woxel position. Returns the new element id.
+    """Add a text label at a woxel position. Returns the new element id and size.
 
-    The text-content setter is undocumented in the modding API, so this may not
-    populate the string correctly on all Dungeondraft versions — verify visually.
+    size: font size in points (default ~32). color: '#rrggbb' (default black).
+    font: a DD font name; omit to keep the default font.
     """
-    params = {"text": text, "color": color, "font": font}
+    params = {"text": text}
     if x is not None:
         params["x"] = x
     if y is not None:
         params["y"] = y
     if size is not None:
         params["size"] = size
+    if color:
+        params["color"] = color
+    if font:
+        params["font"] = font
     return bridge.request("add_text", **params)
 
 

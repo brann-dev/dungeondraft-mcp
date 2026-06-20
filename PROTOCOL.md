@@ -53,6 +53,11 @@ Coordinates are **woxel** (world pixel) space; map center is in
 
 `kind` ∈ `objects, walls, lights, paths, portals, roofs, texts`. An element
 descriptor is `{ id, kind, position[x,y], rotation(deg), scale, asset? }`.
+Text elements describe as `{ id, kind:"text", position[x,y], text, size?,
+color?, font? }` (a DD Text extends LineEdit, so it has no `scale`/`rotation`/
+`asset` and is positioned by `rect_position`). Font name+size are applied
+together via `SetFont` because `SetFontSize` alone doesn't stick on a fresh
+node; default color is black.
 
 ### Create (each returns `{ id, ... }`)
 
@@ -62,7 +67,7 @@ descriptor is `{ id, kind, position[x,y], rotation(deg), scale, asset? }`.
 | `draw_wall` | `points[[x,y]...]`, `asset?`, `loop=false`, `shadow=true`, `type=0`, `joint=1`, `color?` |
 | `draw_path` | `points[[x,y]...]`, `asset`, `layer=0`, `sorting=0`, `smoothness?`, `width?` |
 | `add_light` | `x?`, `y?`, `color?`, `energy=1`, `range=1`, `shadows=true`, `asset?` |
-| `add_portal` | `asset`, `x?`, `y?`, `closed=false`, `radius=64`, `rotation=0` |
+| `add_portal` | `asset`, `x?`, `y?`, `closed=false`, `radius=64`, `mount="wall"`, `snap_max=256`, `flip=false`, `fallback_free=true`, `rotation=0` |
 | `add_roof` | `points[[x,y]...]`, `asset`, `width=256`, `type=0`, `sorting=0` |
 | `add_text` | `text`, `x?`, `y?`, `size?`, `color?`, `font?` |
 
@@ -136,5 +141,12 @@ Ctrl+Z in Dungeondraft.
   snapshot; terrain ops restore a cloned splat image.
 - **`paint_terrain`** — brush footprint and `Paint(...)` offset/position
   semantics are inferred; `fill_terrain` / `set_terrain_slot` are well-defined.
-- **`add_portal`** — only freestanding portals (`Level.CreateFreestandingPortal`);
-  wall-mounted portals (`Wall.AddPortal`) aren't exposed yet.
+- **`add_portal`** — defaults to **wall-mounted** (`Wall.AddPortal`): snaps to
+  the nearest wall within `snap_max` woxels, faces along that wall segment, and
+  the wall remakes its lines so the portal cuts a gap (matching manual door
+  placement). `radius` is the door half-width (≈128 = a 1-tile door, ≈256 = a
+  2-tile door). Pass `mount:"free"` for a freestanding portal
+  (`Level.CreateFreestandingPortal`); when `mount:"wall"` and no wall is near it
+  falls back to freestanding unless `fallback_free:false`. `flip` reverses the
+  facing. The response `kind` is `"wall_portal"` when mounted, `"portal"` when
+  freestanding.
