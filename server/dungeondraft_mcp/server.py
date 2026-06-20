@@ -403,6 +403,22 @@ def clear_selection() -> dict:
     return bridge.request("clear_selection")
 
 
+# --------------------------------------------------------------------------
+# History
+# --------------------------------------------------------------------------
+
+@mcp.tool()
+def undo() -> dict:
+    """Undo the last map edit (same as Ctrl+Z in Dungeondraft). Reverses your own create/move/modify/terrain actions."""
+    return bridge.request("undo")
+
+
+@mcp.tool()
+def redo() -> dict:
+    """Redo the last undone map edit (same as Ctrl+Y in Dungeondraft)."""
+    return bridge.request("redo")
+
+
 def main() -> None:
     mcp.run()
 

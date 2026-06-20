@@ -25,9 +25,9 @@ The mod opens a TCP server inside Dungeondraft and polls it every frame from the
 forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
 
 > **Status: working.** Confirmed end-to-end against Dungeondraft on **Godot
-> 3.4.2** — raw TCP from the modding sandbox works, no fallback needed. 27 tools
-> across query / create / modify / terrain / levels / selection / capture (see
-> below). `paint_terrain` is the lone experimental one.
+> 3.4.2** — raw TCP from the modding sandbox works, no fallback needed. 29 tools
+> across query / create / modify / terrain / levels / selection / capture /
+> undo (see below). `paint_terrain` is the lone experimental one.
 
 ## What the AI can do
 
@@ -41,6 +41,9 @@ forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
 - **Levels:** `add_level`, `set_level`.
 - **See:** `screenshot` (current window) and `export_map` (clean full-map
   render) return images, so the model can look at its own work and iterate.
+- **Undo:** every create / move / modify / terrain edit registers a Dungeondraft
+  undo record (Ctrl+Z works), and `undo` / `redo` drive that stack so the model
+  can reverse its own changes.
 
 Every element is referenced by an integer `id`; create and list calls return
 ids you feed back into edit calls. Coordinates are woxel (pixel) space — call
@@ -120,9 +123,8 @@ Adding a capability is symmetric — one handler on each side:
 2. **Server** (`server/dungeondraft_mcp/server.py`): add an `@mcp.tool()` that
    calls `bridge.request("my_command", ...)`.
 
-Good next targets: undo integration (`Global.Editor.History.CreateCustomRecord`
-so AI edits are Ctrl-Z-able), wall-mounted portals (`Wall.AddPortal`), and
-pattern shapes (floors).
+Good next targets: wall-mounted portals (`Wall.AddPortal`), pattern shapes
+(floors), and grouping a batch of edits into a single undo step.
 
 ## Layout
 

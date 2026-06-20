@@ -97,6 +97,20 @@ server uses a temp path and reads it back as an image).
 | `screenshot` | `path` | `{ path, width, height }` — window grab, synchronous |
 | `export_map` | `path`, `ppi=40` | `{ path, ppi, async }` — full-map render on a background thread; poll `path` for the file |
 
+### History
+
+Reversible map edits (creates, `move_element`, `modify_object`, `fill_terrain`,
+`paint_terrain`) register a Dungeondraft undo record automatically, so Ctrl+Z
+works. These commands drive that same stack programmatically:
+
+| cmd | params | result |
+| --- | --- | --- |
+| `undo` | — | `{ undo: true }` |
+| `redo` | — | `{ redo: true }` |
+
+`delete_element` is **not** auto-undoable (it frees the node). Levels, selection
+and capture commands are not recorded.
+
 `color` accepts `"#rrggbb"` / `"rrggbb"` or `[r,g,b]` / `[r,g,b,a]` floats 0..1.
 `type` for walls: 0=auto,1=manual,2=cave; for roofs: 0=gable,1=hip,2=dormer.
 
@@ -112,6 +126,11 @@ server uses a temp path and reads it back as an image).
 - **`export_map`** — `Exporter.Start(0, ppi, path)` writes asynchronously; if
   DD chunks very large maps into multiple files the single-path read may need
   adjusting. Verify on big maps.
+- **`undo` / `redo`** — drive `Global.Editor.History.Undo()/Redo()`, guarded by
+  `has_method` since the History reference page isn't published. If the method
+  names differ on a DD version, the command returns an error and Ctrl+Z still
+  works in the UI. Create-redo *replays* the original command, so the redone
+  element gets a fresh `node_id` (the old id becomes stale after an undo/redo).
 - **`paint_terrain`** — brush footprint and `Paint(...)` offset/position
   semantics are inferred; `fill_terrain` / `set_terrain_slot` are well-defined.
 - **`add_portal`** — only freestanding portals (`Level.CreateFreestandingPortal`);

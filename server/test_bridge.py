@@ -95,6 +95,25 @@ def main() -> int:
         check("select_elements", lambda: bridge.request("select_elements", ids=created_ids))
         check("clear_selection", lambda: bridge.request("clear_selection"))
 
+    # --- undo / redo round trip: place an object, undo it, redo it ---
+    def undo_round_trip():
+        before = bridge.request("get_status")["counts"]["objects"]
+        made = bridge.request("place_object", asset=obj_asset, x=cx - 200, y=cy)
+        after_create = bridge.request("get_status")["counts"]["objects"]
+        bridge.request("undo")
+        after_undo = bridge.request("get_status")["counts"]["objects"]
+        bridge.request("redo")
+        after_redo = bridge.request("get_status")["counts"]["objects"]
+        # track whatever exists now so cleanup removes it
+        for el in bridge.request("list_elements", kind="objects")["elements"]:
+            if el["id"] not in created_ids:
+                created_ids.append(el["id"])
+        if not (after_create == before + 1 and after_undo == before and after_redo == before + 1):
+            raise BridgeError(f"counts before={before} create={after_create} undo={after_undo} redo={after_redo}")
+        return f"object count {before}->{after_create} undo->{after_undo} redo->{after_redo}"
+
+    check("undo/redo", undo_round_trip)
+
     # --- cleanup: delete everything we made ---
     deleted = 0
     for eid in created_ids:
