@@ -48,12 +48,10 @@ Coordinates are **woxel** (world pixel) space; map center is
 
 ## Known unknowns (verify before relying on)
 
-- **TCP allowed at all?** The DD modding docs never confirm networking is
-  unsandboxed. Strong circumstantial evidence says yes (`OS`, `File`, `load` all
-  work). The mod prints `[mcp-bridge] listening ...` to the DD console on
-  success. If you see neither that line nor the port-in-use alert, the sandbox
-  blocked `TCP_Server` — fall back to a file-watch transport (the mod polls a
-  request file via `File` in `update()` and writes a response file).
+- **TCP allowed at all?** CONFIRMED working on Dungeondraft / Godot 3.4.2 — the
+  modding sandbox permits `TCP_Server`. (If a future DD/Godot version ever locks
+  this down, the fallback is a file-watch transport: the mod polls a request file
+  via `File` in `update()` and writes a response file.)
 - **`draw_wall`** — wall texture category (`"Walls"`) and the coordinate space
   for `AddWall` are inferred from examples, not documented. Check visually.
 - **Terrain / paths** — not implemented yet; `Terrain.Paint` needs a brush

@@ -24,10 +24,10 @@ The mod opens a TCP server inside Dungeondraft and polls it every frame from the
 `update(delta)` hook; the Python side exposes each capability as an MCP tool and
 forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
 
-> **Status: prototype.** `ping` / `get_status` / `list_assets` / `place_object`
-> are built on documented API calls. `draw_wall` is experimental. One assumption
-> is unverified until you run it: that DD's modding sandbox permits TCP at all
-> (see step 2).
+> **Status: working prototype.** `ping` / `get_status` / `list_assets` /
+> `place_object` are confirmed end-to-end against Dungeondraft on **Godot 3.4.2**
+> — raw TCP from the modding sandbox works, no fallback needed. `draw_wall` is
+> still experimental (coordinate space / texture category unverified).
 
 ## Setup
 
@@ -121,4 +121,4 @@ PROTOCOL.md                    wire protocol + known unknowns
 ## Credits
 
 Built against the [Dungeondraft Modding API](https://megasploot.github.io/DungeondraftModdingAPI/).
-Engine is Godot 3.5.x, so the GDScript uses Godot 3 networking class names.
+Engine is Godot 3.4.2, so the GDScript uses Godot 3 networking class names.

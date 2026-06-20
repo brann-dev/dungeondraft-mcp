@@ -4,7 +4,7 @@
 # newline-delimited JSON protocol (see PROTOCOL.md) so an external MCP server
 # can drive the currently-open map.
 #
-# Engine: Dungeondraft runs Godot 3.5.x, so this uses the Godot 3 networking
+# Engine: Dungeondraft runs Godot 3.4.2, so this uses the Godot 3 networking
 # class names (TCP_Server / StreamPeerTCP) and the connect(sig, self, "method")
 # signal form. Mod tool scripts receive a per-frame update(delta) callback but
 # NOT _process / _input, so all socket polling happens in update().
