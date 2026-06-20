@@ -256,6 +256,43 @@ def add_roof(
 
 
 @mcp.tool()
+def place_pattern(
+    asset: str,
+    rect: Optional[list[float]] = None,
+    points: Optional[list[list[float]]] = None,
+    category: str = "Patterns",
+    color: str = "",
+    rotation: Optional[float] = None,
+    z: int = -100,
+) -> dict:
+    """Place a tiled floor/pattern shape (the Building Tool's "Floor" / Pattern Shape).
+
+    Draws an actual tiled floor (wood planks, tile, brick, ...) that renders
+    BELOW objects, distinct from terrain. Provide ONE of:
+      rect: [x, y, w, h] axis-aligned rectangle, or
+      points: [[x,y], ...] a polygon (>= 3 points), all in woxels.
+    asset: a pattern asset path from list_assets(category=...).
+    category: which asset bank — 'Patterns', 'Patterns Colorable', 'Materials',
+      'Simple Tiles', or 'Smart Tiles'.
+    color: optional '#rrggbb' tint. rotation: pattern rotation in degrees.
+    z: absolute z_index. Default -100 sits below objects (z 0) and above terrain
+      shapes (z -200). Raise toward 0+ to overlay on top.
+    """
+    if (rect is None) == (points is None):
+        raise ValueError("provide exactly one of 'rect' or 'points'")
+    params: dict = {"asset": asset, "category": category, "z": z}
+    if rect is not None:
+        params["rect"] = rect
+    if points is not None:
+        params["points"] = points
+    if color:
+        params["color"] = color
+    if rotation is not None:
+        params["rotation"] = rotation
+    return bridge.request("place_pattern", **params)
+
+
+@mcp.tool()
 def add_text(
     text: str,
     x: Optional[float] = None,

@@ -70,6 +70,7 @@ node; default color is black.
 | `add_portal` | `asset`, `x?`, `y?`, `closed=false`, `radius=64`, `mount="wall"`, `snap_max=256`, `flip=false`, `fallback_free=true`, `rotation=0` |
 | `add_roof` | `points[[x,y]...]`, `asset`, `width=256`, `type=0`, `sorting=0` |
 | `add_text` | `text`, `x?`, `y?`, `size?`, `color?`, `font?` |
+| `place_pattern` | `asset`, `rect=[x,y,w,h]` **or** `points=[[x,y]...]`, `category="Patterns"`, `color?`, `rotation?` |
 
 ### Terrain
 
@@ -177,6 +178,14 @@ Ctrl+Z in Dungeondraft.
   **globally** (everywhere that slot is weighted), so to texture one region you
   assign the slot once, then raise that slot's weight only inside the region
   (what `fill_region` / `paint_terrain` do).
+- **`place_pattern`** — draws a tiled-floor shape via `PatternShapes.DrawRect` /
+  `DrawPolygon`, then applies the texture with `PatternShape.SetOptions(tex,
+  color, rotation)` (the draw call alone leaves the shape untextured). New shapes
+  land in the tool's default "Layer 100" (z 100, above the Objects node at z 0),
+  so to render the floor **below** objects we set `z_as_relative = false` and an
+  absolute `z_index` (default `z` = -100, between FloorShapes at -200 and Objects
+  at 0). Do **not** use `PatternShapeTool.SetLayer()` on an uncreated index — it
+  hard-crashes the mod (GDScript has no try/catch; valid range undocumented).
 - **`add_portal`** — defaults to **wall-mounted** (`Wall.AddPortal`): snaps to
   the nearest wall within `snap_max` woxels, faces along that wall segment, and
   the wall remakes its lines so the portal cuts a gap (matching manual door

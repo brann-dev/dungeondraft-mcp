@@ -21,7 +21,7 @@ var script_class = "tool"
 
 const HOST := "127.0.0.1"
 const PORT := 8787
-const PROTOCOL_VERSION := 6
+const PROTOCOL_VERSION := 7
 
 # Commands that get wrapped in a Dungeondraft undo record (see _record_and_dispatch).
 const CREATE_CMDS := [
@@ -265,6 +265,7 @@ func _safe_dispatch(req : Dictionary) -> Dictionary:
 		"add_portal": return _add_portal(req)
 		"add_roof": return _add_roof(req)
 		"add_text": return _add_text(req)
+		"place_pattern": return _place_pattern(req)
 		# --- terrain ---
 		"set_terrain_slot": return _set_terrain_slot(req)
 		"fill_terrain": return _fill_terrain(req)
@@ -534,6 +535,71 @@ func _add_roof(req : Dictionary) -> Dictionary:
 	roof.Set(pts, float(req.get("width", 256.0)), int(req.get("type", 0)))  # type: 0 gable,1 hip,2 dormer
 	roof.SetTileTexture(tex)
 	return _ok({ "id": _id(roof), "point_count": pts.size() })
+
+
+# Place a tiled floor/pattern shape (the "Floor" / Pattern Shape Tool in the UI).
+# The shape's texture is set on the PatternShapeTool, then DrawRect/DrawPolygon
+# rasterizes the shape into the pattern layer. Pass `rect:[x,y,w,h]` OR
+# `points:[[x,y]...]`. `category` selects the asset bank ("Patterns",
+# "Patterns Colorable", "Materials", "Simple Tiles", "Smart Tiles").
+func _place_pattern(req : Dictionary) -> Dictionary:
+	var level = Global.World.GetCurrentLevel()
+	if level == null: return _err("no map open")
+	if not Global.Editor.Tools.has("PatternShapeTool"):
+		return _err("PatternShapeTool not available")
+	var category = str(req.get("category", "Patterns"))
+	var tex = _asset_tex(category, req.get("asset", ""))
+	if tex == null: return _err("could not load pattern asset: " + str(req.get("asset")))
+
+	var shapes = level.PatternShapes
+	var tool = Global.Editor.Tools["PatternShapeTool"]
+	tool.Texture = tex
+	# NOTE: layer switching is intentionally not exposed. tool.SetLayer() on an
+	# index DD hasn't created hard-crashes the mod (GDScript has no try/catch)
+	# and the valid index range is undocumented. New shapes go to the tool's
+	# current layer.
+	var color = _color(req.get("color", ""), Color(1, 1, 1))
+	var rotation = float(req.get("rotation", 0.0))
+	tool.Color = color
+	if tool.get("Rotation") != null:
+		tool.Rotation.value = rotation
+
+	var before := shapes.GetShapes().size()
+	var kind : String
+	if req.has("rect"):
+		var r = req["rect"]
+		if typeof(r) != TYPE_ARRAY or r.size() < 4:
+			return _err("'rect' must be [x, y, w, h]")
+		shapes.DrawRect(Rect2(float(r[0]), float(r[1]), float(r[2]), float(r[3])), false)
+		kind = "rect"
+	elif req.has("points"):
+		var pts = _points(req["points"])
+		if pts.size() < 3:
+			return _err("'points' needs >= 3 [x,y] pairs for a polygon")
+		shapes.DrawPolygon(pts, false)
+		kind = "polygon"
+	else:
+		return _err("provide 'rect':[x,y,w,h] or 'points':[[x,y]...]")
+
+	# DrawRect/DrawPolygon create the shape but don't apply the texture, so set
+	# it on the new shape directly via SetOptions(texture, color, rotation).
+	#
+	# Z-ORDER: new shapes land in the tool's default "Layer 100" node, whose
+	# z_index is 100 — ABOVE the Objects node (z 0), so the floor would cover
+	# furniture. The shape's own z_index is z_as_relative, i.e. an offset from
+	# that 100. To sit below objects we use an ABSOLUTE z: set z_as_relative=false
+	# and z_index=`z` (default -100, between FloorShapes at -200 and Objects at 0).
+	var all = shapes.GetShapes()
+	var result := { "shape": kind, "category": category, "shape_count": all.size() }
+	if all.size() > before and all.size() > 0:
+		var shape = all[all.size() - 1]
+		if shape.has_method("SetOptions"):
+			shape.SetOptions(tex, color, rotation)
+		shape.z_as_relative = false
+		shape.z_index = int(req.get("z", -100))
+		result["id"] = _id(shape)
+		result["z_index"] = shape.z_index
+	return _ok(result)
 
 
 # A Dungeondraft Text extends Godot LineEdit: the string is the inherited

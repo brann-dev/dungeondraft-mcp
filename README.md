@@ -25,7 +25,7 @@ The mod opens a TCP server inside Dungeondraft and polls it every frame from the
 forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
 
 > **Status: working.** Confirmed end-to-end against Dungeondraft on **Godot
-> 3.4.2** — raw TCP from the modding sandbox works, no fallback needed. 34 tools
+> 3.4.2** — raw TCP from the modding sandbox works, no fallback needed. 35 tools
 > across query / create / modify / terrain / levels / selection / capture /
 > camera / undo (see below).
 
@@ -34,7 +34,8 @@ forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
 - **Inspect:** `get_status`, `list_levels`, `list_elements`, `get_element`,
   `list_asset_categories`, `list_assets` (with substring search).
 - **Create:** `place_object`, `draw_wall`, `draw_path`, `add_light`,
-  `add_portal`, `add_roof`, `add_text`.
+  `add_portal`, `add_roof`, `add_text`, `place_pattern` (tiled floor shapes —
+  wood planks, tile, brick — rendered below objects).
 - **Terrain:** `set_terrain_slot`, `fill_terrain` (whole level), `fill_region`
   (a rect/polygon, e.g. one room's floor), `paint_terrain` (a soft brush).
 - **Edit:** `move_element`, `modify_object`, `duplicate_object`,
