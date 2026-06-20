@@ -86,6 +86,7 @@ It is undo-recorded like the other terrain ops.
 | `fill_terrain` | `slot=0`, `asset?` |
 | `fill_region` | `rect=[x,y,w,h]` **or** `points=[[x,y]...]`, `slot=0`, `asset?`, `rate=1` |
 | `paint_terrain` | `slot=0`, `x?`, `y?`, `radius=64`, `rate=1`, `asset?` |
+| `paint_path` | `points=[[x,y]...]`, `slot=0`, `radius=96`, `rate=1`, `asset?` |
 
 ### Modify / delete / levels / selection
 
@@ -169,11 +170,15 @@ Ctrl+Z in Dungeondraft.
   uses its own. Create ops detach/re-attach the node (remove_child / add_child,
   keeping a reference and a stable id); transform ops restore a property
   snapshot; terrain ops restore a cloned splat image.
-- **`paint_terrain` / `fill_region`** — both edit the splat weight image
-  directly (`CloneSplatImage` → raise the target slot's channel per pixel →
+- **`paint_terrain` / `fill_region` / `paint_path`** — all edit the splat weight
+  image directly (`CloneSplatImage` → raise the target slot's channel per pixel →
   `RestoreSplat`) rather than `Terrain.Paint(...)`, which does not modify the
-  splat from a mod context. `paint_terrain` uses a soft radial falloff (a
-  brush); `fill_region` is a hard rect/polygon. Both are undoable.
+  splat from a mod context. `paint_terrain` uses a soft radial falloff (a single
+  circular brush); `fill_region` is a hard rect/polygon. `paint_path` rasterizes
+  a continuous stroke along a polyline by measuring each pixel's distance to the
+  nearest segment and applying the same smoothstep falloff once — a uniform-width
+  ribbon for roads/trails, with no gaps or double-painted overlaps (the reason
+  stamping many `paint_terrain` dabs reads as dotty). All three are undoable.
 - **terrain splat** — `splatImage` is RGBA = weights of slots 0–3; `splatImage2`
   = slots 4–7. `set_terrain_slot` / `SetTexture(tex, slot)` swap a slot's texture
   **globally** (everywhere that slot is weighted), so to texture one region you

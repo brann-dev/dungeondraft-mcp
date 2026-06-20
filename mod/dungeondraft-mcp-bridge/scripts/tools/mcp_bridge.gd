@@ -21,7 +21,7 @@ var script_class = "tool"
 
 const HOST := "127.0.0.1"
 const PORT := 8787
-const PROTOCOL_VERSION := 8
+const PROTOCOL_VERSION := 9
 
 # Commands that get wrapped in a Dungeondraft undo record (see _record_and_dispatch).
 const CREATE_CMDS := [
@@ -29,7 +29,7 @@ const CREATE_CMDS := [
 	"add_portal", "add_roof", "add_text", "duplicate_object",
 ]
 const TRANSFORM_CMDS := ["move_element", "modify_object"]
-const TERRAIN_CMDS := ["fill_terrain", "fill_region", "paint_terrain"]
+const TERRAIN_CMDS := ["fill_terrain", "fill_region", "paint_terrain", "paint_path"]
 
 # SelectTool.GetSelectableType() integer -> readable kind.
 const KIND_NAMES := {
@@ -272,6 +272,7 @@ func _safe_dispatch(req : Dictionary) -> Dictionary:
 		"fill_terrain": return _fill_terrain(req)
 		"fill_region": return _fill_region(req)
 		"paint_terrain": return _paint_terrain(req)
+		"paint_path": return _paint_path(req)
 		# --- modify / delete ---
 		"move_element": return _move_element(req)
 		"modify_object": return _modify_object(req)
@@ -819,6 +820,90 @@ func _paint_terrain(req : Dictionary) -> Dictionary:
 	img.unlock()
 	_close_splat(level, sp.which, img)
 	return _ok({ "painted_slot": slot, "pixels": painted })
+
+
+# Paint a continuous terrain stroke along a polyline (a road/trail) in one call.
+# Unlike stamping many `paint_terrain` dabs (whose overlaps double-paint and whose
+# spacing the caller has to eyeball), this rasterizes a uniform ribbon: for each
+# pixel near the line it measures the distance to the NEAREST segment and applies
+# the soft falloff once, so the whole route has constant width and clean edges.
+# `points` is a woxel polyline (>= 2 [x,y] pairs); `radius` is the half-width.
+func _paint_path(req : Dictionary) -> Dictionary:
+	var level = Global.World.GetCurrentLevel()
+	if level == null: return _err("no map open")
+	var slot = int(req.get("slot", 0))
+	var radius = float(req.get("radius", 96.0))
+	var rate = clamp(float(req.get("rate", 1.0)), 0.0, 1.0)
+	if not req.has("points"):
+		return _err("provide 'points':[[x,y]...] (>= 2 points)")
+	var pts = req["points"]
+	if typeof(pts) != TYPE_ARRAY or pts.size() < 2:
+		return _err("'points' needs >= 2 [x,y] pairs for a path")
+	if req.has("asset"):
+		var tex = _asset_tex("Terrain", req["asset"])
+		if tex == null: return _err("could not load terrain asset: " + str(req["asset"]))
+		level.Terrain.SetTexture(tex, slot)
+
+	# Map the polyline into texture space; radius scales by the woxel->texture
+	# ratio (same conversion paint_terrain uses for a single dab).
+	var tscale = float(level.Terrain.width) / max(Global.World.WoxelDimensions.x, 1.0)
+	var trad = max(radius * tscale, 0.5)
+	var tpts := []
+	var mn = Vector2(INF, INF)
+	var mx = Vector2(-INF, -INF)
+	for p in pts:
+		var tp = level.Terrain.WorldToTexture(Vector2(float(p[0]), float(p[1])))
+		tpts.append(tp)
+		mn.x = min(mn.x, tp.x); mn.y = min(mn.y, tp.y)
+		mx.x = max(mx.x, tp.x); mx.y = max(mx.y, tp.y)
+
+	var sp = _open_splat(level, slot)
+	if sp == null: return _err("could not read splat image for slot " + str(slot))
+	var img = sp.img
+	var ch = sp.ch
+	var iw = img.get_width()
+	var ih = img.get_height()
+	# Bounding box of the whole stroke, padded by the brush radius.
+	var x0 = max(int(floor(mn.x - trad)), 0)
+	var y0 = max(int(floor(mn.y - trad)), 0)
+	var x1 = min(int(ceil(mx.x + trad)), iw - 1)
+	var y1 = min(int(ceil(mx.y + trad)), ih - 1)
+	var painted := 0
+	img.lock()
+	for iy in range(y0, y1 + 1):
+		for ix in range(x0, x1 + 1):
+			var pix = Vector2(ix + 0.5, iy + 0.5)
+			# Distance to the closest segment of the polyline.
+			var d = INF
+			for i in range(tpts.size() - 1):
+				var sd = _dist_point_segment(pix, tpts[i], tpts[i + 1])
+				if sd < d:
+					d = sd
+				if d <= 0.0:
+					break
+			if d > trad:
+				continue
+			# Same smoothstep falloff as paint_terrain, applied once per pixel.
+			var falloff = clamp(1.0 - (d / trad), 0.0, 1.0)
+			falloff = falloff * falloff * (3.0 - 2.0 * falloff)
+			var w = rate * falloff
+			if w <= 0.0:
+				continue
+			img.set_pixel(ix, iy, _splat_set_channel(img.get_pixel(ix, iy), ch, w))
+			painted += 1
+	img.unlock()
+	_close_splat(level, sp.which, img)
+	return _ok({ "painted_slot": slot, "segments": tpts.size() - 1, "pixels": painted })
+
+
+# Shortest distance from point p to segment a-b (all in texture space).
+func _dist_point_segment(p : Vector2, a : Vector2, b : Vector2) -> float:
+	var ab = b - a
+	var len2 = ab.x * ab.x + ab.y * ab.y
+	if len2 <= 0.0000001:
+		return p.distance_to(a)
+	var t = clamp((p - a).dot(ab) / len2, 0.0, 1.0)
+	return p.distance_to(a + ab * t)
 
 
 # Fill a region (rectangle or polygon) with a terrain slot, in woxel coords.

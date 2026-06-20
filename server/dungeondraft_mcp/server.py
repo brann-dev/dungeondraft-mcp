@@ -449,6 +449,32 @@ def paint_terrain(
     return bridge.request("paint_terrain", **params)
 
 
+@mcp.tool()
+def paint_path(
+    points: list[list[float]],
+    slot: int = 0,
+    radius: float = 96.0,
+    rate: float = 1.0,
+    asset: str = "",
+) -> dict:
+    """Paint a continuous terrain stroke (a road/trail) along a polyline in one call.
+
+    points: a list of [x, y] woxel corners the path runs through (>= 2). The
+    bridge rasterizes a uniform ribbon of constant width by measuring each
+    pixel's distance to the nearest segment, so the route comes out smooth with
+    clean edges — no gaps or double-painted overlaps. Prefer this over stamping
+    many paint_terrain dabs for any line/road.
+
+    radius: half-width of the stroke in woxels. rate: peak strength 0..1 with a
+    soft falloff to the edges so it blends. asset: optional Terrain asset to
+    assign to the slot first (else set it with set_terrain_slot). Undoable.
+    """
+    params = {"points": points, "slot": slot, "radius": radius, "rate": rate}
+    if asset:
+        params["asset"] = asset
+    return bridge.request("paint_path", **params)
+
+
 # --------------------------------------------------------------------------
 # Modify / delete
 # --------------------------------------------------------------------------
