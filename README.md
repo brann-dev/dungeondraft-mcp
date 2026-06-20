@@ -56,6 +56,11 @@ ids you feed back into edit calls. Coordinates are woxel (pixel) space — call
 
 ## Setup
 
+**Prerequisites:** [Dungeondraft](https://dungeondraft.net/) (tested on the
+Godot 3.4.2 builds), Python **3.10+**, and an MCP client (e.g. Claude Code or
+Claude Desktop). On Windows, `python`/`.venv\Scripts\` replace the `python3`/
+`.venv/bin/` paths shown below.
+
 ### 1. Install the mod into Dungeondraft
 
 1. In Dungeondraft's title screen, open **Mods** and note (or set) your mods
@@ -66,36 +71,42 @@ ids you feed back into edit calls. Coordinates are woxel (pixel) space — call
 On load you should see in the Dungeondraft log:
 
 ```
-[mcp-bridge] listening on 127.0.0.1:8787 (protocol v3)
+[mcp-bridge] listening on 127.0.0.1:8787 (protocol v6)
 ```
 
-### 2. Verify the commands work
+### 2. Install the MCP server
+
+Install into a dedicated venv (most distros' system Python is externally
+managed, so a venv keeps the entrypoint clean and stable). Run from the repo
+root:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -e ./server
+```
+
+This installs the `dungeondraft_mcp` package and creates the
+`.venv/bin/dungeondraft-mcp` entrypoint.
+
+### 3. Verify the bridge works
 
 With DD open and a map loaded, run the per-command validator. It builds a small
 throwaway scene near the map center, prints PASS/FAIL for each command, then
 deletes what it made:
 
 ```bash
-cd server
-python test_bridge.py
+.venv/bin/python server/test_bridge.py
 ```
 
 If it fails to connect *and* you never saw the `listening` line in DD's log, the
-sandbox blocked `TCP_Server` — see the fallback note in PROTOCOL.md. (Confirmed
-working on Godot 3.4.2, so this should just pass.)
+sandbox blocked `TCP_Server` — see the fallback note in PROTOCOL.md.
 
-### 3. Install and wire up the MCP server
+To *see* something get built (a small furnished room left on the map, rather
+than a self-cleaning test), run `.venv/bin/python server/demo_build.py`.
 
-Install into a dedicated venv (most distros' system Python is externally
-managed, so a venv keeps the entrypoint clean and stable):
+### 4. Wire up your MCP client
 
-```bash
-python -m venv .venv
-.venv/bin/pip install -e ./server
-```
-
-This creates the `.venv/bin/dungeondraft-mcp` entrypoint. Register it with your
-MCP client using its **absolute path**. For **Claude Code**:
+Register the entrypoint by its **absolute path**. For **Claude Code**:
 
 ```bash
 claude mcp add dungeondraft -s user -- "$PWD/.venv/bin/dungeondraft-mcp"
@@ -120,17 +131,22 @@ Then ask the model things like *"what's the status of my Dungeondraft map?"* or
 
 ## Configuration
 
+These env vars configure the **Python server** (set them where the MCP client
+launches it). The defaults match the mod, so you only need them if you change
+the mod's `HOST` / `PORT` consts in `mcp_bridge.gd` — both halves must agree.
+
 | Env var | Default | Purpose |
 | --- | --- | --- |
-| `DD_BRIDGE_HOST` | `127.0.0.1` | bridge host |
-| `DD_BRIDGE_PORT` | `8787` | bridge port (must match the mod's `PORT` const) |
+| `DD_BRIDGE_HOST` | `127.0.0.1` | host the server connects to |
+| `DD_BRIDGE_PORT` | `8787` | port the server connects to (match the mod's `PORT`) |
 
 ## Extending
 
 Adding a capability is symmetric — one handler on each side:
 
-1. **Mod** (`mod/.../scripts/tools/mcp_bridge.gd`): add a `case` in `_dispatch()`
-   and a `_my_command(req)` function returning `_ok(...)` / `_err(...)`.
+1. **Mod** (`mod/.../scripts/tools/mcp_bridge.gd`): add a `case` to the `match`
+   in `_safe_dispatch()` and a `_my_command(req)` function returning
+   `_ok(...)` / `_err(...)`.
 2. **Server** (`server/dungeondraft_mcp/server.py`): add an `@mcp.tool()` that
    calls `bridge.request("my_command", ...)`.
 
