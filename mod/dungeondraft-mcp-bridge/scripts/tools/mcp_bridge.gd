@@ -21,7 +21,7 @@ var script_class = "tool"
 
 const HOST := "127.0.0.1"
 const PORT := 8787
-const PROTOCOL_VERSION := 4
+const PROTOCOL_VERSION := 5
 
 # Commands that get wrapped in a Dungeondraft undo record (see _record_and_dispatch).
 const CREATE_CMDS := [
@@ -280,6 +280,11 @@ func _safe_dispatch(req : Dictionary) -> Dictionary:
 		# --- capture ---
 		"screenshot": return _screenshot(req)
 		"export_map": return _export_map(req)
+		# --- camera ---
+		"get_camera": return _get_camera()
+		"set_camera": return _set_camera(req)
+		"focus_element": return _focus_element(req)
+		"fit_elements": return _fit_elements(req)
 		# --- history (bridge-managed undo/redo of the model's own edits) ---
 		"undo": return _do_undo()
 		"redo": return _do_redo()
@@ -709,6 +714,130 @@ func _export_map(req : Dictionary) -> Dictionary:
 	var ppi = int(req.get("ppi", 40))
 	Global.Exporter.Start(0, ppi, path)  # mode 0 = PNG
 	return _ok({ "path": path, "ppi": ppi, "async": true })
+
+
+# ---------------------------------------------------------------------------
+# Camera
+# ---------------------------------------------------------------------------
+#
+# The editor camera is a Camera2D at Global.Camera. Its world center is the
+# inherited `global_position`; `zoom` is a Vector2 where LARGER = zoomed OUT
+# (a Camera2D scales the view by `zoom`, so zoom 0.5 shows half as much = 2x
+# magnification). We expose zoom as a single float = zoom.x and pan by setting
+# global_position directly (unambiguous), then nudge DD's zoom dropdown to
+# match via SetZoomOptionByRaw so the bottom bar stays in sync.
+
+func _camera():
+	return Global.get("Camera")
+
+
+func _viewport_size() -> Vector2:
+	return Global.World.get_viewport().get_visible_rect().size
+
+
+func _apply_zoom(cam, z : float) -> void:
+	z = max(0.01, z)
+	cam.zoom = Vector2(z, z)
+	# Keep DD's bottom-bar zoom dropdown in sync with the raw zoom value.
+	if Global.Editor.has_method("SetZoomOptionByRaw"):
+		Global.Editor.SetZoomOptionByRaw(z)
+
+
+func _camera_state(cam) -> Dictionary:
+	return {
+		"position": _vec(cam.global_position),
+		"zoom": cam.zoom.x,
+		"viewport_size": _vec(_viewport_size()),
+	}
+
+
+func _get_camera() -> Dictionary:
+	var cam = _camera()
+	if cam == null: return _err("camera not available")
+	return _ok(_camera_state(cam))
+
+
+func _set_camera(req : Dictionary) -> Dictionary:
+	var cam = _camera()
+	if cam == null: return _err("camera not available")
+	if req.has("x") or req.has("y"):
+		cam.global_position = _xy(req, cam.global_position)
+	if req.has("zoom"):
+		_apply_zoom(cam, float(req["zoom"]))
+	return _ok(_camera_state(cam))
+
+
+# Center the camera on a single element (any kind, incl. text). Optional zoom.
+func _focus_element(req : Dictionary) -> Dictionary:
+	var cam = _camera()
+	if cam == null: return _err("camera not available")
+	var node = _resolve(req)
+	if node == null: return _err("no element with id " + str(req.get("id")))
+	var pos = _element_position(node)
+	if pos == null: return _err("element has no position to focus")
+	cam.global_position = pos
+	if req.has("zoom"):
+		_apply_zoom(cam, float(req["zoom"]))
+	return _ok({ "id": req.get("id"), "focused": _vec(pos), "camera": _camera_state(cam) })
+
+
+# Frame a set of elements: center on their bounding box and zoom so it fits the
+# viewport with `pad` (fraction of extra margin, default 0.15). Ids that don't
+# resolve or lack a position are skipped and reported in `missing`.
+func _fit_elements(req : Dictionary) -> Dictionary:
+	var cam = _camera()
+	if cam == null: return _err("camera not available")
+	var ids = req.get("ids", [])
+	var mn = Vector2(INF, INF)
+	var mx = Vector2(-INF, -INF)
+	var used := 0
+	var missing := []
+	for ident in ids:
+		var node = Global.World.GetNodeByID(int(ident))
+		var pos = null
+		if node != null:
+			pos = _element_position(node)
+		if pos == null:
+			missing.append(ident)
+			continue
+		mn.x = min(mn.x, pos.x); mn.y = min(mn.y, pos.y)
+		mx.x = max(mx.x, pos.x); mx.y = max(mx.y, pos.y)
+		used += 1
+	if used == 0:
+		return _err("no elements with a position to fit")
+	var center = (mn + mx) * 0.5
+	cam.global_position = center
+	# Zoom so the box fits: zoom (Camera2D) = world_span / viewport_span.
+	var pad = 1.0 + float(req.get("pad", 0.15))
+	var span = (mx - mn) * pad
+	var vp = _viewport_size()
+	# Guard against a zero-span (single point / colinear) box.
+	span.x = max(span.x, 1.0)
+	span.y = max(span.y, 1.0)
+	var z = max(span.x / max(vp.x, 1.0), span.y / max(vp.y, 1.0))
+	_apply_zoom(cam, z)
+	return _ok({
+		"fit": used, "missing": missing,
+		"center": _vec(center), "camera": _camera_state(cam),
+	})
+
+
+# Resolve a representative world position for any element kind. Props/lights/
+# portals carry it on `position`; a Text is a Control (rect_position); walls/
+# paths/roofs keep their geometry in `Points` with position often at origin, so
+# use the centroid of their points when available.
+func _element_position(node):
+	if _is_text(node):
+		return node.rect_position
+	var pts = node.get("Points")
+	if pts != null and pts is PoolVector2Array and pts.size() > 0:
+		var sum = Vector2()
+		for p in pts:
+			sum += p
+		return sum / pts.size()
+	if node is Node2D:
+		return node.position
+	return null
 
 
 # ---------------------------------------------------------------------------

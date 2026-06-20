@@ -102,6 +102,26 @@ server uses a temp path and reads it back as an image).
 | `screenshot` | `path` | `{ path, width, height }` — window grab, synchronous |
 | `export_map` | `path`, `ppi=40` | `{ path, ppi, async }` — full-map render on a background thread; poll `path` for the file |
 
+### Camera
+
+The editor camera is a `Camera2D` at `Global.Camera`. Its world center is the
+inherited `global_position`; `zoom` is a Camera2D factor where **larger = zoomed
+out** (0.5 magnifies 2×, 2.0 shows twice as much). `set_camera`/`focus_element`/
+`fit_elements` pan by writing `global_position` and keep DD's bottom-bar zoom
+dropdown in sync via `SetZoomOptionByRaw`. Use these before `screenshot` to
+frame what you want to inspect.
+
+| cmd | params | result |
+| --- | --- | --- |
+| `get_camera` | — | `{ position[x,y], zoom, viewport_size[w,h] }` |
+| `set_camera` | `x?`, `y?`, `zoom?` | camera state |
+| `focus_element` | `id`, `zoom?` | `{ id, focused[x,y], camera{} }` — centers on the element (any kind) |
+| `fit_elements` | `ids[]`, `pad=0.15` | `{ fit, missing[], center[x,y], camera{} }` — frames the bounding box of the ids |
+
+`focus_element`/`fit_elements` use a representative position per element:
+props/lights/portals use `position`, texts use `rect_position`, and walls/paths/
+roofs use the centroid of their `Points`.
+
 ### History
 
 The bridge keeps its **own** undo/redo stacks (it does not use Dungeondraft's

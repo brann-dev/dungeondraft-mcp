@@ -414,6 +414,66 @@ def export_map(ppi: int = 40) -> Image:
 
 
 # --------------------------------------------------------------------------
+# Camera
+# --------------------------------------------------------------------------
+
+@mcp.tool()
+def get_camera() -> dict:
+    """Report the editor camera: world-center position [x,y], zoom, and viewport size.
+
+    zoom is a Camera2D factor where LARGER = zoomed OUT (zoom 0.5 magnifies 2x,
+    zoom 2.0 shows twice as much). Use this to read the view before adjusting it.
+    """
+    return bridge.request("get_camera")
+
+
+@mcp.tool()
+def set_camera(
+    x: Optional[float] = None,
+    y: Optional[float] = None,
+    zoom: Optional[float] = None,
+) -> dict:
+    """Pan and/or zoom the editor camera. Returns the resulting camera state.
+
+    x, y: world (woxel) center to move the view to (omit to keep current).
+    zoom: Camera2D factor (LARGER = zoomed OUT; ~0.5 = a close look, ~2 = wide).
+    Follow with screenshot() to see the framed view.
+    """
+    params: dict = {}
+    if x is not None:
+        params["x"] = x
+    if y is not None:
+        params["y"] = y
+    if zoom is not None:
+        params["zoom"] = zoom
+    return bridge.request("set_camera", **params)
+
+
+@mcp.tool()
+def focus_element(id: int, zoom: Optional[float] = None) -> dict:
+    """Center the camera on an element by id (works for any kind, including text).
+
+    zoom: optional Camera2D factor to apply (LARGER = zoomed OUT). Follow with
+    screenshot() to verify a specific element (e.g. a door cut into a wall).
+    """
+    params: dict = {"id": id}
+    if zoom is not None:
+        params["zoom"] = zoom
+    return bridge.request("focus_element", **params)
+
+
+@mcp.tool()
+def fit_elements(ids: list[int], pad: float = 0.15) -> dict:
+    """Frame a group of elements: center and zoom so their bounding box fits the view.
+
+    ids: element ids to frame. pad: extra margin as a fraction (0.15 = 15%).
+    Ids without a position are skipped and listed in the 'missing' field.
+    Follow with screenshot() to see the framed group.
+    """
+    return bridge.request("fit_elements", ids=ids, pad=pad)
+
+
+# --------------------------------------------------------------------------
 # Selection
 # --------------------------------------------------------------------------
 
