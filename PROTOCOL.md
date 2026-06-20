@@ -205,7 +205,16 @@ Ctrl+Z in Dungeondraft.
   default color when no `color` is given (walls via `WallTool.GetWallColor(tex)`,
   patterns by reading back `PatternShapeTool.Color` after setting the texture),
   rather than `Color(1,1,1)` (white) — which renders bleached/washed-out. Pass
-  an explicit `color` to override.
+  an explicit `color` to override. **`place_pattern` color caveat:** unlike walls,
+  patterns have **no per-texture default** lookup — `PatternShapeTool.Color` is
+  *persistent tool state that leaks across calls* (it holds whatever the previous
+  `place_pattern` set). Reading it back as a "default" made every no-color call
+  inherit the prior call's tint, and if it was ever left transparent (alpha ≈ 0)
+  every subsequent floor rendered **invisible**. So `place_pattern` never trusts
+  `tool.Color`: an explicit `color` is used verbatim; with no color it applies a
+  deterministic opaque neutral tint (`DEFAULT_PATTERN_TINT`) and reports
+  `used_default_tint: true` + the resolved `color`. Each call is independent.
+  Pass an explicit `color` for an exact per-asset look.
 - **`build_room`** — convenience composite: draws a looped wall **and** a floor
   along the **same** boundary path (so the floor meets the wall with no gap, like
   the UI's combined trace), by calling `draw_wall` + `place_pattern`/`fill_region`

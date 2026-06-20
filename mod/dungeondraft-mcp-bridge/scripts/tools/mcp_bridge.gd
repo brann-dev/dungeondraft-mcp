@@ -21,7 +21,7 @@ var script_class = "tool"
 
 const HOST := "127.0.0.1"
 const PORT := 8787
-const PROTOCOL_VERSION := 10
+const PROTOCOL_VERSION := 11
 
 # Commands that get wrapped in a Dungeondraft undo record (see _record_and_dispatch).
 const CREATE_CMDS := [
@@ -30,6 +30,10 @@ const CREATE_CMDS := [
 ]
 const TRANSFORM_CMDS := ["move_element", "modify_object"]
 const TERRAIN_CMDS := ["fill_terrain", "fill_region", "paint_terrain", "paint_path"]
+# Neutral opaque tint for pattern floors when no color is given. PatternShapeTool
+# has no per-texture default (and its .Color leaks across calls), so we apply a
+# deterministic wood/stone-neutral tone; callers pass an explicit color to override.
+const DEFAULT_PATTERN_TINT := Color(0.62, 0.5, 0.34)
 
 # SelectTool.GetSelectableType() integer -> readable kind.
 const KIND_NAMES := {
@@ -637,16 +641,25 @@ func _place_pattern(req : Dictionary) -> Dictionary:
 	# and the valid index range is undocumented. New shapes go to the tool's
 	# current layer.
 	#
-	# Color: many tilesets carry a default tint (e.g. wood is brown, not white).
-	# Only override it when the caller passes an explicit color; otherwise read
-	# back whatever the tool has for this texture so we match the UI default
-	# instead of forcing white (which renders bleached/washed-out).
+	# Color. CRITICAL: PatternShapeTool.Color is PERSISTENT TOOL STATE that leaks
+	# across calls — it holds whatever the previous place_pattern set, NOT a
+	# per-texture default (unlike walls, which have WallTool.GetWallColor(tex);
+	# patterns have no such per-texture lookup). Reading it back as a "default"
+	# made every no-color call inherit the last call's tint, and if it was ever
+	# left transparent (alpha~0) every subsequent floor rendered INVISIBLE. So we
+	# never trust tool.Color: an explicit `color` is used verbatim; with no color
+	# we set a deterministic OPAQUE neutral tint so each call is independent and
+	# always renders. (Pass an explicit color for an exact look.)
 	var color
+	var used_default = false
 	if req.has("color") and str(req.get("color", "")) != "":
-		color = _color(req["color"], Color(1, 1, 1))
-		tool.Color = color
+		color = _color(req["color"], DEFAULT_PATTERN_TINT)
 	else:
-		color = tool.Color
+		color = DEFAULT_PATTERN_TINT
+		used_default = true
+	if color.a < 0.05:  # guard: never paint an invisible floor
+		color = Color(color.r, color.g, color.b, 1.0)
+	tool.Color = color  # always set, so we don't inherit/leave leaked state
 	var rotation = float(req.get("rotation", 0.0))
 	if tool.get("Rotation") != null:
 		tool.Rotation.value = rotation
@@ -678,6 +691,12 @@ func _place_pattern(req : Dictionary) -> Dictionary:
 	# and z_index=`z` (default -100, between FloorShapes at -200 and Objects at 0).
 	var all = shapes.GetShapes()
 	var result := { "shape": kind, "category": category, "shape_count": all.size() }
+	if color is Color:
+		result["color"] = "#" + color.to_html(true)
+	if used_default:
+		# Signal we applied the neutral default (no per-texture tint exists for
+		# patterns; pass an explicit `color` for an exact look).
+		result["used_default_tint"] = true
 	if all.size() > before and all.size() > 0:
 		var shape = all[all.size() - 1]
 		if shape.has_method("SetOptions"):
