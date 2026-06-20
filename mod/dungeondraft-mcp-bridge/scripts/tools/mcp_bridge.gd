@@ -44,7 +44,9 @@ const COLLECTIONS := {
 }
 
 var _server : TCP_Server = null
-var _conns := []   # array of { "peer": StreamPeerTCP, "buf": String }
+var _conns := []         # array of { "peer": StreamPeerTCP, "buf": String }
+var _undo_stack := []    # bridge-managed undo ops (see _build_op / _apply_op)
+var _redo_stack := []
 
 
 # ---------------------------------------------------------------------------
@@ -108,9 +110,11 @@ func _handle_line(peer : StreamPeerTCP, line : String):
 	peer.put_data((JSON.print(resp) + "\n").to_utf8())
 
 
-# Runs a command and, if it succeeded and is a reversible map edit, registers a
-# Dungeondraft undo record so Ctrl+Z works. Pre-edit state (transforms / terrain
-# splat) is captured before the command runs.
+# Runs a command and, if it succeeded and is a reversible map edit, pushes an op
+# onto the bridge-managed undo stack. We do NOT use Dungeondraft's
+# History.CreateCustomRecord — on 3.4.2 it invokes undo() unreliably and never
+# round-trips redo(). Our own stacks are deterministic and fully under control.
+# Pre-edit state (transform / terrain splat) is captured before the command runs.
 func _record_and_dispatch(req : Dictionary) -> Dictionary:
 	var cmd = req.get("cmd", "")
 
@@ -128,31 +132,104 @@ func _record_and_dispatch(req : Dictionary) -> Dictionary:
 
 	var result = _safe_dispatch(req)
 	if typeof(result) == TYPE_DICTIONARY and result.get("ok", false):
-		_maybe_record(cmd, req, result, pre, terrain_before)
+		var op = _build_op(cmd, req, result, pre, terrain_before)
+		if op != null:
+			_undo_stack.append(op)
+			_redo_stack = []   # a fresh edit invalidates the redo branch
 	return result
 
 
-func _maybe_record(cmd, req, result, pre, terrain_before):
+# Returns an undo op for a recordable command, or null. Ops are reversed by
+# _apply_op (undo=true) and re-applied (undo=false).
+func _build_op(cmd, req, result, pre, terrain_before):
 	if cmd in CREATE_CMDS:
 		var id = result["result"].get("id", -1)
 		if id != null and int(id) >= 0:
 			var node = Global.World.GetNodeByID(int(id))
 			if node != null:
-				_new_record({ "action": "create", "node": node, "parent": node.get_parent(), "id": int(id) })
+				return { "kind": "create", "node": node, "parent": node.get_parent(), "id": int(id) }
 	elif cmd in TRANSFORM_CMDS and pre != null:
 		var node = Global.World.GetNodeByID(int(req["id"]))
 		if node != null:
-			_new_record({ "action": "transform", "id": int(req["id"]), "old": pre, "new": _snapshot(node) })
+			return { "kind": "transform", "id": int(req["id"]), "old": pre, "new": _snapshot(node) }
 	elif cmd in TERRAIN_CMDS and terrain_before != null:
 		var lvl = Global.World.GetCurrentLevel()
 		if lvl != null:
-			_new_record({ "action": "terrain", "before": terrain_before, "after": lvl.Terrain.CloneSplatImage() })
+			return { "kind": "terrain", "before": terrain_before, "after": lvl.Terrain.CloneSplatImage() }
+	return null
 
 
-func _new_record(record_state : Dictionary):
-	var rec = Script.InstanceReference("library/mcp_history_record.gd")
-	rec.state = record_state
-	Global.Editor.History.CreateCustomRecord(rec)
+func _do_undo() -> Dictionary:
+	if _undo_stack.empty():
+		return _ok({ "undone": false, "reason": "nothing to undo" })
+	var op = _undo_stack.pop_back()
+	_apply_op(op, true)
+	_redo_stack.append(op)
+	return _ok({ "undone": true, "kind": op["kind"], "undo_depth": _undo_stack.size() })
+
+
+func _do_redo() -> Dictionary:
+	if _redo_stack.empty():
+		return _ok({ "redone": false, "reason": "nothing to redo" })
+	var op = _redo_stack.pop_back()
+	_apply_op(op, false)
+	_undo_stack.append(op)
+	return _ok({ "redone": true, "kind": op["kind"], "redo_depth": _redo_stack.size() })
+
+
+func _apply_op(op, undo : bool):
+	match op["kind"]:
+		"create":
+			if undo:
+				_detach_node(op["node"], int(op["id"]))
+			else:
+				_attach_node(op["node"], op["parent"], int(op["id"]))
+		"transform":
+			_apply_props(Global.World.GetNodeByID(int(op["id"])), op["old"] if undo else op["new"])
+		"terrain":
+			_restore_splat(op["before"] if undo else op["after"])
+
+
+func _detach_node(node, id : int):
+	if is_instance_valid(node) and node.get_parent() != null:
+		node.get_parent().remove_child(node)
+	if Global.World.HasNodeID(id):
+		Global.World.RemoveNodeID(id)
+
+
+func _attach_node(node, parent, id : int):
+	if not is_instance_valid(node):
+		return
+	if node.get_parent() == null and is_instance_valid(parent):
+		parent.add_child(node)
+	Global.World.SetNodeID(node, id)
+	if node.has_method("RemakeLines"):
+		node.RemakeLines()   # walls/paths cache geometry; refresh after re-adding
+
+
+func _apply_props(node, snap):
+	if node == null or snap == null:
+		return
+	if snap.get("position") != null:
+		node.position = snap["position"]
+	if snap.get("rotation") != null:
+		node.rotation = snap["rotation"]
+	if snap.get("scale") != null:
+		node.scale = snap["scale"]
+	if snap.get("shadow") != null:
+		node.set("HasShadow", snap["shadow"])
+	if snap.get("color") != null and node.has_method("SetCustomColor"):
+		node.SetCustomColor(snap["color"])
+
+
+func _restore_splat(img):
+	if img == null:
+		return
+	var level = Global.World.GetCurrentLevel()
+	if level == null:
+		return
+	level.Terrain.RestoreSplat(img)
+	level.Terrain.UpdateSplat()
 
 
 func _snapshot(node) -> Dictionary:
@@ -203,9 +280,9 @@ func _safe_dispatch(req : Dictionary) -> Dictionary:
 		# --- capture ---
 		"screenshot": return _screenshot(req)
 		"export_map": return _export_map(req)
-		# --- history ---
-		"undo": return _history("Undo")
-		"redo": return _history("Redo")
+		# --- history (bridge-managed undo/redo of the model's own edits) ---
+		"undo": return _do_undo()
+		"redo": return _do_redo()
 		# --- selection ---
 		"select_elements": return _select_elements(req)
 		"clear_selection": return _clear_selection()
@@ -542,18 +619,6 @@ func _export_map(req : Dictionary) -> Dictionary:
 	var ppi = int(req.get("ppi", 40))
 	Global.Exporter.Start(0, ppi, path)  # mode 0 = PNG
 	return _ok({ "path": path, "ppi": ppi, "async": true })
-
-
-# ---------------------------------------------------------------------------
-# History (undo / redo)
-# ---------------------------------------------------------------------------
-
-func _history(method : String) -> Dictionary:
-	var h = Global.Editor.History
-	if not h.has_method(method):
-		return _err("History has no %s() on this Dungeondraft version (use Ctrl+Z/Ctrl+Y instead)" % method)
-	h.call(method)
-	return _ok({ method.to_lower(): true })
 
 
 # ---------------------------------------------------------------------------
