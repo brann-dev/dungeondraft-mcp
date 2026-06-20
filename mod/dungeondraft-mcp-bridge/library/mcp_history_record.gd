@@ -3,9 +3,15 @@ extends Reference
 # Global.Editor.History.CreateCustomRecord(). Dungeondraft calls undo() on Ctrl+Z
 # and redo() on Ctrl+Y. `state["action"]` selects the behaviour:
 #
-#   create:    { action, bridge, req, id }   undo deletes the node; redo replays
-#   transform: { action, id, old, new }       undo/redo set captured props
+#   create:    { action, node, parent, id }   undo detaches the node; redo re-adds
+#   transform: { action, id, old, new }        undo/redo set captured props
 #   terrain:   { action, before, after }       undo/redo restore a splat image
+#
+# Create undo uses remove_child / add_child (pure scene-graph ops) rather than
+# World.DeleteNodeByID(), because that is a history-aware delete: calling it from
+# undo() clears Dungeondraft's redo stack, so redo would have nothing to restore.
+# The record holds a reference to the detached node, keeping it alive and keeping
+# its id stable across undo/redo.
 #
 # NOTE: `extends` MUST be the first line in Godot 3.4 GDScript ("extends must be
 # used before anything else") — a leading comment block makes Dungeondraft abort
@@ -18,7 +24,7 @@ var state = {}
 func undo():
 	match state.get("action", ""):
 		"create":
-			Global.World.DeleteNodeByID(int(state["id"]))
+			_detach(state["node"], int(state["id"]))
 		"transform":
 			_apply(Global.World.GetNodeByID(int(state["id"])), state["old"])
 		"terrain":
@@ -28,15 +34,28 @@ func undo():
 func redo():
 	match state.get("action", ""):
 		"create":
-			# Re-run the original command through the bridge's pure dispatcher
-			# (no recording happens there), then track the new node's id.
-			var r = state["bridge"]._safe_dispatch(state["req"])
-			if typeof(r) == TYPE_DICTIONARY and r.get("ok", false):
-				state["id"] = r["result"].get("id", state["id"])
+			_attach(state["node"], state["parent"], int(state["id"]))
 		"transform":
 			_apply(Global.World.GetNodeByID(int(state["id"])), state["new"])
 		"terrain":
 			_restore_terrain(state["after"])
+
+
+func _detach(node, id):
+	if is_instance_valid(node) and node.get_parent() != null:
+		node.get_parent().remove_child(node)
+	if Global.World.HasNodeID(id):
+		Global.World.RemoveNodeID(id)
+
+
+func _attach(node, parent, id):
+	if not is_instance_valid(node):
+		return
+	if node.get_parent() == null and is_instance_valid(parent):
+		parent.add_child(node)
+	Global.World.SetNodeID(node, id)
+	if node.has_method("RemakeLines"):
+		node.RemakeLines()   # walls/paths cache geometry; refresh after re-adding
 
 
 func _apply(node, snap):

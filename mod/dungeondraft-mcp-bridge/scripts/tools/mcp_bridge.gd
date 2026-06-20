@@ -136,7 +136,9 @@ func _maybe_record(cmd, req, result, pre, terrain_before):
 	if cmd in CREATE_CMDS:
 		var id = result["result"].get("id", -1)
 		if id != null and int(id) >= 0:
-			_new_record({ "action": "create", "bridge": self, "req": req, "id": int(id) })
+			var node = Global.World.GetNodeByID(int(id))
+			if node != null:
+				_new_record({ "action": "create", "node": node, "parent": node.get_parent(), "id": int(id) })
 	elif cmd in TRANSFORM_CMDS and pre != null:
 		var node = Global.World.GetNodeByID(int(req["id"]))
 		if node != null:
