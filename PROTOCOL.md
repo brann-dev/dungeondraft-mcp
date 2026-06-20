@@ -83,7 +83,7 @@ It is undo-recorded like the other terrain ops.
 | `set_terrain_slot` | `asset`, `slot=0` |
 | `fill_terrain` | `slot=0`, `asset?` |
 | `fill_region` | `rect=[x,y,w,h]` **or** `points=[[x,y]...]`, `slot=0`, `asset?`, `rate=1` |
-| `paint_terrain` *(experimental)* | `slot=0`, `x?`, `y?`, `radius=64`, `rate=1` |
+| `paint_terrain` | `slot=0`, `x?`, `y?`, `radius=64`, `rate=1`, `asset?` |
 
 ### Modify / delete / levels / selection
 
@@ -166,18 +166,17 @@ Ctrl+Z in Dungeondraft.
   was abandoned. Create ops detach/re-attach the node (remove_child / add_child,
   keeping a reference and a stable id); transform ops restore a property
   snapshot; terrain ops restore a cloned splat image.
-- **`paint_terrain`** *(experimental, likely broken)* — it calls
-  `Terrain.Paint(...)`, which **did not write the splat** in live testing from a
-  mod context (the splat RGBA was unchanged before/after). `fill_region` works
-  around this by editing the splat image directly (`CloneSplatImage` → set the
-  target slot's channel per pixel → `RestoreSplat`), so prefer `fill_region`
-  over `paint_terrain` until `Paint`'s contract is understood. `fill_terrain` /
-  `set_terrain_slot` are well-defined.
+- **`paint_terrain` / `fill_region`** — both edit the splat weight image
+  directly (`CloneSplatImage` → raise the target slot's channel per pixel →
+  `RestoreSplat`). They do **not** use `Terrain.Paint(...)`, which is a no-op
+  from a mod context (the splat RGBA was unchanged before/after in live testing).
+  `paint_terrain` uses a soft radial falloff (a brush); `fill_region` is a hard
+  rect/polygon. Both are undoable via the cloned-splat history op.
 - **terrain splat** — `splatImage` is RGBA = weights of slots 0–3; `splatImage2`
   = slots 4–7. `set_terrain_slot` / `SetTexture(tex, slot)` swap a slot's texture
   **globally** (everywhere that slot is weighted), so to texture one region you
   assign the slot once, then raise that slot's weight only inside the region
-  (what `fill_region` does).
+  (what `fill_region` / `paint_terrain` do).
 - **`add_portal`** — defaults to **wall-mounted** (`Wall.AddPortal`): snaps to
   the nearest wall within `snap_max` woxels, faces along that wall segment, and
   the wall remakes its lines so the portal cuts a gap (matching manual door

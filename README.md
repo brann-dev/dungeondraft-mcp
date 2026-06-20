@@ -27,7 +27,7 @@ forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
 > **Status: working.** Confirmed end-to-end against Dungeondraft on **Godot
 > 3.4.2** — raw TCP from the modding sandbox works, no fallback needed. 34 tools
 > across query / create / modify / terrain / levels / selection / capture /
-> camera / undo (see below). `paint_terrain` is the lone experimental one.
+> camera / undo (see below).
 
 ## What the AI can do
 
@@ -36,7 +36,7 @@ forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
 - **Create:** `place_object`, `draw_wall`, `draw_path`, `add_light`,
   `add_portal`, `add_roof`, `add_text`.
 - **Terrain:** `set_terrain_slot`, `fill_terrain` (whole level), `fill_region`
-  (a rect/polygon, e.g. one room's floor), `paint_terrain`*.
+  (a rect/polygon, e.g. one room's floor), `paint_terrain` (a soft brush).
 - **Edit:** `move_element`, `modify_object`, `duplicate_object`,
   `delete_element`, `select_elements`, `clear_selection`.
 - **Levels:** `add_level`, `set_level`.
@@ -52,7 +52,7 @@ forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
 
 Every element is referenced by an integer `id`; create and list calls return
 ids you feed back into edit calls. Coordinates are woxel (pixel) space — call
-`get_status` for `map_center`. Discover assets with `list_assets`. (* experimental.)
+`get_status` for `map_center`. Discover assets with `list_assets`.
 
 ## Setup
 

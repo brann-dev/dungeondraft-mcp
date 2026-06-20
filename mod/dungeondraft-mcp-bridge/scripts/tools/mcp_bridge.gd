@@ -607,20 +607,55 @@ func _fill_terrain(req : Dictionary) -> Dictionary:
 	return _ok({ "filled_slot": slot })
 
 
-# Experimental: brush footprint / offset semantics inferred, verify visually.
+# Paint a soft circular brush of a terrain slot at a woxel position. Like
+# fill_region, this edits the splat weight image directly (Terrain.Paint is a
+# no-op from a mod context). The brush has a smooth radial falloff so strokes
+# blend; `rate` scales the peak strength at the center.
 func _paint_terrain(req : Dictionary) -> Dictionary:
 	var level = Global.World.GetCurrentLevel()
 	if level == null: return _err("no map open")
 	var slot = int(req.get("slot", 0))
 	var radius = float(req.get("radius", 64.0))
-	var rate = float(req.get("rate", 1.0))
-	var brush = _circle_brush(radius)
+	var rate = clamp(float(req.get("rate", 1.0)), 0.0, 1.0)
+	if req.has("asset"):
+		var tex = _asset_tex("Terrain", req["asset"])
+		if tex == null: return _err("could not load terrain asset: " + str(req["asset"]))
+		level.Terrain.SetTexture(tex, slot)
 	var world = _xy(req, Global.World.WoxelDimensions * 0.5)
-	var tex_pos = level.Terrain.WorldToTexture(world)
-	var offset = Vector2(-brush.get_width() * 0.5, -brush.get_height() * 0.5)
-	level.Terrain.Paint(slot, brush, offset, tex_pos, rate)
-	level.Terrain.UpdateSplat()
-	return _ok({ "painted_slot": slot, "experimental": true })
+	# Convert the brush center and radius into texture space (radius scales by
+	# the woxel->texture ratio along x).
+	var center = level.Terrain.WorldToTexture(world)
+	var tscale = float(level.Terrain.width) / max(Global.World.WoxelDimensions.x, 1.0)
+	var trad = max(radius * tscale, 0.5)
+
+	var sp = _open_splat(level, slot)
+	if sp == null: return _err("could not read splat image for slot " + str(slot))
+	var img = sp.img
+	var ch = sp.ch
+	var iw = img.get_width()
+	var ih = img.get_height()
+	var x0 = int(floor(center.x - trad))
+	var y0 = int(floor(center.y - trad))
+	var x1 = int(ceil(center.x + trad))
+	var y1 = int(ceil(center.y + trad))
+	var painted := 0
+	img.lock()
+	for iy in range(max(y0, 0), min(y1 + 1, ih)):
+		for ix in range(max(x0, 0), min(x1 + 1, iw)):
+			var d = Vector2(ix + 0.5, iy + 0.5).distance_to(center)
+			if d > trad:
+				continue
+			# Smooth falloff: full strength in the inner half, easing to 0 at the rim.
+			var falloff = clamp(1.0 - (d / trad), 0.0, 1.0)
+			falloff = falloff * falloff * (3.0 - 2.0 * falloff)  # smoothstep
+			var w = rate * falloff
+			if w <= 0.0:
+				continue
+			img.set_pixel(ix, iy, _splat_set_channel(img.get_pixel(ix, iy), ch, w))
+			painted += 1
+	img.unlock()
+	_close_splat(level, sp.which, img)
+	return _ok({ "painted_slot": slot, "pixels": painted })
 
 
 # Fill a region (rectangle or polygon) with a terrain slot, in woxel coords.
@@ -669,21 +704,18 @@ func _fill_region(req : Dictionary) -> Dictionary:
 	if bw < 1 or bh < 1:
 		return _err("region is too small in texture space")
 
-	# Terrain.Paint is a black box that didn't write the splat in testing, so we
-	# edit the splat image directly: splatImage RGBA = weights of slots 0..3,
-	# splatImage2 = slots 4..7. For each pixel inside the polygon, drive the
-	# target slot's channel toward 1 by `rate` and pull the other channels down,
-	# so the weights still blend (sum ~1). Then RestoreSplat to push it back.
+	# Edit the splat weight image directly (Terrain.Paint is a no-op from a mod
+	# context). For each pixel inside the polygon, drive the target slot's
+	# channel toward 1 by `rate`; _open/_close_splat handle clone + restore.
 	var local := []
 	for tp in tpoly:
 		local.append(tp - origin)
-	var which = 0 if slot < 4 else 1
-	var ch = slot % 4  # 0=R,1=G,2=B,3=A within the chosen splat image
-	var img = level.Terrain.CloneSplatImage() if which == 0 else level.Terrain.CloneSplatImage2()
-	if img == null: return _err("could not read splat image for slot " + str(slot))
+	rate = clamp(rate, 0.0, 1.0)
+	var sp = _open_splat(level, slot)
+	if sp == null: return _err("could not read splat image for slot " + str(slot))
+	var img = sp.img
 	var iw = img.get_width()
 	var ih = img.get_height()
-	rate = clamp(rate, 0.0, 1.0)
 	var painted := 0
 	img.lock()
 	for py in range(bh):
@@ -696,20 +728,36 @@ func _fill_region(req : Dictionary) -> Dictionary:
 				continue
 			if not _point_in_poly(Vector2(px + 0.5, py + 0.5), local):
 				continue
-			img.set_pixel(ix, iy, _splat_set_channel(img.get_pixel(ix, iy), ch, rate))
+			img.set_pixel(ix, iy, _splat_set_channel(img.get_pixel(ix, iy), sp.ch, rate))
 			painted += 1
 	img.unlock()
-	if which == 0:
-		level.Terrain.RestoreSplat(img)
-	else:
-		level.Terrain.RestoreSplat2(img)
-	level.Terrain.UpdateSplat()
+	_close_splat(level, sp.which, img)
 
 	return _ok({
 		"filled_slot": slot, "shape": ("rect" if req.has("rect") else "polygon"),
 		"texture_bbox": [_vec(origin), [origin.x + bw, origin.y + bh]],
 		"pixels": painted,
 	})
+
+
+# Clone the splat weight image holding `slot` for direct editing. Returns
+# { img, ch, which } where ch is the RGBA channel (0..3) for that slot and
+# which is 0 (slots 0-3 -> splatImage) or 1 (slots 4-7 -> splatImage2), or null
+# if the image isn't available. Pair with _close_splat to push edits back.
+func _open_splat(level, slot : int):
+	var which = 0 if slot < 4 else 1
+	var img = level.Terrain.CloneSplatImage() if which == 0 else level.Terrain.CloneSplatImage2()
+	if img == null:
+		return null
+	return { "img": img, "ch": slot % 4, "which": which }
+
+
+func _close_splat(level, which : int, img) -> void:
+	if which == 0:
+		level.Terrain.RestoreSplat(img)
+	else:
+		level.Terrain.RestoreSplat2(img)
+	level.Terrain.UpdateSplat()
 
 
 # Push channel `ch` (0=R,1=G,2=B,3=A) of an RGBA splat weight toward 1 by `rate`,
@@ -1132,21 +1180,6 @@ func _color(v, fallback : Color) -> Color:
 			a = float(v[3])
 		return Color(float(v[0]), float(v[1]), float(v[2]), a)
 	return fallback
-
-
-func _circle_brush(radius : float) -> Image:
-	var size = int(max(2.0, radius * 2.0))
-	var img = Image.new()
-	img.create(size, size, false, Image.FORMAT_RGBA8)
-	img.lock()
-	var c = Vector2(size, size) * 0.5
-	var r = size * 0.5
-	for y in range(size):
-		for x in range(size):
-			var a = clamp(1.0 - (Vector2(x, y).distance_to(c) / r), 0.0, 1.0)
-			img.set_pixel(x, y, Color(1, 1, 1, a))
-	img.unlock()
-	return img
 
 
 func _ok(result) -> Dictionary:

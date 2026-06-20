@@ -337,17 +337,22 @@ def paint_terrain(
     y: Optional[float] = None,
     radius: float = 64.0,
     rate: float = 1.0,
+    asset: str = "",
 ) -> dict:
-    """(Experimental) Paint a circular terrain brush of a slot at a woxel position.
+    """Paint a soft circular terrain brush of a slot at a woxel position.
 
-    Brush footprint / blend semantics are inferred from the API; verify visually.
-    Assign the slot's texture first with set_terrain_slot.
+    radius: brush radius in woxels. rate: peak strength 0..1 at the center, with
+    a smooth falloff to the rim so strokes blend. asset: optional Terrain asset
+    to assign to the slot first (else set it with set_terrain_slot). Undoable.
+    For a hard-edged region instead of a brush, use fill_region.
     """
     params = {"slot": slot, "radius": radius, "rate": rate}
     if x is not None:
         params["x"] = x
     if y is not None:
         params["y"] = y
+    if asset:
+        params["asset"] = asset
     return bridge.request("paint_terrain", **params)
 
 
