@@ -274,7 +274,9 @@ def place_pattern(
     asset: a pattern asset path from list_assets(category=...).
     category: which asset bank — 'Patterns', 'Patterns Colorable', 'Materials',
       'Simple Tiles', or 'Smart Tiles'.
-    color: optional '#rrggbb' tint. rotation: pattern rotation in degrees.
+    color: '#rrggbb' tint. Omit to use the tileset's own default tint (wood is
+      brown, etc.) instead of white — match the UI by leaving it unset.
+    rotation: pattern rotation in degrees.
     z: absolute z_index. Default -100 sits below objects (z 0) and above terrain
       shapes (z -200). Raise toward 0+ to overlay on top.
     """
@@ -290,6 +292,60 @@ def place_pattern(
     if rotation is not None:
         params["rotation"] = rotation
     return bridge.request("place_pattern", **params)
+
+
+@mcp.tool()
+def build_room(
+    rect: Optional[list[float]] = None,
+    points: Optional[list[list[float]]] = None,
+    wall_asset: str = "",
+    floor: str = "pattern",
+    floor_asset: str = "",
+    floor_category: str = "Simple Tiles",
+    floor_color: str = "",
+    floor_slot: int = 1,
+    wall_type: int = 0,
+    wall_joint: int = 1,
+) -> dict:
+    """Build a room in one call: a looped wall AND a matching floor on the SAME path.
+
+    Because the wall and floor share the boundary, the floor meets the wall
+    exactly (no gap) — like the UI's combined wall+floor trace. Provide ONE of:
+      rect: [x, y, w, h] axis-aligned rectangle, or
+      points: [[x,y], ...] a polygon (>= 3 points), all in woxels (the wall
+      centerline; the wall covers the floor's outer edge).
+
+    wall_asset: a Walls asset path (omit for the default).
+    floor: 'pattern' (a tiled floor; floor_asset + floor_category), 'terrain'
+      (paints terrain into floor_slot; floor_asset assigns the slot texture),
+      or 'none' for walls only.
+    floor_asset: the floor texture. floor_category: pattern bank for floor=
+      'pattern' (e.g. 'Simple Tiles', 'Smart Tiles', 'Materials').
+    floor_color: optional '#rrggbb' tint (pattern floors).
+    wall_type: 0=auto, 1=manual, 2=cave. wall_joint: 0=sharp, 1=bevel, 2=round.
+
+    Returns { wall_id, floor_id?, points }.
+    """
+    if (rect is None) == (points is None):
+        raise ValueError("provide exactly one of 'rect' or 'points'")
+    params: dict = {
+        "floor": floor,
+        "floor_category": floor_category,
+        "floor_slot": floor_slot,
+        "wall_type": wall_type,
+        "wall_joint": wall_joint,
+    }
+    if rect is not None:
+        params["rect"] = rect
+    if points is not None:
+        params["points"] = points
+    if wall_asset:
+        params["wall_asset"] = wall_asset
+    if floor_asset:
+        params["floor_asset"] = floor_asset
+    if floor_color:
+        params["floor_color"] = floor_color
+    return bridge.request("build_room", **params)
 
 
 @mcp.tool()

@@ -71,6 +71,7 @@ node; default color is black.
 | `add_roof` | `points[[x,y]...]`, `asset`, `width=256`, `type=0`, `sorting=0` |
 | `add_text` | `text`, `x?`, `y?`, `size?`, `color?`, `font?` |
 | `place_pattern` | `asset`, `rect=[x,y,w,h]` **or** `points=[[x,y]...]`, `category="Patterns"`, `color?`, `rotation?` |
+| `build_room` | `rect=[x,y,w,h]` **or** `points=[[x,y]...]`, `wall_asset?`, `floor="pattern"\|"terrain"\|"none"`, `floor_asset?`, `floor_category="Simple Tiles"`, `floor_color?`, `floor_slot=1`, `wall_type=0`, `wall_joint=1` → `{ wall_id, floor_id?, points }` |
 
 ### Terrain
 
@@ -186,6 +187,15 @@ Ctrl+Z in Dungeondraft.
   absolute `z_index` (default `z` = -100, between FloorShapes at -200 and Objects
   at 0). Do **not** use `PatternShapeTool.SetLayer()` on an uncreated index — it
   hard-crashes the mod (GDScript has no try/catch; valid range undocumented).
+- **default tints** — `draw_wall` / `place_pattern` apply the texture's own
+  default color when no `color` is given (walls via `WallTool.GetWallColor(tex)`,
+  patterns by reading back `PatternShapeTool.Color` after setting the texture),
+  rather than `Color(1,1,1)` (white) — which renders bleached/washed-out. Pass
+  an explicit `color` to override.
+- **`build_room`** — convenience composite: draws a looped wall **and** a floor
+  along the **same** boundary path (so the floor meets the wall with no gap, like
+  the UI's combined trace), by calling `draw_wall` + `place_pattern`/`fill_region`
+  internally. `floor` = `"pattern"` / `"terrain"` / `"none"`.
 - **`add_portal`** — defaults to **wall-mounted** (`Wall.AddPortal`): snaps to
   the nearest wall within `snap_max` woxels, faces along that wall segment, and
   the wall remakes its lines so the portal cuts a gap (matching manual door

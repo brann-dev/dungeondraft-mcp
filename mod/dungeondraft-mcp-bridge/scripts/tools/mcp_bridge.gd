@@ -21,7 +21,7 @@ var script_class = "tool"
 
 const HOST := "127.0.0.1"
 const PORT := 8787
-const PROTOCOL_VERSION := 7
+const PROTOCOL_VERSION := 8
 
 # Commands that get wrapped in a Dungeondraft undo record (see _record_and_dispatch).
 const CREATE_CMDS := [
@@ -266,6 +266,7 @@ func _safe_dispatch(req : Dictionary) -> Dictionary:
 		"add_roof": return _add_roof(req)
 		"add_text": return _add_text(req)
 		"place_pattern": return _place_pattern(req)
+		"build_room": return _build_room(req)
 		# --- terrain ---
 		"set_terrain_slot": return _set_terrain_slot(req)
 		"fill_terrain": return _fill_terrain(req)
@@ -402,11 +403,26 @@ func _draw_wall(req : Dictionary) -> Dictionary:
 	if pts.size() < 2: return _err("'points' needs >= 2 [x,y] pairs")
 	var tex = _asset_tex("Walls", req.get("asset", ""))
 	var wall = level.Walls.AddWall(
-		pts, tex, _color(req.get("color", ""), Color(1, 1, 1)),
+		pts, tex, _wall_color(req, tex),
 		bool(req.get("loop", false)), bool(req.get("shadow", true)),
 		int(req.get("type", 0)), int(req.get("joint", 1)), true)
 	if wall == null: return _err("AddWall returned null (bad asset/points?)")
 	return _ok({ "id": _id(wall), "point_count": pts.size() })
+
+
+# Wall tint: use the caller's `color` if given, else the texture's own default
+# (WallTool.GetWallColor) so stone/wood walls render with their natural tint
+# instead of a bleached white (Color(1,1,1) = no tint = washed-out base).
+func _wall_color(req : Dictionary, tex) -> Color:
+	if req.has("color") and str(req.get("color", "")) != "":
+		return _color(req["color"], Color(1, 1, 1))
+	if tex != null and Global.Editor.Tools.has("WallTool"):
+		var wt = Global.Editor.Tools["WallTool"]
+		if wt.has_method("GetWallColor"):
+			var c = wt.GetWallColor(tex)
+			if c != null and c is Color:
+				return c
+	return Color(1, 1, 1)
 
 
 func _draw_path(req : Dictionary) -> Dictionary:
@@ -558,9 +574,18 @@ func _place_pattern(req : Dictionary) -> Dictionary:
 	# index DD hasn't created hard-crashes the mod (GDScript has no try/catch)
 	# and the valid index range is undocumented. New shapes go to the tool's
 	# current layer.
-	var color = _color(req.get("color", ""), Color(1, 1, 1))
+	#
+	# Color: many tilesets carry a default tint (e.g. wood is brown, not white).
+	# Only override it when the caller passes an explicit color; otherwise read
+	# back whatever the tool has for this texture so we match the UI default
+	# instead of forcing white (which renders bleached/washed-out).
+	var color
+	if req.has("color") and str(req.get("color", "")) != "":
+		color = _color(req["color"], Color(1, 1, 1))
+		tool.Color = color
+	else:
+		color = tool.Color
 	var rotation = float(req.get("rotation", 0.0))
-	tool.Color = color
 	if tool.get("Rotation") != null:
 		tool.Rotation.value = rotation
 
@@ -599,6 +624,78 @@ func _place_pattern(req : Dictionary) -> Dictionary:
 		shape.z_index = int(req.get("z", -100))
 		result["id"] = _id(shape)
 		result["z_index"] = shape.z_index
+	return _ok(result)
+
+
+# Build a room in one call: a looped wall AND a floor along the SAME boundary
+# path, so the floor meets the wall exactly (the wall covers the floor's outer
+# edge) — the way the UI's combined wall+floor trace works. Pass `rect:[x,y,w,h]`
+# or `points:[[x,y]...]`. Floor is a pattern by default (`floor:"pattern"`,
+# floor_asset + floor_category) or terrain (`floor:"terrain"`, floor_asset +
+# floor_slot). Pass `floor:"none"` for walls only. Reuses _draw_wall /
+# _place_pattern / _fill_region so behavior matches those tools exactly.
+func _build_room(req : Dictionary) -> Dictionary:
+	var level = Global.World.GetCurrentLevel()
+	if level == null: return _err("no map open")
+
+	# Normalize the boundary to a list of [x,y] points (rect -> 4 corners).
+	var pts_raw := []
+	if req.has("rect"):
+		var r = req["rect"]
+		if typeof(r) != TYPE_ARRAY or r.size() < 4:
+			return _err("'rect' must be [x, y, w, h]")
+		var x = float(r[0]); var y = float(r[1]); var w = float(r[2]); var h = float(r[3])
+		pts_raw = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]]
+	elif req.has("points"):
+		if typeof(req["points"]) != TYPE_ARRAY or req["points"].size() < 3:
+			return _err("'points' needs >= 3 [x,y] pairs")
+		pts_raw = req["points"]
+	else:
+		return _err("provide 'rect':[x,y,w,h] or 'points':[[x,y]...]")
+
+	var result := {}
+
+	# 1) Wall loop along the boundary.
+	var wall_req := {
+		"points": pts_raw, "loop": true,
+		"asset": req.get("wall_asset", ""),
+		"type": req.get("wall_type", 0), "joint": req.get("wall_joint", 1),
+		"shadow": req.get("wall_shadow", true),
+	}
+	var wall_res = _draw_wall(wall_req)
+	if not wall_res.get("ok", false):
+		return wall_res
+	result["wall_id"] = wall_res["result"].get("id")
+
+	# 2) Floor along the SAME boundary (no inset — the wall covers the seam).
+	var floor_kind = str(req.get("floor", "pattern"))
+	if floor_kind == "pattern":
+		var fr := {
+			"points": pts_raw,
+			"asset": req.get("floor_asset", ""),
+			"category": req.get("floor_category", "Simple Tiles"),
+		}
+		if req.has("floor_color"): fr["color"] = req["floor_color"]
+		if req.has("floor_z"): fr["z"] = req["floor_z"]
+		var fres = _place_pattern(fr)
+		if fres.get("ok", false):
+			result["floor_id"] = fres["result"].get("id")
+		else:
+			result["floor_error"] = fres.get("error")
+	elif floor_kind == "terrain":
+		var tr := {
+			"points": pts_raw, "slot": int(req.get("floor_slot", 1)),
+		}
+		if req.has("floor_asset") and str(req.get("floor_asset", "")) != "":
+			tr["asset"] = req["floor_asset"]
+		var tres = _fill_region(tr)
+		if tres.get("ok", false):
+			result["floor_pixels"] = tres["result"].get("pixels")
+		else:
+			result["floor_error"] = tres.get("error")
+	# floor_kind == "none" -> walls only
+
+	result["points"] = pts_raw
 	return _ok(result)
 
 
