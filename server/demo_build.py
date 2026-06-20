@@ -80,7 +80,7 @@ def main() -> int:
         step("add_roof", lambda: bridge.request("add_roof", points=rpoly, asset=roof, width=256, type=0))
 
     step("add_text", lambda: bridge.request(
-        "add_text", text="Built by Claude", x=cx, y=cy - h - 120, size=48))
+        "add_text", text="MCP Bridge Demo", x=cx, y=cy - h - 120, size=48))
 
     print("\nDone. Look at the map around its center — pan to it if needed.")
     print("Counts now:", bridge.request("get_status")["counts"])

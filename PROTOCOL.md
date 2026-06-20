@@ -134,7 +134,8 @@ the rect's midpoint; `fit_elements` frames the union of all rects.
 The bridge keeps its **own** undo/redo stacks (it does not use Dungeondraft's
 `History.CreateCustomRecord`, which is unreliable on 3.4.2 — see notes). Every
 reversible edit (creates, `move_element`, `modify_object`, `fill_terrain`,
-`paint_terrain`) pushes an op; a fresh edit clears the redo stack.
+`fill_region`, `paint_terrain`) pushes an op; a fresh edit clears the redo
+stack.
 
 | cmd | params | result |
 | --- | --- | --- |
@@ -148,30 +149,29 @@ Ctrl+Z in Dungeondraft.
 `color` accepts `"#rrggbb"` / `"rrggbb"` or `[r,g,b]` / `[r,g,b,a]` floats 0..1.
 `type` for walls: 0=auto,1=manual,2=cave; for roofs: 0=gable,1=hip,2=dormer.
 
-## Known unknowns (verify before relying on)
+## Implementation notes
 
-- **TCP allowed at all?** CONFIRMED working on Dungeondraft / Godot 3.4.2 — the
-  modding sandbox permits `TCP_Server`. (If a future DD/Godot version ever locks
-  this down, the fallback is a file-watch transport: the mod polls a request file
-  via `File` in `update()` and writes a response file.)
+- **Transport** — the mod opens a `TCP_Server` inside Dungeondraft; the modding
+  sandbox on Godot 3.4.2 permits it. If a future DD/Godot version locks this
+  down, the fallback is a file-watch transport: the mod polls a request file via
+  `File` in `update()` and writes a response file.
 - **Element ids** — every element is referenced by `node_id`, force-assigned via
   `Global.World.AssignNodeID(node)` on create/list so it resolves immediately
   with `GetNodeByID` / `DeleteNodeByID`.
-- **`export_map`** — `Exporter.Start(0, ppi, path)` writes asynchronously; if
-  DD chunks very large maps into multiple files the single-path read may need
-  adjusting. Verify on big maps.
+- **`export_map`** — `Exporter.Start(0, ppi, path)` writes asynchronously. If DD
+  chunks a very large map into multiple files, the single-path read would need
+  extending.
 - **`undo` / `redo`** — bridge-managed stacks, not DD's history. DD 3.4.2's
-  `History.CreateCustomRecord` does not natively record programmatic creates,
-  invokes custom `undo()` inconsistently, and never round-trips `redo()`, so it
-  was abandoned. Create ops detach/re-attach the node (remove_child / add_child,
+  `History.CreateCustomRecord` does not record programmatic creates, invokes
+  custom `undo()` inconsistently, and never round-trips `redo()`, so the bridge
+  uses its own. Create ops detach/re-attach the node (remove_child / add_child,
   keeping a reference and a stable id); transform ops restore a property
   snapshot; terrain ops restore a cloned splat image.
 - **`paint_terrain` / `fill_region`** — both edit the splat weight image
   directly (`CloneSplatImage` → raise the target slot's channel per pixel →
-  `RestoreSplat`). They do **not** use `Terrain.Paint(...)`, which is a no-op
-  from a mod context (the splat RGBA was unchanged before/after in live testing).
-  `paint_terrain` uses a soft radial falloff (a brush); `fill_region` is a hard
-  rect/polygon. Both are undoable via the cloned-splat history op.
+  `RestoreSplat`) rather than `Terrain.Paint(...)`, which does not modify the
+  splat from a mod context. `paint_terrain` uses a soft radial falloff (a
+  brush); `fill_region` is a hard rect/polygon. Both are undoable.
 - **terrain splat** — `splatImage` is RGBA = weights of slots 0–3; `splatImage2`
   = slots 4–7. `set_terrain_slot` / `SetTexture(tex, slot)` swap a slot's texture
   **globally** (everywhere that slot is weighted), so to texture one region you

@@ -14,8 +14,8 @@
 # DeleteNodeByID). Creation commands return the new id; query commands return
 # ids you can pass back to move/modify/delete.
 #
-# Undo: reversible edits are wrapped in a Dungeondraft history record
-# (library/mcp_history_record.gd) so Ctrl+Z works; see _record_and_dispatch.
+# Undo: reversible edits push an op onto the bridge's own undo/redo stacks
+# (DD 3.4.2's History.CreateCustomRecord is unreliable); see _record_and_dispatch.
 
 var script_class = "tool"
 

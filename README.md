@@ -151,13 +151,11 @@ Two things will bite you if you don't know them up front:
   handler, server for the tool registration); changing an *existing* handler's
   behavior needs only the mod reload.
 
-- **There's no live `eval`/introspect command**, so you can't probe a running
-  node's properties without a mod reload per hypothesis. When a DD API behaves
-  unexpectedly (e.g. a setter that doesn't stick), the cheapest debugging trick
-  is to **return intermediate state in the response** — e.g. stash before/after
-  values in a `_dbg` field — so one reload tells you where a value changes
-  instead of guessing across several. That's how the text font-size bug
-  (TextTool.UpdateText overwriting the node) was pinned down in a single cycle.
+- **There's no live `eval`/introspect command**, so probing a running node's
+  properties needs a mod reload. When a DD API behaves unexpectedly (e.g. a
+  setter that doesn't stick), a quick way to diagnose it is to **return
+  intermediate state in the response** — stash before/after values in a debug
+  field — so one reload shows where a value changes.
 
 ## Layout
 
@@ -169,7 +167,7 @@ server/                        the Python MCP server
   dungeondraft_mcp/server.py   MCP tool definitions
   dungeondraft_mcp/bridge_client.py  TCP/JSON client
   test_bridge.py               standalone smoke test (run this first)
-PROTOCOL.md                    wire protocol + known unknowns
+PROTOCOL.md                    wire protocol + implementation notes
 ```
 
 ## Credits
