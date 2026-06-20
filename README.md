@@ -24,10 +24,25 @@ The mod opens a TCP server inside Dungeondraft and polls it every frame from the
 `update(delta)` hook; the Python side exposes each capability as an MCP tool and
 forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
 
-> **Status: working prototype.** `ping` / `get_status` / `list_assets` /
-> `place_object` are confirmed end-to-end against Dungeondraft on **Godot 3.4.2**
-> — raw TCP from the modding sandbox works, no fallback needed. `draw_wall` is
-> still experimental (coordinate space / texture category unverified).
+> **Status: working.** Confirmed end-to-end against Dungeondraft on **Godot
+> 3.4.2** — raw TCP from the modding sandbox works, no fallback needed. 25 tools
+> across query / create / modify / terrain / levels / selection (see below).
+> A few are flagged experimental (`add_text`, `paint_terrain`).
+
+## What the AI can do
+
+- **Inspect:** `get_status`, `list_levels`, `list_elements`, `get_element`,
+  `list_asset_categories`, `list_assets` (with substring search).
+- **Create:** `place_object`, `draw_wall`, `draw_path`, `add_light`,
+  `add_portal`, `add_roof`, `add_text`*.
+- **Terrain:** `set_terrain_slot`, `fill_terrain`, `paint_terrain`*.
+- **Edit:** `move_element`, `modify_object`, `duplicate_object`,
+  `delete_element`, `select_elements`, `clear_selection`.
+- **Levels:** `add_level`, `set_level`.
+
+Every element is referenced by an integer `id`; create and list calls return
+ids you feed back into edit calls. Coordinates are woxel (pixel) space — call
+`get_status` for `map_center`. Discover assets with `list_assets`. (* experimental.)
 
 ## Setup
 
@@ -41,21 +56,23 @@ forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
 On load you should see in the Dungeondraft log:
 
 ```
-[mcp-bridge] listening on 127.0.0.1:8787 (protocol v1)
+[mcp-bridge] listening on 127.0.0.1:8787 (protocol v2)
 ```
 
-### 2. Verify the socket actually works (the one risky assumption)
+### 2. Verify the commands work
 
-With DD open and a map loaded:
+With DD open and a map loaded, run the per-command validator. It builds a small
+throwaway scene near the map center, prints PASS/FAIL for each command, then
+deletes what it made:
 
 ```bash
 cd server
 python test_bridge.py
 ```
 
-If `ping` and `get_status` come back, networking is allowed and you're done with
-the hard part. If it fails *and* you never saw the `listening` line in DD's log,
-the sandbox blocked `TCP_Server` — see the fallback note in PROTOCOL.md.
+If it fails to connect *and* you never saw the `listening` line in DD's log, the
+sandbox blocked `TCP_Server` — see the fallback note in PROTOCOL.md. (Confirmed
+working on Godot 3.4.2, so this should just pass.)
 
 ### 3. Install and wire up the MCP server
 
@@ -101,9 +118,10 @@ Adding a capability is symmetric — one handler on each side:
 2. **Server** (`server/dungeondraft_mcp/server.py`): add an `@mcp.tool()` that
    calls `bridge.request("my_command", ...)`.
 
-Good next targets: `paint_terrain` (`Terrain.Paint`), `draw_path`
-(`Pathways.CreatePath`), `select`/`delete` via `node_id`
-(`Global.World.GetNodeByID`), and a `screenshot`/export trigger.
+Good next targets: wall-mounted portals (`Wall.AddPortal`), pattern shapes
+(floors), undo integration (`Global.Editor.History.CreateCustomRecord` so AI
+edits are Ctrl-Z-able), and an export/screenshot trigger so the AI can see its
+own results.
 
 ## Layout
 
