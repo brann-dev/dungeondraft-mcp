@@ -99,17 +99,19 @@ server uses a temp path and reads it back as an image).
 
 ### History
 
-Reversible map edits (creates, `move_element`, `modify_object`, `fill_terrain`,
-`paint_terrain`) register a Dungeondraft undo record automatically, so Ctrl+Z
-works. These commands drive that same stack programmatically:
+The bridge keeps its **own** undo/redo stacks (it does not use Dungeondraft's
+`History.CreateCustomRecord`, which is unreliable on 3.4.2 — see notes). Every
+reversible edit (creates, `move_element`, `modify_object`, `fill_terrain`,
+`paint_terrain`) pushes an op; a fresh edit clears the redo stack.
 
 | cmd | params | result |
 | --- | --- | --- |
-| `undo` | — | `{ undo: true }` |
-| `redo` | — | `{ redo: true }` |
+| `undo` | — | `{ undone, kind?, undo_depth? }` / `{ undone: false, reason }` |
+| `redo` | — | `{ redone, kind?, redo_depth? }` / `{ redone: false, reason }` |
 
-`delete_element` is **not** auto-undoable (it frees the node). Levels, selection
-and capture commands are not recorded.
+`delete_element` is **not** reversible (it frees the node). Levels, selection
+and capture commands are not recorded. This stack is independent of the user's
+Ctrl+Z in Dungeondraft.
 
 `color` accepts `"#rrggbb"` / `"rrggbb"` or `[r,g,b]` / `[r,g,b,a]` floats 0..1.
 `type` for walls: 0=auto,1=manual,2=cave; for roofs: 0=gable,1=hip,2=dormer.
@@ -126,11 +128,12 @@ and capture commands are not recorded.
 - **`export_map`** — `Exporter.Start(0, ppi, path)` writes asynchronously; if
   DD chunks very large maps into multiple files the single-path read may need
   adjusting. Verify on big maps.
-- **`undo` / `redo`** — drive `Global.Editor.History.Undo()/Redo()`, guarded by
-  `has_method` since the History reference page isn't published. Create records
-  detach/re-attach the node (remove_child / add_child) rather than
-  `DeleteNodeByID`, because that history-aware delete would clear the redo stack
-  when called from undo(). The node id stays stable across undo/redo.
+- **`undo` / `redo`** — bridge-managed stacks, not DD's history. DD 3.4.2's
+  `History.CreateCustomRecord` does not natively record programmatic creates,
+  invokes custom `undo()` inconsistently, and never round-trips `redo()`, so it
+  was abandoned. Create ops detach/re-attach the node (remove_child / add_child,
+  keeping a reference and a stable id); transform ops restore a property
+  snapshot; terrain ops restore a cloned splat image.
 - **`paint_terrain`** — brush footprint and `Paint(...)` offset/position
   semantics are inferred; `fill_terrain` / `set_terrain_slot` are well-defined.
 - **`add_portal`** — only freestanding portals (`Level.CreateFreestandingPortal`);

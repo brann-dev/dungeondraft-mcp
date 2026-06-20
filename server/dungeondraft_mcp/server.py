@@ -409,13 +409,18 @@ def clear_selection() -> dict:
 
 @mcp.tool()
 def undo() -> dict:
-    """Undo the last map edit (same as Ctrl+Z in Dungeondraft). Reverses your own create/move/modify/terrain actions."""
+    """Reverse the last reversible edit you made (create / move / modify / terrain).
+
+    The bridge keeps its own undo/redo stack, so this reliably steps back through
+    your own edits. Note: it is independent of Dungeondraft's Ctrl+Z, and
+    delete_element is not reversible.
+    """
     return bridge.request("undo")
 
 
 @mcp.tool()
 def redo() -> dict:
-    """Redo the last undone map edit (same as Ctrl+Y in Dungeondraft)."""
+    """Re-apply the last edit reversed by undo()."""
     return bridge.request("redo")
 
 

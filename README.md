@@ -41,9 +41,10 @@ forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
 - **Levels:** `add_level`, `set_level`.
 - **See:** `screenshot` (current window) and `export_map` (clean full-map
   render) return images, so the model can look at its own work and iterate.
-- **Undo:** every create / move / modify / terrain edit registers a Dungeondraft
-  undo record (Ctrl+Z works), and `undo` / `redo` drive that stack so the model
-  can reverse its own changes.
+- **Undo:** the bridge keeps its own undo/redo stacks for create / move / modify
+  / terrain edits, so `undo` / `redo` let the model reliably reverse its own
+  changes (independent of Dungeondraft's Ctrl+Z; `delete_element` is not
+  reversible).
 
 Every element is referenced by an integer `id`; create and list calls return
 ids you feed back into edit calls. Coordinates are woxel (pixel) space — call
