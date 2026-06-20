@@ -1,3 +1,4 @@
+extends Reference
 # Undo/redo record created by the MCP bridge and handed to
 # Global.Editor.History.CreateCustomRecord(). Dungeondraft calls undo() on Ctrl+Z
 # and redo() on Ctrl+Y. `state["action"]` selects the behaviour:
@@ -6,9 +7,10 @@
 #   transform: { action, id, old, new }       undo/redo set captured props
 #   terrain:   { action, before, after }       undo/redo restore a splat image
 #
-# This file has no `script_class`, so Dungeondraft does not load it as a tool;
-# it is only instantiated via Script.InstanceReference() by the bridge.
-extends Reference
+# NOTE: `extends` MUST be the first line in Godot 3.4 GDScript ("extends must be
+# used before anything else") — a leading comment block makes Dungeondraft abort
+# loading the whole mod. This file has no `script_class`, so DD does not load it
+# as a tool; it is only instantiated via Script.InstanceReference() by the bridge.
 
 var state = {}
 
