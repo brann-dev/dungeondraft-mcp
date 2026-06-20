@@ -18,7 +18,7 @@ var script_class = "tool"
 
 const HOST := "127.0.0.1"
 const PORT := 8787
-const PROTOCOL_VERSION := 2
+const PROTOCOL_VERSION := 3
 
 # SelectTool.GetSelectableType() integer -> readable kind.
 const KIND_NAMES := {
@@ -131,6 +131,9 @@ func _safe_dispatch(req : Dictionary) -> Dictionary:
 		# --- levels ---
 		"add_level": return _add_level(req)
 		"set_level": return _set_level(req)
+		# --- capture ---
+		"screenshot": return _screenshot(req)
+		"export_map": return _export_map(req)
 		# --- selection ---
 		"select_elements": return _select_elements(req)
 		"clear_selection": return _clear_selection()
@@ -314,24 +317,24 @@ func _add_roof(req : Dictionary) -> Dictionary:
 	return _ok({ "id": _id(roof), "point_count": pts.size() })
 
 
-# Experimental: the Text content setter is undocumented; we try the common ones.
+# A Dungeondraft Text extends Godot LineEdit, so the string is the inherited
+# `.text` property. SetFont takes (name, size); SetFontSize/SetFontColor are setters.
 func _add_text(req : Dictionary) -> Dictionary:
 	var level = Global.World.GetCurrentLevel()
 	if level == null: return _err("no map open")
 	var text = level.Texts.CreateText()
 	text.position = _xy(req, Global.World.WoxelDimensions * 0.5)
-	var content = str(req.get("text", ""))
-	if text.has_method("Replace"):
-		text.Replace(content)
-	else:
-		text.set("text", content)
-	if req.has("size") and text.has_method("SetFontSize"):
-		text.SetFontSize(int(req["size"]))
-	if req.has("color") and text.has_method("SetFontColor"):
+	text.text = str(req.get("text", ""))
+	var size = int(req.get("size", 32))
+	if req.has("size"):
+		text.SetFontSize(size)
+	if req.has("color"):
 		text.SetFontColor(_color(req["color"], Color(1, 1, 1)))
-	if req.has("font") and text.has_method("SetFont"):
-		text.SetFont(str(req["font"]))
-	return _ok({ "id": _id(text), "experimental": true })
+	if req.has("font"):
+		text.SetFont(str(req["font"]), size)
+	if Global.Editor.Tools.has("TextTool"):
+		Global.Editor.Tools["TextTool"].UpdateText(text)
+	return _ok({ "id": _id(text) })
 
 
 # ---------------------------------------------------------------------------
@@ -443,6 +446,33 @@ func _set_level(req : Dictionary) -> Dictionary:
 
 
 # ---------------------------------------------------------------------------
+# Capture
+# ---------------------------------------------------------------------------
+
+# Grab the current window (what's on screen) to a PNG. Synchronous: the texture
+# holds the last drawn frame, so no yield is needed inside update().
+func _screenshot(req : Dictionary) -> Dictionary:
+	var path = str(req.get("path", ""))
+	if path == "": return _err("missing 'path'")
+	var img = Global.World.get_viewport().get_texture().get_data()
+	if img == null: return _err("viewport capture returned null")
+	img.flip_y()  # viewport textures come back vertically flipped
+	var err = img.save_png(path)
+	if err != OK: return _err("save_png failed (err %d): %s" % [err, path])
+	return _ok({ "path": path, "width": img.get_width(), "height": img.get_height() })
+
+
+# Render the whole map (no UI) to a clean PNG. Asynchronous: Exporter.Start runs
+# on a separate thread, so the caller (MCP server) polls the path for the file.
+func _export_map(req : Dictionary) -> Dictionary:
+	var path = str(req.get("path", ""))
+	if path == "": return _err("missing 'path'")
+	var ppi = int(req.get("ppi", 40))
+	Global.Exporter.Start(0, ppi, path)  # mode 0 = PNG
+	return _ok({ "path": path, "ppi": ppi, "async": true })
+
+
+# ---------------------------------------------------------------------------
 # Selection
 # ---------------------------------------------------------------------------
 
@@ -473,10 +503,16 @@ func _collection(level, kind : String) -> Node:
 
 
 # Stable id for a node: reuse its node_id meta, else allocate+register one.
+# Returns -1 if the node type can't be registered (e.g. Text on some versions).
 func _id(node) -> int:
 	if node.has_meta("node_id"):
 		return int(node.get_meta("node_id"))
-	return int(Global.World.AssignNodeID(node))
+	var nid = Global.World.AssignNodeID(node)
+	if nid != null:
+		return int(nid)
+	if node.has_meta("node_id"):
+		return int(node.get_meta("node_id"))
+	return -1
 
 
 func _resolve(req : Dictionary):

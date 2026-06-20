@@ -12,17 +12,36 @@ list_assets(category, search=...).
 from __future__ import annotations
 
 import os
+import tempfile
+import time
 from typing import Optional
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Image
 
-from .bridge_client import BridgeClient
+from .bridge_client import BridgeClient, BridgeError
 
 HOST = os.environ.get("DD_BRIDGE_HOST", "127.0.0.1")
 PORT = int(os.environ.get("DD_BRIDGE_PORT", "8787"))
 
 mcp = FastMCP("dungeondraft")
 bridge = BridgeClient(HOST, PORT)
+
+_SCREENSHOT_PATH = os.path.join(tempfile.gettempdir(), "dd_mcp_screenshot.png")
+_EXPORT_PATH = os.path.join(tempfile.gettempdir(), "dd_mcp_export.png")
+
+
+def _wait_for_file(path: str, timeout: float = 60.0) -> None:
+    """Block until `path` exists with a non-zero size that is stable across polls."""
+    deadline = time.time() + timeout
+    last = -1
+    while time.time() < deadline:
+        if os.path.exists(path):
+            size = os.path.getsize(path)
+            if size > 0 and size == last:
+                return
+            last = size
+        time.sleep(0.3)
+    raise BridgeError(f"render did not complete within {timeout:.0f}s ({path})")
 
 
 # --------------------------------------------------------------------------
@@ -335,6 +354,37 @@ def add_level(label: str = "Level") -> dict:
 def set_level(index: int) -> dict:
     """Switch the active level (floor) by its index (see list_levels)."""
     return bridge.request("set_level", index=index)
+
+
+# --------------------------------------------------------------------------
+# Capture — let the model see its own work
+# --------------------------------------------------------------------------
+
+@mcp.tool()
+def screenshot() -> Image:
+    """Capture the current Dungeondraft window (the on-screen view) and return it as an image.
+
+    Fast; shows exactly what's visible including the current camera framing. Use this
+    to check your work as you build. For a clean full-map render without UI, use export_map.
+    """
+    res = bridge.request("screenshot", path=_SCREENSHOT_PATH)
+    return Image(path=res["path"])
+
+
+@mcp.tool()
+def export_map(ppi: int = 40) -> Image:
+    """Render the entire current map to a clean PNG (no UI) and return it as an image.
+
+    ppi controls resolution (pixels per grid cell): higher = sharper but larger/slower.
+    The render runs asynchronously in Dungeondraft; this waits for it to finish.
+    """
+    try:
+        os.remove(_EXPORT_PATH)
+    except FileNotFoundError:
+        pass
+    bridge.request("export_map", path=_EXPORT_PATH, ppi=ppi)
+    _wait_for_file(_EXPORT_PATH)
+    return Image(path=_EXPORT_PATH)
 
 
 # --------------------------------------------------------------------------

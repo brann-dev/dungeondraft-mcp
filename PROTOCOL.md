@@ -64,7 +64,7 @@ descriptor is `{ id, kind, position[x,y], rotation(deg), scale, asset? }`.
 | `add_light` | `x?`, `y?`, `color?`, `energy=1`, `range=1`, `shadows=true`, `asset?` |
 | `add_portal` | `asset`, `x?`, `y?`, `closed=false`, `radius=64`, `rotation=0` |
 | `add_roof` | `points[[x,y]...]`, `asset`, `width=256`, `type=0`, `sorting=0` |
-| `add_text` *(experimental)* | `text`, `x?`, `y?`, `size?`, `color?`, `font?` |
+| `add_text` | `text`, `x?`, `y?`, `size?`, `color?`, `font?` |
 
 ### Terrain
 
@@ -87,6 +87,16 @@ descriptor is `{ id, kind, position[x,y], rotation(deg), scale, asset? }`.
 | `select_elements` | `ids[]` |
 | `clear_selection` | — |
 
+### Capture
+
+The caller passes the absolute `path` the mod should write the PNG to (the MCP
+server uses a temp path and reads it back as an image).
+
+| cmd | params | result |
+| --- | --- | --- |
+| `screenshot` | `path` | `{ path, width, height }` — window grab, synchronous |
+| `export_map` | `path`, `ppi=40` | `{ path, ppi, async }` — full-map render on a background thread; poll `path` for the file |
+
 `color` accepts `"#rrggbb"` / `"rrggbb"` or `[r,g,b]` / `[r,g,b,a]` floats 0..1.
 `type` for walls: 0=auto,1=manual,2=cave; for roofs: 0=gable,1=hip,2=dormer.
 
@@ -99,9 +109,9 @@ descriptor is `{ id, kind, position[x,y], rotation(deg), scale, asset? }`.
 - **Element ids** — every element is referenced by `node_id`, force-assigned via
   `Global.World.AssignNodeID(node)` on create/list so it resolves immediately
   with `GetNodeByID` / `DeleteNodeByID`.
-- **`add_text`** — the Text content setter is undocumented; the mod tries
-  `Replace()` then a `text` property. May not populate the string on all
-  versions. Verify visually.
+- **`export_map`** — `Exporter.Start(0, ppi, path)` writes asynchronously; if
+  DD chunks very large maps into multiple files the single-path read may need
+  adjusting. Verify on big maps.
 - **`paint_terrain`** — brush footprint and `Paint(...)` offset/position
   semantics are inferred; `fill_terrain` / `set_terrain_slot` are well-defined.
 - **`add_portal`** — only freestanding portals (`Level.CreateFreestandingPortal`);
