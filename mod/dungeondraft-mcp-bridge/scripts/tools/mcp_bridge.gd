@@ -21,7 +21,7 @@ var script_class = "tool"
 
 const HOST := "127.0.0.1"
 const PORT := 8787
-const PROTOCOL_VERSION := 15
+const PROTOCOL_VERSION := 16
 
 # Commands that get wrapped in a Dungeondraft undo record (see _record_and_dispatch).
 const CREATE_CMDS := [
@@ -784,24 +784,30 @@ func _add_portal(req : Dictionary) -> Dictionary:
 	return _ok({ "id": _id(kids[kids.size() - 1]), "kind": "portal", "position": _vec(pos) })
 
 
+# TEMP DEBUG: dump AddPolygon/AddHip/Set arg signatures so we can find the proper
+# CLOSED-roof entry point (Set duplicates the first vertex when we close it,
+# which malforms the top-left hip face). Then build a test roof via AddPolygon.
+# Add a roof. KEY MODEL (learned by probing): Roof.Set(points, width, type) takes
+# the roof's RIDGE LINE (the peak), NOT a footprint to trace — it builds a
+# complete, self-closing roof that slopes down `width` woxels perpendicular to
+# each side of the ridge, with hips/gables off the ridge ends. So:
+#   - 2 points = one clean roof (a short ridge -> a near-pyramid hip).
+#   - the footprint covered = the ridge bounding box expanded by `width` on all
+#     sides. For a building W x H, put the ridge along the LONG axis, centered,
+#     and set width = half the SHORT dimension so the eaves reach the walls.
+# (Earlier code wrongly treated points as a footprint and "closed" the loop,
+# which duplicated a vertex and malformed the seam corner — removed.)
 func _add_roof(req : Dictionary) -> Dictionary:
 	var level = Global.World.GetCurrentLevel()
 	if level == null: return _err("no map open")
 	var pts = _points(req.get("points", []))
-	if pts.size() < 2: return _err("'points' needs >= 2 [x,y] pairs")
+	if pts.size() < 2: return _err("'points' needs >= 2 [x,y] ridge points")
 	var tex = _asset_tex("Roofs", req.get("asset", ""))
 	if tex == null: return _err("could not load roof asset: " + str(req.get("asset")))
-	# A roof over a building is a CLOSED footprint, but Roof.Set connects the
-	# points as given without closing the loop (an open polygon renders as a
-	# "C" shape with one side missing). Close it by repeating the first point,
-	# unless the caller wants an open ridge (`closed:false`, e.g. a lean-to).
-	var closed = bool(req.get("closed", true))
-	if closed and pts.size() >= 3 and pts[0].distance_to(pts[pts.size() - 1]) > 0.5:
-		pts.append(pts[0])
 	var roof = level.Roofs.CreateRoof(int(req.get("sorting", 0)))
 	roof.Set(pts, float(req.get("width", 256.0)), int(req.get("type", 0)))  # type: 0 gable,1 hip,2 dormer
 	roof.SetTileTexture(tex)
-	return _ok({ "id": _id(roof), "point_count": pts.size(), "closed": closed })
+	return _ok({ "id": _id(roof), "ridge_points": pts.size() })
 
 
 # Place a tiled floor/pattern shape (the "Floor" / Pattern Shape Tool in the UI).

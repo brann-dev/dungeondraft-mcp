@@ -247,22 +247,27 @@ def add_roof(
     width: float = 256.0,
     type: int = 0,
     sorting: int = 0,
-    closed: bool = True,
 ) -> dict:
-    """Add a roof along a polyline of [x, y] woxel points. Returns the new element id.
+    """Add a roof from its RIDGE LINE. Returns the new element id.
 
-    A roof is a sloped tile band that follows the points (like the UI's roof
-    trace), sloping inward from each eave by `width` woxels. For a building, pass
-    the footprint CORNERS and keep closed=True (the default) so the loop closes —
-    an open polyline renders as a 'C' with one side missing. Set width >= half
-    the footprint's span so opposing slopes meet and cover the interior;
-    otherwise the middle stays open (a courtyard). closed=False leaves an open
-    ridge (e.g. a lean-to). asset: a Roofs asset path (list_assets('Roofs')).
-    type: 0=gable, 1=hip, 2=dormer. Roofs render above everything (z 800).
+    IMPORTANT: `points` is the roof's ridge (the peak line), NOT a footprint to
+    trace. DD builds a complete, self-closing roof that slopes down `width`
+    woxels perpendicular to each side of the ridge, with hips/gables off the
+    ridge ends. The footprint covered = the ridge's bounding box expanded by
+    `width` on every side.
+
+    To roof a building W x H: put the ridge along the LONG axis, centered, and
+    set width = half the SHORT dimension so the eaves reach the side walls. The
+    ridge should be shorter than the long wall by ~width at each end (so the end
+    hips land on the short walls). Two points that are close together give a
+    near-pyramid (a square hip roof).
+
+    asset: a Roofs asset path (list_assets('Roofs')). type: 0=gable, 1=hip,
+    2=dormer. Roofs render above everything (z 800). Undoable as a create.
     """
     return bridge.request(
         "add_roof", points=points, asset=asset, width=width,
-        type=type, sorting=sorting, closed=closed,
+        type=type, sorting=sorting,
     )
 
 
