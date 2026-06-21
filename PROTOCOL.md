@@ -97,6 +97,7 @@ It is undo-recorded like the other terrain ops.
 | `paint_terrain` | `slot=0`, `x?`, `y?`, `radius=64`, `rate=1`, `asset?` |
 | `paint_path` | `points=[[x,y]...]`, `slot=0`, `radius=96`, `rate=1`, `asset?` |
 | `dig_cave` | `points=[[x,y]...]` **or** `x?`,`y?`, `radius=256`, `dig=true`, `ground_color?`, `wall_color?`, `texture?` |
+| `clear_caves` | — (wipes the whole cave layer back to rock) |
 
 ### Modify / delete / levels / selection
 
@@ -236,7 +237,9 @@ Ctrl+Z in Dungeondraft.
   `SetCircle` and the `IsEmpty` flag on the mesh proved unreliable from a mod
   context (an internal grid the BitMap doesn't reflect) — editing the BitMap
   directly is the path that renders. Undo-recorded (snapshots the BitMap before
-  and after, like the terrain ops).
+  and after, like the terrain ops). `clear_caves` wipes the whole cave layer back
+  to rock in one call (native `CaveMesh.Clear()`, or zero the BitMap as a
+  fallback, then rebuild) — also undoable.
 - **`add_portal`** — defaults to **wall-mounted** (`Wall.AddPortal`): snaps to
   the nearest wall within `snap_max` woxels, faces along that wall segment, and
   the wall remakes its lines so the portal cuts a gap (matching manual door

@@ -507,6 +507,17 @@ def dig_cave(
     return bridge.request("dig_cave", **params)
 
 
+@mcp.tool()
+def clear_caves() -> dict:
+    """Wipe the entire cave layer back to solid rock.
+
+    Removes all carved caves at once (the whole cave system), rebuilding the
+    mesh. Undoable like dig_cave. Use this instead of filling regions back with
+    dig_cave(dig=False) when you want to reset all caves.
+    """
+    return bridge.request("clear_caves")
+
+
 # --------------------------------------------------------------------------
 # Modify / delete
 # --------------------------------------------------------------------------

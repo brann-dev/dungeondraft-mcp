@@ -25,7 +25,7 @@ The mod opens a TCP server inside Dungeondraft and polls it every frame from the
 forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
 
 > **Status: working.** Confirmed end-to-end against Dungeondraft on **Godot
-> 3.4.2** — raw TCP from the modding sandbox works, no fallback needed. 38 tools
+> 3.4.2** — raw TCP from the modding sandbox works, no fallback needed. 39 tools
 > across query / create / modify / terrain / levels / selection / capture /
 > camera / undo (see below).
 
@@ -42,7 +42,7 @@ forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
   `paint_path` (a smooth continuous stroke along a polyline — roads/trails).
 - **Caves:** `dig_cave` carves caverns/tunnels along a path (the Cave Brush —
   dig open floor out of rock, with auto rocky walls + debris; `dig=false` fills
-  back; optional ground/wall tints).
+  back; optional ground/wall tints), `clear_caves` wipes the whole cave layer.
 - **Edit:** `move_element`, `modify_object`, `duplicate_object`,
   `delete_element`, `select_elements`, `clear_selection`.
 - **Levels:** `add_level`, `set_level`.

@@ -21,7 +21,7 @@ var script_class = "tool"
 
 const HOST := "127.0.0.1"
 const PORT := 8787
-const PROTOCOL_VERSION := 13
+const PROTOCOL_VERSION := 14
 
 # Commands that get wrapped in a Dungeondraft undo record (see _record_and_dispatch).
 const CREATE_CMDS := [
@@ -30,7 +30,7 @@ const CREATE_CMDS := [
 ]
 const TRANSFORM_CMDS := ["move_element", "modify_object"]
 const TERRAIN_CMDS := ["fill_terrain", "fill_region", "paint_terrain", "paint_path"]
-const CAVE_CMDS := ["dig_cave"]
+const CAVE_CMDS := ["dig_cave", "clear_caves"]
 # Neutral opaque tint for pattern floors when no color is given. PatternShapeTool
 # has no per-texture default (and its .Color leaks across calls), so we apply a
 # deterministic wood/stone-neutral tone; callers pass an explicit color to override.
@@ -300,6 +300,7 @@ func _safe_dispatch(req : Dictionary) -> Dictionary:
 		"get_element": return _get_element(req)
 		"list_levels": return _list_levels()
 		"dig_cave": return _dig_cave(req)
+		"clear_caves": return _clear_caves(req)
 		# --- create ---
 		"place_object": return _place_object(req)
 		"draw_wall": return _draw_wall(req)
@@ -494,6 +495,36 @@ func _cave_stroke_segment(bm, a : Vector2, b : Vector2, rad : int, value : bool,
 		return
 	for s in range(steps + 1):
 		_cave_stamp(bm, a.linear_interpolate(b, float(s) / steps), rad, value, bw, bh)
+
+
+# Wipe the entire cave layer back to solid rock. Uses the native Clear() then
+# rebuilds the mesh; if Clear isn't present, falls back to zeroing the BitMap
+# (set every bit false) and pushing it back — both render via UpdateMesh. This is
+# a CAVE_CMD, so it's BitMap-snapshotted for undo like dig_cave.
+func _clear_caves(req : Dictionary) -> Dictionary:
+	var level = Global.World.GetCurrentLevel()
+	if level == null: return _err("no map open")
+	var cave = _cave_mesh()
+	if cave == null: return _err("cave brush/mesh unavailable")
+	var method = ""
+	if cave.has_method("Clear"):
+		cave.call("Clear")
+		method = "Clear"
+	elif cave.has_method("get_Bitmap") and cave.has_method("SetBitmap"):
+		var bm = cave.call("get_Bitmap")
+		if bm != null:
+			var size = bm.call("get_size")
+			for iy in range(int(size.y)):
+				for ix in range(int(size.x)):
+					bm.call("set_bit", Vector2(ix, iy), false)
+			cave.call("SetBitmap", bm)
+			method = "zero_bitmap"
+	else:
+		return _err("cave mesh missing Clear/BitMap API")
+	if cave.has_method("FinalizeMeshAndBorders"):
+		cave.call("FinalizeMeshAndBorders")
+	cave.call("UpdateMesh")
+	return _ok({ "cleared": true, "method": method })
 
 
 func _list_elements(req : Dictionary) -> Dictionary:
