@@ -475,6 +475,38 @@ def paint_path(
     return bridge.request("paint_path", **params)
 
 
+@mcp.tool()
+def dig_cave(
+    points: list[list[float]],
+    radius: float = 256.0,
+    dig: bool = True,
+    ground_color: str = "",
+    wall_color: str = "",
+    texture: str = "",
+) -> dict:
+    """Carve a cave along a path with the Cave Brush (the dig/blast tool).
+
+    Dungeondraft caves are a separate layer: you dig open floor out of solid
+    rock, and DD auto-generates the rocky wall border + debris around the opening.
+
+    points: a list of [x, y] woxel points the cave runs through (>= 1). A single
+    point digs one circular chamber; multiple points dig a connected tunnel
+    (rasterized as a constant-width ribbon, like paint_path). radius: half-width
+    in woxels (default 256 = ~1 tile). dig: True carves open cave; False fills it
+    back to rock. ground_color / wall_color: optional cave floor/wall tints
+    ("#rrggbb" or [r,g,b]). texture: optional Caves floor asset (see
+    list_assets(category="Caves")). The mesh rebuilds automatically.
+    """
+    params = {"points": points, "radius": radius, "dig": dig}
+    if ground_color:
+        params["ground_color"] = ground_color
+    if wall_color:
+        params["wall_color"] = wall_color
+    if texture:
+        params["texture"] = texture
+    return bridge.request("dig_cave", **params)
+
+
 # --------------------------------------------------------------------------
 # Modify / delete
 # --------------------------------------------------------------------------

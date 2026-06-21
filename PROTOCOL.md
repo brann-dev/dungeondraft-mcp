@@ -96,6 +96,7 @@ It is undo-recorded like the other terrain ops.
 | `fill_region` | `rect=[x,y,w,h]` **or** `points=[[x,y]...]`, `slot=0`, `asset?`, `rate=1` |
 | `paint_terrain` | `slot=0`, `x?`, `y?`, `radius=64`, `rate=1`, `asset?` |
 | `paint_path` | `points=[[x,y]...]`, `slot=0`, `radius=96`, `rate=1`, `asset?` |
+| `dig_cave` | `points=[[x,y]...]` **or** `x?`,`y?`, `radius=256`, `dig=true`, `ground_color?`, `wall_color?`, `texture?` |
 
 ### Modify / delete / levels / selection
 
@@ -219,6 +220,21 @@ Ctrl+Z in Dungeondraft.
   along the **same** boundary path (so the floor meets the wall with no gap, like
   the UI's combined trace), by calling `draw_wall` + `place_pattern`/`fill_region`
   internally. `floor` = `"pattern"` / `"terrain"` / `"none"`.
+- **`dig_cave`** — caves are a separate layer: a `CaveMesh` (a `MeshInstance2D`,
+  z -300) whose open/rock state is a Godot **`BitMap`** (one bit per cell;
+  `true` = open cave floor). The bridge enables the `CaveBrush` tool (the UI
+  path, which wires the mesh to the level), fetches the BitMap via
+  `get_Bitmap()`, sets bits along the requested woxel path (rasterized as a
+  constant-width ribbon, like `paint_path`), then `SetBitmap` +
+  `FinalizeMeshAndBorders` + `UpdateMesh` rebuilds the floor, the rocky wall
+  border and debris — the same result as hand-painting with the Cave Brush.
+  Cell mapping: `cell = floor(woxel / CellSize) + MapEdgeBuffer` (CellSize is 64
+  woxels = ¼ tile). `dig=false` fills cave back to rock. `ground_color` /
+  `wall_color` tint the **whole** cave system (DD applies one color globally, as
+  the UI does), `texture` sets the cave floor from the `Caves` asset bank. Note:
+  `SetCircle` and the `IsEmpty` flag on the mesh proved unreliable from a mod
+  context (an internal grid the BitMap doesn't reflect) — editing the BitMap
+  directly is the path that renders. Not currently undo-recorded.
 - **`add_portal`** — defaults to **wall-mounted** (`Wall.AddPortal`): snaps to
   the nearest wall within `snap_max` woxels, faces along that wall segment, and
   the wall remakes its lines so the portal cuts a gap (matching manual door

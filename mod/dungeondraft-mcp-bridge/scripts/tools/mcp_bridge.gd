@@ -21,7 +21,7 @@ var script_class = "tool"
 
 const HOST := "127.0.0.1"
 const PORT := 8787
-const PROTOCOL_VERSION := 11
+const PROTOCOL_VERSION := 12
 
 # Commands that get wrapped in a Dungeondraft undo record (see _record_and_dispatch).
 const CREATE_CMDS := [
@@ -261,6 +261,7 @@ func _safe_dispatch(req : Dictionary) -> Dictionary:
 		"list_elements": return _list_elements(req)
 		"get_element": return _get_element(req)
 		"list_levels": return _list_levels()
+		"dig_cave": return _dig_cave(req)
 		# --- create ---
 		"place_object": return _place_object(req)
 		"draw_wall": return _draw_wall(req)
@@ -347,6 +348,114 @@ func _list_assets(req : Dictionary) -> Dictionary:
 		if out.size() < limit:
 			out.append(path)
 	return _ok({ "category": category, "total": all.size(), "matched": matched, "returned": out.size(), "assets": out })
+
+
+# Resolve the cave editing target: enable the CaveBrush (the UI path that wires
+# the mesh to the level) and return its CaveMesh, or null if unavailable.
+func _cave_mesh():
+	if not Global.Editor.Tools.has("CaveBrush"):
+		return null
+	var brush = Global.Editor.Tools["CaveBrush"]
+	brush.call("Enable")
+	if not brush.has_method("get_Mesh"):
+		return null
+	return brush.call("get_Mesh")
+
+
+# Woxel position -> cave-bitmap cell (the bitmap is the woxel grid at CellSize
+# woxels/cell plus a MapEdgeBuffer border).
+func _cave_cell(cave, world : Vector2) -> Vector2:
+	var cs = cave.call("get_CellSize")
+	var buf = int(cave.get("MapEdgeBuffer"))
+	return Vector2(int(floor(world.x / cs)) + buf, int(floor(world.y / cs)) + buf)
+
+
+# Dig (or fill) a cave along a polyline brush stroke. The cave is a MeshInstance2D
+# whose open/rock state is a Godot BitMap (true = open cave floor); editing it
+# then SetBitmap + UpdateMesh rebuilds the floor, rocky wall border and debris
+# (exactly what the UI's Cave Brush does). Params:
+#   points:[[x,y]...] (>=1) woxel path; single point = one dab.
+#   radius (woxels, default 256 = 1 tile), value/dig (true=dig open, false=fill),
+#   ground_color / wall_color (optional tints), texture (optional Caves asset).
+# A multi-point path is rasterized as a constant-width ribbon so it digs a smooth
+# tunnel (like paint_path, but into the cave bitmap).
+func _dig_cave(req : Dictionary) -> Dictionary:
+	var level = Global.World.GetCurrentLevel()
+	if level == null: return _err("no map open")
+	var cave = _cave_mesh()
+	if cave == null: return _err("cave brush/mesh unavailable")
+	if not cave.has_method("get_Bitmap") or not cave.has_method("SetBitmap"):
+		return _err("cave mesh missing BitMap API")
+
+	# Optional cave tints / floor texture (apply before the mesh rebuild).
+	if req.has("ground_color") and str(req.get("ground_color", "")) != "":
+		var gc = _color(req["ground_color"], Color(0.5, 0.5, 0.45))
+		if cave.has_method("SetGroundColor"): cave.call("SetGroundColor", gc)
+	if req.has("wall_color") and str(req.get("wall_color", "")) != "":
+		var wc = _color(req["wall_color"], Color(0.5, 0.5, 0.45))
+		if cave.has_method("SetWallColor"): cave.call("SetWallColor", wc)
+	if req.has("texture") and str(req.get("texture", "")) != "":
+		var tex = _asset_tex("Caves", req["texture"])
+		if tex != null and cave.has_method("SetFloorTexture"):
+			cave.call("SetFloorTexture", tex)
+
+	# Path -> cell-space points.
+	var pts := []
+	if req.has("points"):
+		for p in req["points"]:
+			pts.append(_cave_cell(cave, Vector2(float(p[0]), float(p[1]))))
+	else:
+		pts.append(_cave_cell(cave, _xy(req, Global.World.WoxelDimensions * 0.5)))
+	if pts.empty(): return _err("provide 'points':[[x,y]...] or x/y")
+
+	var value = bool(req.get("value", req.get("dig", true)))
+	var cs = cave.call("get_CellSize")
+	var rad_cells = max(int(round(float(req.get("radius", 256.0)) / cs)), 1)
+
+	var bm = cave.call("get_Bitmap")
+	if bm == null: return _err("cave bitmap is null")
+	var size = bm.call("get_size")
+	var bw = int(size.x)
+	var bh = int(size.y)
+	# Rasterize the stroke: dab each point, then thicken the segments between them.
+	var n := 0
+	for cell in pts:
+		n += _cave_stamp(bm, cell, rad_cells, value, bw, bh)
+	for i in range(pts.size() - 1):
+		_cave_stroke_segment(bm, pts[i], pts[i + 1], rad_cells, value, bw, bh)
+
+	cave.call("SetBitmap", bm)
+	if cave.has_method("FinalizeMeshAndBorders"):
+		cave.call("FinalizeMeshAndBorders")
+	cave.call("UpdateMesh")
+	return _ok({
+		"dug": value, "cells_painted": n, "radius_cells": rad_cells,
+		"points": pts.size(), "bitmap_size": [bw, bh],
+	})
+
+
+# Stamp a filled circle of cells into the BitMap. Returns the count set.
+func _cave_stamp(bm, c : Vector2, rad : int, value : bool, bw : int, bh : int) -> int:
+	var n := 0
+	var x0 = max(int(c.x) - rad, 0)
+	var y0 = max(int(c.y) - rad, 0)
+	var x1 = min(int(c.x) + rad, bw - 1)
+	var y1 = min(int(c.y) + rad, bh - 1)
+	for iy in range(y0, y1 + 1):
+		for ix in range(x0, x1 + 1):
+			if Vector2(ix, iy).distance_to(c) <= rad:
+				bm.call("set_bit", Vector2(ix, iy), value)
+				n += 1
+	return n
+
+
+# Stamp a thick line of cells between two cell-space points (no gaps between dabs).
+func _cave_stroke_segment(bm, a : Vector2, b : Vector2, rad : int, value : bool, bw : int, bh : int) -> void:
+	var steps = int(ceil(a.distance_to(b)))
+	if steps <= 0:
+		return
+	for s in range(steps + 1):
+		_cave_stamp(bm, a.linear_interpolate(b, float(s) / steps), rad, value, bw, bh)
 
 
 func _list_elements(req : Dictionary) -> Dictionary:
