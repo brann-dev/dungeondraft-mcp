@@ -147,8 +147,9 @@ the rect's midpoint; `fit_elements` frames the union of all rects.
 The bridge keeps its **own** undo/redo stacks (it does not use Dungeondraft's
 `History.CreateCustomRecord`, which is unreliable on 3.4.2 — see notes). Every
 reversible edit (creates, `move_element`, `modify_object`, `fill_terrain`,
-`fill_region`, `paint_terrain`) pushes an op; a fresh edit clears the redo
-stack.
+`fill_region`, `paint_terrain`, `paint_path`, `dig_cave`) pushes an op; a fresh
+edit clears the redo stack. Terrain ops snapshot the splat image before/after;
+`dig_cave` snapshots the cave `BitMap` the same way.
 
 | cmd | params | result |
 | --- | --- | --- |
@@ -234,7 +235,8 @@ Ctrl+Z in Dungeondraft.
   the UI does), `texture` sets the cave floor from the `Caves` asset bank. Note:
   `SetCircle` and the `IsEmpty` flag on the mesh proved unreliable from a mod
   context (an internal grid the BitMap doesn't reflect) — editing the BitMap
-  directly is the path that renders. Not currently undo-recorded.
+  directly is the path that renders. Undo-recorded (snapshots the BitMap before
+  and after, like the terrain ops).
 - **`add_portal`** — defaults to **wall-mounted** (`Wall.AddPortal`): snaps to
   the nearest wall within `snap_max` woxels, faces along that wall segment, and
   the wall remakes its lines so the portal cuts a gap (matching manual door

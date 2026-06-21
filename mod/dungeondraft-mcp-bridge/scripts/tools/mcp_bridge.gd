@@ -21,7 +21,7 @@ var script_class = "tool"
 
 const HOST := "127.0.0.1"
 const PORT := 8787
-const PROTOCOL_VERSION := 12
+const PROTOCOL_VERSION := 13
 
 # Commands that get wrapped in a Dungeondraft undo record (see _record_and_dispatch).
 const CREATE_CMDS := [
@@ -30,6 +30,7 @@ const CREATE_CMDS := [
 ]
 const TRANSFORM_CMDS := ["move_element", "modify_object"]
 const TERRAIN_CMDS := ["fill_terrain", "fill_region", "paint_terrain", "paint_path"]
+const CAVE_CMDS := ["dig_cave"]
 # Neutral opaque tint for pattern floors when no color is given. PatternShapeTool
 # has no per-texture default (and its .Color leaks across calls), so we apply a
 # deterministic wood/stone-neutral tone; callers pass an explicit color to override.
@@ -134,9 +135,13 @@ func _record_and_dispatch(req : Dictionary) -> Dictionary:
 		if lvl != null:
 			terrain_before = lvl.Terrain.CloneSplatImage()
 
+	var cave_before = null
+	if cmd in CAVE_CMDS:
+		cave_before = _cave_snapshot()
+
 	var result = _safe_dispatch(req)
 	if typeof(result) == TYPE_DICTIONARY and result.get("ok", false):
-		var op = _build_op(cmd, req, result, pre, terrain_before)
+		var op = _build_op(cmd, req, result, pre, terrain_before, cave_before)
 		if op != null:
 			_undo_stack.append(op)
 			_redo_stack = []   # a fresh edit invalidates the redo branch
@@ -145,7 +150,7 @@ func _record_and_dispatch(req : Dictionary) -> Dictionary:
 
 # Returns an undo op for a recordable command, or null. Ops are reversed by
 # _apply_op (undo=true) and re-applied (undo=false).
-func _build_op(cmd, req, result, pre, terrain_before):
+func _build_op(cmd, req, result, pre, terrain_before, cave_before = null):
 	if cmd in CREATE_CMDS:
 		var id = result["result"].get("id", -1)
 		if id != null and int(id) >= 0:
@@ -160,6 +165,10 @@ func _build_op(cmd, req, result, pre, terrain_before):
 		var lvl = Global.World.GetCurrentLevel()
 		if lvl != null:
 			return { "kind": "terrain", "before": terrain_before, "after": lvl.Terrain.CloneSplatImage() }
+	elif cmd in CAVE_CMDS and cave_before != null:
+		var after = _cave_snapshot()
+		if after != null:
+			return { "kind": "cave", "before": cave_before, "after": after }
 	return null
 
 
@@ -192,6 +201,8 @@ func _apply_op(op, undo : bool):
 			_apply_props(Global.World.GetNodeByID(int(op["id"])), op["old"] if undo else op["new"])
 		"terrain":
 			_restore_splat(op["before"] if undo else op["after"])
+		"cave":
+			_restore_cave(op["before"] if undo else op["after"])
 
 
 func _detach_node(node, id : int):
@@ -234,6 +245,33 @@ func _restore_splat(img):
 		return
 	level.Terrain.RestoreSplat(img)
 	level.Terrain.UpdateSplat()
+
+
+# Deep-copy the cave BitMap for the undo stack (Resource.duplicate(true) so the
+# snapshot isn't aliased to the live bitmap). Returns null if no cave is present.
+func _cave_snapshot():
+	var cave = _cave_mesh()
+	if cave == null or not cave.has_method("get_Bitmap"):
+		return null
+	var bm = cave.call("get_Bitmap")
+	if bm == null:
+		return null
+	return bm.duplicate(true)
+
+
+# Restore a snapshotted cave BitMap and rebuild the mesh (mirror of _restore_splat
+# for the cave layer). A duplicate(true) of the stored snapshot is pushed so the
+# op's snapshot stays pristine across repeated undo/redo.
+func _restore_cave(bm):
+	if bm == null:
+		return
+	var cave = _cave_mesh()
+	if cave == null or not cave.has_method("SetBitmap"):
+		return
+	cave.call("SetBitmap", bm.duplicate(true))
+	if cave.has_method("FinalizeMeshAndBorders"):
+		cave.call("FinalizeMeshAndBorders")
+	cave.call("UpdateMesh")
 
 
 func _snapshot(node) -> Dictionary:
