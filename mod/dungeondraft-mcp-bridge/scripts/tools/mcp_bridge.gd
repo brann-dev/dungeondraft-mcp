@@ -21,7 +21,7 @@ var script_class = "tool"
 
 const HOST := "127.0.0.1"
 const PORT := 8787
-const PROTOCOL_VERSION := 14
+const PROTOCOL_VERSION := 15
 
 # Commands that get wrapped in a Dungeondraft undo record (see _record_and_dispatch).
 const CREATE_CMDS := [
@@ -791,10 +791,17 @@ func _add_roof(req : Dictionary) -> Dictionary:
 	if pts.size() < 2: return _err("'points' needs >= 2 [x,y] pairs")
 	var tex = _asset_tex("Roofs", req.get("asset", ""))
 	if tex == null: return _err("could not load roof asset: " + str(req.get("asset")))
+	# A roof over a building is a CLOSED footprint, but Roof.Set connects the
+	# points as given without closing the loop (an open polygon renders as a
+	# "C" shape with one side missing). Close it by repeating the first point,
+	# unless the caller wants an open ridge (`closed:false`, e.g. a lean-to).
+	var closed = bool(req.get("closed", true))
+	if closed and pts.size() >= 3 and pts[0].distance_to(pts[pts.size() - 1]) > 0.5:
+		pts.append(pts[0])
 	var roof = level.Roofs.CreateRoof(int(req.get("sorting", 0)))
 	roof.Set(pts, float(req.get("width", 256.0)), int(req.get("type", 0)))  # type: 0 gable,1 hip,2 dormer
 	roof.SetTileTexture(tex)
-	return _ok({ "id": _id(roof), "point_count": pts.size() })
+	return _ok({ "id": _id(roof), "point_count": pts.size(), "closed": closed })
 
 
 # Place a tiled floor/pattern shape (the "Floor" / Pattern Shape Tool in the UI).

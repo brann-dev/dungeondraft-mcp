@@ -247,12 +247,23 @@ def add_roof(
     width: float = 256.0,
     type: int = 0,
     sorting: int = 0,
+    closed: bool = True,
 ) -> dict:
-    """Add a roof over a polygon of [x, y] woxel points. Returns the new element id.
+    """Add a roof along a polyline of [x, y] woxel points. Returns the new element id.
 
-    asset: a Roofs asset path. type: 0=gable, 1=hip, 2=dormer. width: roof width.
+    A roof is a sloped tile band that follows the points (like the UI's roof
+    trace), sloping inward from each eave by `width` woxels. For a building, pass
+    the footprint CORNERS and keep closed=True (the default) so the loop closes —
+    an open polyline renders as a 'C' with one side missing. Set width >= half
+    the footprint's span so opposing slopes meet and cover the interior;
+    otherwise the middle stays open (a courtyard). closed=False leaves an open
+    ridge (e.g. a lean-to). asset: a Roofs asset path (list_assets('Roofs')).
+    type: 0=gable, 1=hip, 2=dormer. Roofs render above everything (z 800).
     """
-    return bridge.request("add_roof", points=points, asset=asset, width=width, type=type, sorting=sorting)
+    return bridge.request(
+        "add_roof", points=points, asset=asset, width=width,
+        type=type, sorting=sorting, closed=closed,
+    )
 
 
 @mcp.tool()

@@ -77,7 +77,7 @@ node; default color is black.
 | `draw_path` | `points[[x,y]...]`, `asset`, `layer=0`, `sorting=0`, `smoothness?`, `width?` |
 | `add_light` | `x?`, `y?`, `color?`, `energy=1`, `range=1`, `shadows=true`, `asset?` |
 | `add_portal` | `asset`, `x?`, `y?`, `closed=false`, `radius=64`, `mount="wall"`, `snap_max=256`, `flip=false`, `fallback_free=true`, `rotation=0` |
-| `add_roof` | `points[[x,y]...]`, `asset`, `width=256`, `type=0`, `sorting=0` |
+| `add_roof` | `points[[x,y]...]`, `asset`, `width=256`, `type=0`, `sorting=0`, `closed=true` |
 | `add_text` | `text`, `x?`, `y?`, `size?`, `color?`, `font?` |
 | `place_pattern` | `asset`, `rect=[x,y,w,h]` **or** `points=[[x,y]...]`, `category="Patterns"`, `color?`, `rotation?` |
 | `build_room` | `rect=[x,y,w,h]` **or** `points=[[x,y]...]`, `wall_asset?`, `floor="pattern"\|"terrain"\|"none"`, `floor_asset?`, `floor_category="Simple Tiles"`, `floor_color?`, `floor_slot=1`, `wall_type=0`, `wall_joint=1` → `{ wall_id, floor_id?, points }` |
@@ -222,6 +222,17 @@ Ctrl+Z in Dungeondraft.
   along the **same** boundary path (so the floor meets the wall with no gap, like
   the UI's combined trace), by calling `draw_wall` + `place_pattern`/`fill_region`
   internally. `floor` = `"pattern"` / `"terrain"` / `"none"`.
+- **`add_roof`** — a roof is a sloped tile band that follows the `points` polyline
+  (DD's `Roof.Set(points, width, type)`), sloping inward from each eave by `width`
+  woxels. `Roof.Set` does **not** close the loop, so an open polygon renders as a
+  "C" with one side missing; `add_roof` closes it by repeating the first point
+  when `closed` (default `true`) — pass `closed:false` for an open ridge like a
+  lean-to. For a solid roof, `width` must be ≥ half the footprint's span so the
+  opposing slopes meet (else the interior stays open, a courtyard). `type`:
+  0=gable, 1=hip, 2=dormer. Roofs have **no color/tint** (the tileset renders at
+  its natural color — there is no `SetColor`, unlike walls/patterns) and sit at
+  z 800 (above everything). Not undo-recorded as a terrain-style op, but it is a
+  create (returns an `id`) and `undo` reverses creates.
 - **`dig_cave`** — caves are a separate layer: a `CaveMesh` (a `MeshInstance2D`,
   z -300) whose open/rock state is a Godot **`BitMap`** (one bit per cell;
   `true` = open cave floor). The bridge enables the `CaveBrush` tool (the UI
