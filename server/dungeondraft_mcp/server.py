@@ -120,7 +120,10 @@ def place_object(
 
     asset: an Objects asset path from list_assets(category='Objects').
     x, y: woxel coordinates; defaults to map center. rotation: degrees.
-    sorting: 0=over, 1=under. color: optional tint as '#rrggbb'.
+    sorting: 0=over, 1=under.
+    color: '#rrggbb' custom color. Only 'Colorable' assets (red-mask areas) take
+    one; with no color they get DD's default '#6b3834'. On other assets color is
+    ignored and the result carries a 'warning'. The result reports the applied color.
     """
     params = {"asset": asset, "scale": scale, "rotation": rotation, "sorting": sorting}
     if x is not None:
@@ -552,7 +555,11 @@ def modify_object(
     color: str = "",
     shadow: Optional[bool] = None,
 ) -> dict:
-    """Modify an existing object's scale, rotation (degrees), color ('#rrggbb') and/or shadow flag by id."""
+    """Modify an existing object's scale, rotation (degrees), color ('#rrggbb') and/or shadow flag by id.
+
+    color applies only to 'Colorable' objects; otherwise it is ignored and the
+    result has a 'warning'. The returned descriptor includes 'colorable' and 'color'.
+    """
     params: dict = {"id": id}
     if scale is not None:
         params["scale"] = scale
