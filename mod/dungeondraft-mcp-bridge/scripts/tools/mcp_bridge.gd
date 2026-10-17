@@ -21,7 +21,7 @@ var script_class = "tool"
 
 const HOST := "127.0.0.1"
 const PORT := 8787
-const PROTOCOL_VERSION := 16
+const PROTOCOL_VERSION := 17
 
 # Commands that get wrapped in a Dungeondraft undo record (see _record_and_dispatch).
 const CREATE_CMDS := [
@@ -58,20 +58,40 @@ var _redo_stack := []
 # Lifecycle
 # ---------------------------------------------------------------------------
 
+# DD calls start() on a fresh script instance every time a map is opened or
+# created, with no teardown hook for the previous one — whose TCP_Server keeps
+# the port bound. So the listener is process-global: stashed in Engine meta and
+# adopted by each new instance. Ownership moves to the newest instance; older
+# ones notice in update() and stop polling.
+const META_SERVER := "mcp_bridge_server"
+const META_OWNER := "mcp_bridge_owner"
+
 func start():
 	_register_tool()
-	_server = TCP_Server.new()
-	var err = _server.listen(PORT, HOST)
-	if err == OK:
-		print("[mcp-bridge] listening on %s:%d (protocol v%d)" % [HOST, PORT, PROTOCOL_VERSION])
+	var prev = Engine.get_meta(META_SERVER) if Engine.has_meta(META_SERVER) else null
+	if prev != null and prev is TCP_Server and prev.is_listening():
+		_server = prev
+		print("[mcp-bridge] adopted listener on %s:%d (protocol v%d)" % [HOST, PORT, PROTOCOL_VERSION])
 	else:
-		_server = null
-		print("[mcp-bridge] FAILED to listen on %s:%d (error %d)" % [HOST, PORT, err])
-		OS.alert("MCP bridge could not open port %d (error %d).\nIs it already in use?" % [PORT, err], "MCP Bridge")
+		_server = TCP_Server.new()
+		var err = _server.listen(PORT, HOST)
+		if err != OK:
+			_server = null
+			print("[mcp-bridge] FAILED to listen on %s:%d (error %d)" % [HOST, PORT, err])
+			OS.alert("MCP bridge could not open port %d (error %d).\nIs it already in use?" % [PORT, err], "MCP Bridge")
+			return
+		Engine.set_meta(META_SERVER, _server)
+		print("[mcp-bridge] listening on %s:%d (protocol v%d)" % [HOST, PORT, PROTOCOL_VERSION])
+	Engine.set_meta(META_OWNER, get_instance_id())
 
 
 func update(delta : float):
 	if _server == null:
+		return
+	if Engine.get_meta(META_OWNER) != get_instance_id():
+		# A newer map's instance took over the shared listener.
+		_server = null
+		_conns = []
 		return
 
 	while _server.is_connection_available():
