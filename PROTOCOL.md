@@ -178,6 +178,23 @@ Ctrl+Z in Dungeondraft.
   also claims `mcp_bridge_owner`; older instances see they no longer own it and
   stop polling in `update()`. Undo/redo stacks are per instance, so they reset
   with each map.
+- **Registering created nodes like DD does** — DD's own tools/loaders set a
+  `"preview" = false` meta on every object, path and light, and add each object
+  to `Objects.AddToSearchTable` (the `QuickSearchBuckets` index). The bare
+  `CreateObject` / `CreatePath` / `CreateLight` calls skip both, so the bridge
+  does them itself. Without the meta, `Pathways.Save()` / `Lights.Save()` throw
+  on a hard `(bool)GetMeta("preview")` cast — the save aborts with no file
+  written and DD stays "busy" (`Master.IsSaving` stuck) until restart — and
+  `Objects.Save()` silently skips the object. Without the search-table entry,
+  `SelectTool` (which hit-tests props only through that index) can never select
+  the object. (`Prop._ExitTree` removes itself from the index, so deletes need
+  no extra step.)
+- **Undo/redo of a created object** — props are **not** detached/re-attached
+  like other kinds: `Prop._EnterTree` builds a fresh, empty `Sprite` on every
+  tree entry, so a re-added prop loses its texture (renders via the stale old
+  sprite, but is unselectable and saves without a texture). Like DD's
+  `ObjectRecord`, undo snapshots it with `Prop.Save()` and deletes it; redo
+  rebuilds it with `Objects.LoadObject(data)` (same id, meta and index entry).
 - **Element ids** — every element is referenced by `node_id`, force-assigned via
   `Global.World.AssignNodeID(node)` on create/list so it resolves immediately
   with `GetNodeByID` / `DeleteNodeByID`.
