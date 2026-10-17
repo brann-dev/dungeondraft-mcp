@@ -21,7 +21,7 @@ var script_class = "tool"
 
 const HOST := "127.0.0.1"
 const PORT := 8787
-const PROTOCOL_VERSION := 17
+const PROTOCOL_VERSION := 19
 
 # Commands that get wrapped in a Dungeondraft undo record (see _record_and_dispatch).
 const CREATE_CMDS := [
@@ -176,6 +176,12 @@ func _build_op(cmd, req, result, pre, terrain_before, cave_before = null):
 		if id != null and int(id) >= 0:
 			var node = Global.World.GetNodeByID(int(id))
 			if node != null:
+				if node.get_parent().has_method("LoadObject"):
+					# Props can't be detached/re-attached: Prop._EnterTree builds a
+					# fresh, empty Sprite on every re-entry, so a re-added prop loses
+					# its texture (unselectable, saved texture-less). Mirror DD's
+					# ObjectRecord instead: serialize + delete on undo, LoadObject on redo.
+					return { "kind": "create_prop", "parent": node.get_parent(), "id": int(id) }
 				return { "kind": "create", "node": node, "parent": node.get_parent(), "id": int(id) }
 	elif cmd in TRANSFORM_CMDS and pre != null:
 		var node = Global.World.GetNodeByID(int(req["id"]))
@@ -217,6 +223,11 @@ func _apply_op(op, undo : bool):
 				_detach_node(op["node"], int(op["id"]))
 			else:
 				_attach_node(op["node"], op["parent"], int(op["id"]))
+		"create_prop":
+			if undo:
+				_delete_prop(op)
+			else:
+				_reload_prop(op)
 		"transform":
 			_apply_props(Global.World.GetNodeByID(int(op["id"])), op["old"] if undo else op["new"])
 		"terrain":
@@ -240,6 +251,30 @@ func _attach_node(node, parent, id : int):
 	Global.World.SetNodeID(node, id)
 	if node.has_method("RemakeLines"):
 		node.RemakeLines()   # walls/paths cache geometry; refresh after re-adding
+
+
+# Undo a prop create: snapshot it (Prop.Save keeps node_id) for redo, then free it.
+# Prop._ExitTree drops it from the select search table itself.
+func _delete_prop(op) -> void:
+	var id = int(op["id"])
+	if not Global.World.HasNodeID(id):
+		return
+	var node = Global.World.GetNodeByID(id)
+	if node == null:
+		return
+	op["data"] = node.Save(false)
+	op["index"] = node.get_index()
+	Global.World.DeleteNodeByID(id)
+
+
+# Redo a prop create: LoadObject rebuilds it from the snapshot with the same id,
+# the "preview" meta and its search-table entry (DD's ObjectRecord.Create path).
+func _reload_prop(op) -> void:
+	if op.get("data") == null or not is_instance_valid(op["parent"]):
+		return
+	var prop = op["parent"].LoadObject(op["data"])
+	if prop != null:
+		op["parent"].move_child(prop, min(int(op["index"]), op["parent"].get_child_count() - 1))
 
 
 func _apply_props(node, snap):
@@ -657,7 +692,22 @@ func _place_object(req : Dictionary) -> Dictionary:
 	prop.rotation = deg2rad(float(req.get("rotation", 0.0)))
 	if req.has("color") and prop.has_method("SetCustomColor"):
 		prop.SetCustomColor(_color(req["color"], Color(1, 1, 1)))
+	_register_prop(level, prop, int(req.get("sorting", 0)))
 	return _ok({ "id": _id(prop), "position": _vec(prop.position) })
+
+
+# A bare CreateObject() skips two things DD's own placement paths do
+# (ObjectTool.Record / Objects.LoadObject), and both bite later:
+#  - the "preview" meta: Objects/Pathways/Lights.Save() read it with a hard
+#    (bool) cast. Missing on a path or light, the cast throws, the whole save
+#    aborts (no file written) and DD stays "busy" until restart; missing on an
+#    object, the save silently DROPS that object.
+#  - Objects.AddToSearchTable: SelectTool hit-tests props only through
+#    QuickSearchBuckets, so an unregistered prop can never be clicked/selected.
+# Register after the final z/sorting is set (the bucket is keyed by z_index).
+func _register_prop(level, prop, sorting : int) -> void:
+	prop.set_meta("preview", false)
+	level.Objects.AddToSearchTable(prop, sorting == 1)
 
 
 func _draw_wall(req : Dictionary) -> Dictionary:
@@ -707,6 +757,7 @@ func _draw_path(req : Dictionary) -> Dictionary:
 	if req.has("width"):
 		path.SetWidthScale(float(req["width"]))
 	path.UpdateGradient()
+	path.set_meta("preview", false)   # Pathways.Save() hard-casts it (see _register_prop)
 	return _ok({ "id": _id(path), "point_count": pts.size() })
 
 
@@ -722,6 +773,7 @@ func _add_light(req : Dictionary) -> Dictionary:
 	var tex = _asset_tex("Lights", req.get("asset", ""))
 	if tex != null:
 		light.texture = tex
+	light.set_meta("preview", false)   # Lights.Save() hard-casts it (see _register_prop)
 	return _ok({ "id": _id(light), "position": _vec(light.position) })
 
 
@@ -1371,6 +1423,7 @@ func _duplicate_object(req : Dictionary) -> Dictionary:
 	prop.position = src.position + Vector2(float(req.get("dx", 64.0)), float(req.get("dy", 0.0)))
 	prop.scale = src.scale
 	prop.rotation = src.rotation
+	_register_prop(level, prop, 0)
 	return _ok({ "id": _id(prop), "position": _vec(prop.position) })
 
 
