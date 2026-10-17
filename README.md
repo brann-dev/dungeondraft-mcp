@@ -47,7 +47,8 @@ forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
   `delete_element`, `select_elements`, `clear_selection`.
 - **Levels:** `add_level`, `set_level`.
 - **See:** `screenshot` (current window) and `export_map` (clean full-map
-  render) return images, so the model can look at its own work and iterate.
+  render, `grid=False` to export without the grid) return images, so the model
+  can look at its own work and iterate. `set_grid` shows/hides the editor grid.
 - **Camera:** `get_camera`, `set_camera`, `focus_element` (center on one
   element), `fit_elements` (frame a group) — point the view before a
   `screenshot` to inspect specific spots like a door cut into a wall.

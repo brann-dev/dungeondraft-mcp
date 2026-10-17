@@ -616,19 +616,40 @@ def screenshot() -> Image:
 
 
 @mcp.tool()
-def export_map(ppi: int = 40) -> Image:
+def export_map(ppi: int = 40, grid: Optional[bool] = None) -> Image:
     """Render the entire current map to a clean PNG (no UI) and return it as an image.
 
     ppi controls resolution (pixels per grid cell): higher = sharper but larger/slower.
+    grid: False exports without the grid, True with it; omitted = as currently shown
+    in the editor. The editor's grid setting is restored afterwards.
     The render runs asynchronously in Dungeondraft; this waits for it to finish.
     """
     try:
         os.remove(_EXPORT_PATH)
     except FileNotFoundError:
         pass
-    bridge.request("export_map", path=_EXPORT_PATH, ppi=ppi)
-    _wait_for_file(_EXPORT_PATH)
+    params: dict = {"path": _EXPORT_PATH, "ppi": ppi}
+    if grid is not None:
+        params["grid"] = grid
+    res = bridge.request("export_map", **params)
+    try:
+        _wait_for_file(_EXPORT_PATH)
+    finally:
+        if res.get("grid") != res.get("grid_was"):
+            bridge.request("set_grid", visible=res["grid_was"])
     return Image(path=_EXPORT_PATH)
+
+
+@mcp.tool()
+def set_grid(visible: Optional[bool] = None) -> dict:
+    """Show (True) or hide (False) the editor grid, like DD's Grid toggle; omit to just read it.
+
+    Affects screenshot (and export_map when its grid param is omitted). Returns {grid}.
+    """
+    params: dict = {}
+    if visible is not None:
+        params["visible"] = visible
+    return bridge.request("set_grid", **params)
 
 
 # --------------------------------------------------------------------------

@@ -120,7 +120,8 @@ server uses a temp path and reads it back as an image).
 | cmd | params | result |
 | --- | --- | --- |
 | `screenshot` | `path` | `{ path, width, height }` — window grab, synchronous |
-| `export_map` | `path`, `ppi=40` | `{ path, ppi, async }` — full-map render on a background thread; poll `path` for the file |
+| `export_map` | `path`, `ppi=40`, `grid?` | `{ path, ppi, async, grid, grid_was }` — full-map render on a background thread; poll `path` for the file, then `set_grid(grid_was)` to restore the editor grid |
+| `set_grid` | `visible?` | `{ grid }` — show/hide the editor grid (omit `visible` to read it) |
 
 ### Camera
 
@@ -216,6 +217,11 @@ Ctrl+Z in Dungeondraft.
 - **Element ids** — every element is referenced by `node_id`, force-assigned via
   `Global.World.AssignNodeID(node)` on create/list so it resolves immediately
   with `GetNodeByID` / `DeleteNodeByID`.
+- **Export grid** — `Exporter` has **no grid option**: it renders what the editor
+  shows, and the Export window's Grid checkbox just calls `Editor.ToggleGrid`.
+  `export_map` with `grid` toggles it before `Start`; the render spans later
+  frames, so the mod can't restore it itself — the Python tool calls
+  `set_grid(grid_was)` after the file is written.
 - **`export_map`** — `Exporter.Start(0, ppi, path)` writes asynchronously. If DD
   chunks a very large map into multiple files, the single-path read would need
   extending.
