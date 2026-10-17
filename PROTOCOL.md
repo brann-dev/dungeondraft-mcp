@@ -170,6 +170,14 @@ Ctrl+Z in Dungeondraft.
   sandbox on Godot 3.4.2 permits it. If a future DD/Godot version locks this
   down, the fallback is a file-watch transport: the mod polls a request file via
   `File` in `update()` and writes a response file.
+- **Listener lifecycle** — DD calls `start()` on a new script instance every
+  time a map is opened/created (and on mod reload), with no teardown hook, so the
+  previous instance's `TCP_Server` keeps the port bound and a fresh `listen()`
+  fails ("port in use"). The listener is therefore process-global: kept in
+  `Engine` meta (`mcp_bridge_server`) and **adopted** by each new instance, which
+  also claims `mcp_bridge_owner`; older instances see they no longer own it and
+  stop polling in `update()`. Undo/redo stacks are per instance, so they reset
+  with each map.
 - **Element ids** — every element is referenced by `node_id`, force-assigned via
   `Global.World.AssignNodeID(node)` on create/list so it resolves immediately
   with `GetNodeByID` / `DeleteNodeByID`.
