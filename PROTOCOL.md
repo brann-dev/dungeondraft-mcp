@@ -72,7 +72,7 @@ node; default color is black.
 
 | cmd | params |
 | --- | --- |
-| `place_object` | `asset`, `x?`, `y?`, `scale=1`, `rotation=0`, `sorting=0`, `color?` |
+| `place_object` | `asset`, `x?`, `y?`, `scale=1`, `rotation=0`, `sorting=0`, `color?` → `{ id, position, color?, warning? }` |
 | `draw_wall` | `points[[x,y]...]`, `asset?`, `loop=false`, `shadow=true`, `type=0`, `joint=1`, `color?` |
 | `draw_path` | `points[[x,y]...]`, `asset`, `layer=0`, `sorting=0`, `smoothness?`, `width?` |
 | `add_light` | `x?`, `y?`, `color?`, `energy=1`, `range=1`, `shadows=true`, `asset?` |
@@ -104,7 +104,7 @@ It is undo-recorded like the other terrain ops.
 | cmd | params |
 | --- | --- |
 | `move_element` | `id`, `x`, `y` |
-| `modify_object` | `id`, `scale?`, `rotation?`, `color?`, `shadow?` |
+| `modify_object` | `id`, `scale?`, `rotation?`, `color?`, `shadow?` → descriptor (+ `warning?`) |
 | `duplicate_object` | `id`, `dx=64`, `dy=0` → `{ id }` |
 | `delete_element` | `id` → `{ deleted }` |
 | `add_level` | `label="Level"` → `{ id, label }` |
@@ -195,6 +195,24 @@ Ctrl+Z in Dungeondraft.
   sprite, but is unselectable and saves without a texture). Like DD's
   `ObjectRecord`, undo snapshots it with `Prop.Save()` and deletes it; redo
   rebuilds it with `Objects.LoadObject(data)` (same id, meta and index entry).
+- **Object custom color** — only textures tagged **`Colorable`** (the red-mask
+  assets) take a color, and `Prop.SetCustomColor` only sets the shader's
+  `tint_r` if the Sprite **already has the `CustomColors` ShaderMaterial** —
+  `ObjectTool.PromoteCustomColor` / `Prop.Load` install it first; a bare
+  `CreateObject()` prop has none, so the call silently did nothing and the raw red
+  mask rendered. The bridge installs a duplicate of
+  `res://materials/CustomColors.material`, then calls `SetCustomColor`, then
+  clears the texture flags (as `Prop.Load` does). `Master.Tags` is static C# and
+  unreachable from GDScript, so the Colorable set is rebuilt from the same tag
+  files (`res://data/default.dungeondraft_tags`, each
+  `res://packs/<id>/data/default.dungeondraft_tags`, the user override file),
+  plus DD's "path contains `colorable`" rule. `place_object` on a Colorable asset
+  with no `color` uses ObjectTool's default palette color **`#6b3834`**
+  (`Cache.DefaultCustomColors[0]`) and reports the resolved `color`; a `color` on
+  a non-Colorable asset is ignored with a `warning` (as DD's tools do).
+  `duplicate_object` copies the source's color. Object descriptors include
+  `colorable` and, when set, `color`. The color is saved as `custom_color` and
+  survives undo/redo and save/reload.
 - **Element ids** — every element is referenced by `node_id`, force-assigned via
   `Global.World.AssignNodeID(node)` on create/list so it resolves immediately
   with `GetNodeByID` / `DeleteNodeByID`.

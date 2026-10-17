@@ -21,7 +21,7 @@ var script_class = "tool"
 
 const HOST := "127.0.0.1"
 const PORT := 8787
-const PROTOCOL_VERSION := 19
+const PROTOCOL_VERSION := 20
 
 # Commands that get wrapped in a Dungeondraft undo record (see _record_and_dispatch).
 const CREATE_CMDS := [
@@ -35,6 +35,11 @@ const CAVE_CMDS := ["dig_cave", "clear_caves"]
 # has no per-texture default (and its .Color leaks across calls), so we apply a
 # deterministic wood/stone-neutral tone; callers pass an explicit color to override.
 const DEFAULT_PATTERN_TINT := Color(0.62, 0.5, 0.34)
+# Custom color for "Colorable" objects (the red-mask ones) when the caller gives
+# none: ObjectTool's initial palette color (Cache.DefaultCustomColors[0]).
+const DEFAULT_OBJECT_TINT := Color("6b3834")
+const CUSTOM_COLORS_MATERIAL := "res://materials/CustomColors.material"
+const TAGS_FILE := "data/default.dungeondraft_tags"
 
 # SelectTool.GetSelectableType() integer -> readable kind.
 const KIND_NAMES := {
@@ -52,6 +57,7 @@ var _server : TCP_Server = null
 var _conns := []         # array of { "peer": StreamPeerTCP, "buf": String }
 var _undo_stack := []    # bridge-managed undo ops (see _build_op / _apply_op)
 var _redo_stack := []
+var _colorable = null    # lazily built set of "Colorable"-tagged texture paths
 
 
 # ---------------------------------------------------------------------------
@@ -288,8 +294,11 @@ func _apply_props(node, snap):
 		node.scale = snap["scale"]
 	if snap.get("shadow") != null:
 		node.set("HasShadow", snap["shadow"])
-	if snap.get("color") != null and node.has_method("SetCustomColor"):
-		node.SetCustomColor(snap["color"])
+	if snap.has("color"):
+		if snap["color"] != null:
+			_apply_custom_color(node, snap["color"])
+		elif node.HasCustomColor():
+			node.ClearCustomColor()
 
 
 func _restore_splat(img):
@@ -337,8 +346,8 @@ func _snapshot(node) -> Dictionary:
 		s["scale"] = node.scale
 	if node.get("HasShadow") != null:
 		s["shadow"] = node.get("HasShadow")
-	if node.get("customColor") != null:
-		s["color"] = node.get("customColor")
+	if node.has_method("HasCustomColor"):
+		s["color"] = node.GetCustomColor() if node.HasCustomColor() else null
 	return s
 
 
@@ -690,10 +699,86 @@ func _place_object(req : Dictionary) -> Dictionary:
 	var s = float(req.get("scale", 1.0))
 	prop.scale = Vector2(s, s)
 	prop.rotation = deg2rad(float(req.get("rotation", 0.0)))
-	if req.has("color") and prop.has_method("SetCustomColor"):
-		prop.SetCustomColor(_color(req["color"], Color(1, 1, 1)))
+	var result := { "id": _id(prop), "position": _vec(prop.position) }
+	_color_new_prop(prop, req, result)
 	_register_prop(level, prop, int(req.get("sorting", 0)))
-	return _ok({ "id": _id(prop), "position": _vec(prop.position) })
+	return _ok(result)
+
+
+# Custom color, the way ObjectTool.PromoteCustomColor does it: only "Colorable"-
+# tagged textures get one, and the CustomColors shader material must be on the
+# Sprite BEFORE SetCustomColor — Prop.SetCustomColor only sets the shader's
+# tint_r param if a ShaderMaterial is already there, so on a bare CreateObject()
+# prop it records the color but renders nothing (the raw red mask shows).
+# Colorable + no color -> DEFAULT_OBJECT_TINT. Non-colorable + color -> ignored
+# with a `warning` (DD's own tools ignore it too).
+func _color_new_prop(prop, req : Dictionary, result : Dictionary) -> void:
+	var wants = req.has("color") and str(req.get("color", "")) != ""
+	if _is_colorable(prop):
+		var c = _color(req["color"], DEFAULT_OBJECT_TINT) if wants else DEFAULT_OBJECT_TINT
+		_apply_custom_color(prop, c)
+		result["color"] = "#" + c.to_html(false)
+	elif wants:
+		result["warning"] = "asset is not Colorable; color ignored"
+
+
+func _apply_custom_color(prop, c : Color) -> void:
+	var spr = prop.get("Sprite")
+	if spr != null and not (spr.material is ShaderMaterial):
+		spr.material = load(CUSTOM_COLORS_MATERIAL).duplicate(false)
+	prop.SetCustomColor(c)
+	# Prop.Load clears the texture flags of a custom-colored prop (no filter /
+	# mipmaps, which would bleed the mask edge); mirror it.
+	var tex = prop.get("Texture")
+	if tex != null and tex.flags != 0:
+		tex.flags = 0
+
+
+func _is_colorable(prop) -> bool:
+	if not prop.has_method("SetCustomColor"):
+		return false
+	var tex = prop.get("Texture")
+	if tex == null or not (tex is Texture):
+		return false
+	var path = tex.resource_path
+	return path.find("colorable") != -1 or _colorable_paths().has(path)
+
+
+# DD's Master.Tags isn't reachable from GDScript (static C#), so rebuild the
+# "Colorable" set from the same files Master.LoadTags reads: the built-in tags,
+# each asset pack's (entries relative to the pack dir) and the user override.
+func _colorable_paths() -> Dictionary:
+	if _colorable != null:
+		return _colorable
+	_colorable = {}
+	_load_colorable_tags("res://" + TAGS_FILE, "")
+	var dir = Directory.new()
+	if dir.open("res://packs") == OK:
+		dir.list_dir_begin(true, true)
+		var name = dir.get_next()
+		while name != "":
+			if dir.current_is_dir():
+				var pack = "res://packs/" + name + "/"
+				_load_colorable_tags(pack + TAGS_FILE, pack)
+			name = dir.get_next()
+		dir.list_dir_end()
+	_load_colorable_tags(OS.get_user_data_dir() + "/override.dungeondraft_tags", "")
+	return _colorable
+
+
+func _load_colorable_tags(path : String, prefix : String) -> void:
+	var f = File.new()
+	if not f.file_exists(path) or f.open(path, File.READ) != OK:
+		return
+	var parsed = JSON.parse(f.get_as_text())
+	f.close()
+	if parsed.error != OK or typeof(parsed.result) != TYPE_DICTIONARY:
+		return
+	var tags = parsed.result.get("tags")
+	if typeof(tags) != TYPE_DICTIONARY or typeof(tags.get("Colorable")) != TYPE_ARRAY:
+		return
+	for p in tags["Colorable"]:
+		_colorable[prefix + str(p)] = true
 
 
 # A bare CreateObject() skips two things DD's own placement paths do
@@ -1405,11 +1490,18 @@ func _modify_object(req : Dictionary) -> Dictionary:
 		var s = float(req["scale"]); node.scale = Vector2(s, s)
 	if req.has("rotation"):
 		node.rotation = deg2rad(float(req["rotation"]))
-	if req.has("color") and node.has_method("SetCustomColor"):
-		node.SetCustomColor(_color(req["color"], Color(1, 1, 1)))
+	var warning = ""
+	if req.has("color") and str(req.get("color", "")) != "":
+		if _is_colorable(node):
+			_apply_custom_color(node, _color(req["color"], DEFAULT_OBJECT_TINT))
+		else:
+			warning = "element is not a Colorable object; color ignored"
 	if req.has("shadow"):
 		node.set("HasShadow", bool(req["shadow"]))
-	return _ok(_describe(node))
+	var d = _describe(node)
+	if warning != "":
+		d["warning"] = warning
+	return _ok(d)
 
 
 func _duplicate_object(req : Dictionary) -> Dictionary:
@@ -1423,6 +1515,8 @@ func _duplicate_object(req : Dictionary) -> Dictionary:
 	prop.position = src.position + Vector2(float(req.get("dx", 64.0)), float(req.get("dy", 0.0)))
 	prop.scale = src.scale
 	prop.rotation = src.rotation
+	if src.has_method("HasCustomColor") and src.HasCustomColor():
+		_apply_custom_color(prop, src.GetCustomColor())
 	_register_prop(level, prop, 0)
 	return _ok({ "id": _id(prop), "position": _vec(prop.position) })
 
@@ -1725,6 +1819,10 @@ func _describe(node) -> Dictionary:
 	var tex_path = _texture_path(node, t)
 	if tex_path != "":
 		d["asset"] = tex_path
+	if t == 4 and node.has_method("HasCustomColor"):
+		d["colorable"] = _is_colorable(node)
+		if node.HasCustomColor():
+			d["color"] = "#" + node.GetCustomColor().to_html(false)
 	return d
 
 
