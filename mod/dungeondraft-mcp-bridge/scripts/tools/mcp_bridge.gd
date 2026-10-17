@@ -21,7 +21,7 @@ var script_class = "tool"
 
 const HOST := "127.0.0.1"
 const PORT := 8787
-const PROTOCOL_VERSION := 20
+const PROTOCOL_VERSION := 21
 
 # Commands that get wrapped in a Dungeondraft undo record (see _record_and_dispatch).
 const CREATE_CMDS := [
@@ -392,6 +392,7 @@ func _safe_dispatch(req : Dictionary) -> Dictionary:
 		# --- capture ---
 		"screenshot": return _screenshot(req)
 		"export_map": return _export_map(req)
+		"set_grid": return _set_grid(req)
 		# --- camera ---
 		"get_camera": return _get_camera()
 		"set_camera": return _set_camera(req)
@@ -1568,8 +1569,27 @@ func _export_map(req : Dictionary) -> Dictionary:
 	var path = str(req.get("path", ""))
 	if path == "": return _err("missing 'path'")
 	var ppi = int(req.get("ppi", 40))
+	var toggle = Global.Editor.get("GridToggle")
+	if toggle == null: return _err("grid toggle not available")
+	# DD's export has no grid option: it renders whatever the editor shows, and
+	# the Export window's Grid checkbox just calls Editor.ToggleGrid. So set it
+	# before Start; the caller restores `grid_was` (set_grid) once the file is
+	# written — the render runs over later frames, so we can't restore here.
+	var grid_was = toggle.pressed
+	var grid = bool(req["grid"]) if req.has("grid") else grid_was
+	Global.Editor.ToggleGrid(grid)
 	Global.Exporter.Start(0, ppi, path)  # mode 0 = PNG
-	return _ok({ "path": path, "ppi": ppi, "async": true })
+	return _ok({ "path": path, "ppi": ppi, "async": true, "grid": grid, "grid_was": grid_was })
+
+
+# Show/hide the editor grid (same as the bottom-bar Grid toggle). It also
+# decides whether export_map renders the grid.
+func _set_grid(req : Dictionary) -> Dictionary:
+	var toggle = Global.Editor.get("GridToggle")
+	if toggle == null: return _err("grid toggle not available")
+	if req.has("visible"):
+		Global.Editor.ToggleGrid(bool(req["visible"]))
+	return _ok({ "grid": toggle.pressed })
 
 
 # ---------------------------------------------------------------------------
