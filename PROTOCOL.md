@@ -117,8 +117,8 @@ It is undo-recorded like the other terrain ops.
 | cmd | params | result | errors |
 | --- | --- | --- | --- |
 | `get_current_map` | — | `{ map_open, path, dirty, saving }` | — |
-| `save_map` | — | `{ saved: true, path }` | `"no map open"`, `"map has never been saved"`, `"save already in progress"` (checked in that order) |
-| `open_map` | `path` | `{ opening: path }` | `"missing 'path'"`, `"file not found: <path>"` |
+| `save_map` | — | `{ saved: true, path, saving }`. `saved` means a save was **requested**, not that it finished | `"no map open"`, `"map has never been saved"`, `"save already in progress"` (checked in that order) |
+| `open_map` | `path` | `{ opening: path }` | `"missing 'path'"`, `"file not found: <path>"`, `"save in progress"` |
 
 - `get_current_map`: `path` is the map file's full path exactly as DD holds it
   (a Windows path with backslashes), or `""` if the map has never been saved.
@@ -126,9 +126,23 @@ It is undo-recorded like the other terrain ops.
   `saving` is `true` while a save is still being written.
 - `save_map` saves to the map's current file, just as clicking DD's Save button
   does. It never opens a Save As dialog: a map that has never been saved is
-  refused instead. Save a new map once in DD by hand first.
+  refused instead. Save a new map once in DD by hand first. **`saved: true` does
+  not confirm a write.** It means the Save button's handler was called. The save
+  can still be running, and a save that fails inside DD still replies
+  `saved: true`. The save is asynchronous, and `IsSaving` is only set about a
+  frame after the handler runs. So the reply's `saving` (read straight after the
+  call) can be `false` while the save is pending. In testing, the reply said
+  `saving: false` and an immediate `get_current_map` said `saving: true`.
+  Don't treat `saving: false` in the reply as "done". To confirm the save, poll
+  `get_current_map` until `saving` is `false` **and** the file's modification
+  time has moved past its value before the save.
 - `open_map` **replies before the switch happens.** The mod validates `path`,
-  sends `{ opening }`, then calls `ForceOpenMap` one frame later. While the new
+  refuses with `"save in progress"` while `Master.IsSaving` is true (switching
+  would cut the save off and lose the work), sends `{ opening }`, then calls
+  `ForceOpenMap` on a later frame. If a save starts in between, the deferred
+  open waits for it to finish. If the save is still running after 30 s, the
+  open is abandoned and logged, and the current map stays open, so a caller
+  polling for the new map times out instead of losing data. While the new
   map loads, the bridge is briefly unreachable (connections fail), and then a
   fresh bridge instance on the same port takes over. Poll `get_current_map`
   (retrying connection errors) until `path` names the new map; this took about
@@ -364,11 +378,19 @@ Ctrl+Z in Dungeondraft.
     `yield(Global.World.get_tree(), "idle_frame")`, so the reply is sent before
     the map is torn down. The bridge script has no `extends` (it is a
     `Reference`), so it has no `get_tree()` of its own; `Global.World` (a Node)
-    provides one.
+    provides one. Saving is asynchronous (`Master.Save` takes an `onFinish`
+    callback), so `open_map` checks `IsSaving` both when the request arrives and
+    on every frame before `ForceOpenMap` (giving up after 30 s, measured with
+    `OS.get_ticks_msec()`). A save that throws leaves `IsSaving` stuck (see the
+    note on registering created nodes), so in that case `open_map` refuses or
+    abandons the switch instead of discarding the map.
 - **Mod compile errors crash Dungeondraft** — DD compiles mod scripts when a
   map opens, and a GDScript **parse error** makes it crash natively, with no
-  console output (only a Windows `.dmp`), instead of reporting the error. DD has
-  no in-app mod reload either, so every `.gd` change costs a full restart.
+  console output (only a Windows `.dmp`), instead of reporting the error. A
+  broken script crashes DD the same way when it is loaded through the toolbar's
+  **Reload Mods** button, or by launching `Dungeondraft.exe "<map path>"`
+  (which opens that map directly with mods active; the bridge answered about
+  12 s after launch, which makes it a quick restart-and-test loop).
   Example: `self is Node` in this script (which has no `extends`, so it is a
   Reference) is a parse error in 3.4.2: *A value of type "self" will never be
   an instance of "Node"*. Compile-check `.gd` changes offline before

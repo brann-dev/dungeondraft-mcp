@@ -142,12 +142,38 @@ def main() -> int:
     check("open_map missing file", open_missing)
     check("ping after bad open", lambda: bridge.request("ping"))
 
-    # --- switch to the second map ---
+    # --- edit + save, then switch away at once: the switch must not cut the save off ---
+    state = {}
+
+    def count_objects():
+        return bridge.request("get_status")["counts"]["objects"]
+
+    def place_and_save():
+        place_at_center(dx=-300)
+        state["objects"] = count_objects()
+        res = bridge.request("save_map")
+        if res.get("saved") is not True:
+            raise BridgeError(f"saved is not True: {res}")
+        cur = bridge.request("get_current_map")
+        return f"objects={state['objects']}, reply={res}, saving right after={cur.get('saving')!r}"
+
+    check("place + save (no wait)", place_and_save)
+
     def open_second():
-        res = bridge.request("open_map", path=second_map)
-        if "opening" not in res:
-            raise BridgeError(f"no 'opening' in reply: {res}")
-        return res
+        deadline = time.monotonic() + SWITCH_TIMEOUT
+        retries = 0
+        while True:
+            try:
+                res = bridge.request("open_map", path=second_map)
+            except BridgeError as exc:
+                if "save in progress" in str(exc) and time.monotonic() < deadline:
+                    retries += 1
+                    time.sleep(0.2)
+                    continue
+                raise
+            if "opening" not in res:
+                raise BridgeError(f"no 'opening' in reply: {res}")
+            return f"{res} after {retries} 'save in progress' retries"
 
     on_second = None
     if check("open_map second", open_second) is not None:
@@ -172,7 +198,15 @@ def main() -> int:
         return res
 
     if check("open_map back to first", open_first) is not None:
-        check("first map loaded", lambda: wait_for_map(first_map))
+        if check("first map loaded", lambda: wait_for_map(first_map)) is not None:
+            def save_survived():
+                n = count_objects()
+                if n != state.get("objects"):
+                    raise BridgeError(f"first map has {n} objects, expected {state.get('objects')} "
+                                      "(the object saved just before the switch was lost)")
+                return f"{n} objects, as saved"
+
+            check("quick save survived", save_survived)
 
     # --- human check: did a dialog appear? ---
     print("\n  >>> QUESTION FOR THE HUMAN <<<")

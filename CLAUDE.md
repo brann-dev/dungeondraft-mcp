@@ -37,8 +37,15 @@ blindly.
 
 If you change code (not just drive the map), the two halves reload differently:
 
-- **Mod** (`mod/.../mcp_bridge.gd`, GDScript): reload the mod inside Dungeondraft
-  (keeps the current map). Changing an existing handler needs only this.
+- **Mod** (`mod/.../mcp_bridge.gd`, GDScript): click **Reload Mods** in
+  Dungeondraft's toolbar, or restart DD (`Dungeondraft.exe "<map path>"` reopens
+  a map directly; the bridge is up about 12 s later). Changing an existing
+  handler needs only this.
+- **A GDScript compile (parse) error crashes Dungeondraft natively** when the
+  mod loads, with no error message. Compile-check `.gd` changes before
+  reloading (see PROTOCOL.md's implementation notes), and avoid static type
+  assertions such as `self is Node`: the script has no `extends`, so that line
+  doesn't compile.
 - **Server** (`server/dungeondraft_mcp/server.py`): new/changed `@mcp.tool()`
   defs need an **MCP-server reconnect** (`/mcp` → reconnect). Adding a *new tool*
   needs **both** reloads. The install is editable — never reinstall.

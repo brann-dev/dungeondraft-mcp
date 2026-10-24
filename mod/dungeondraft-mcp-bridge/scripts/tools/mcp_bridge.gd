@@ -1597,11 +1597,15 @@ func _save_map() -> Dictionary:
 	if not Global.Editor.has_method("_on_SaveButton_pressed"):
 		return _err("save button handler not available")
 	Global.Editor._on_SaveButton_pressed()
-	return _ok({ "saved": true, "path": path })
+	# `saved` only means the save was started: it may still be writing (see
+	# PROTOCOL.md). `saving` is read right after the handler call.
+	return _ok({ "saved": true, "path": path, "saving": _is_saving() })
 
 
 # Replies first, switches after: ForceOpenMap tears down this map (and DD
 # starts a fresh bridge instance), so the reply must be on the wire before it.
+# Refuses while a save is running: switching would cut the save off and lose
+# the user's work.
 func _open_map(req : Dictionary) -> Dictionary:
 	var path = req.get("path")
 	if typeof(path) != TYPE_STRING or path == "":
@@ -1609,13 +1613,27 @@ func _open_map(req : Dictionary) -> Dictionary:
 	var f = File.new()
 	if not f.file_exists(path):
 		return _err("file not found: " + path)
+	if _is_saving():
+		return _err("save in progress")
 	call_deferred("_do_open_map", path)
 	return _ok({ "opening": path })
 
 
-# This script has no `extends` (no get_tree of its own), so yield on World's tree.
+const OPEN_SAVE_WAIT_MS := 30000
+
+# This script has no `extends` (no get_tree of its own), so yield on World's
+# tree. A save can start between the reply and this frame, so keep waiting
+# while one runs; if it never finishes, stay on the current map rather than
+# discard it (the caller's get_current_map poll then times out visibly).
 func _do_open_map(path : String):
-	yield(Global.World.get_tree(), "idle_frame")
+	var tree = Global.World.get_tree()
+	yield(tree, "idle_frame")
+	var deadline = OS.get_ticks_msec() + OPEN_SAVE_WAIT_MS
+	while _is_saving():
+		if OS.get_ticks_msec() > deadline:
+			print("[mcp-bridge] open_map: a save was still running after %d ms; not opening %s" % [OPEN_SAVE_WAIT_MS, path])
+			return
+		yield(tree, "idle_frame")
 	Global.Editor.ForceOpenMap(path)
 
 

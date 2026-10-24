@@ -601,8 +601,12 @@ def get_current_map() -> dict:
 
 @mcp.tool()
 def save_map() -> dict:
-    """Save the open map to its current file, like DD's Save button. Returns {saved, path}.
+    """Save the open map to its current file, like DD's Save button. Returns {saved, path, saving}.
 
+    saved=True means a save was REQUESTED, not that it finished: the write can
+    still be running (saving=True), and a save that fails inside Dungeondraft
+    also replies saved=True. To confirm, poll get_current_map until saving is
+    False AND the map file's modification time has advanced.
     Fails with "map has never been saved" (no file yet; save it once in DD),
     "save already in progress", or "no map open".
     """
@@ -617,7 +621,10 @@ def open_map(path: str) -> dict:
     and the bridge is briefly unavailable. Poll get_current_map until its path
     names the new map before sending further commands. Unsaved changes to the
     current map are discarded silently (no prompt); call save_map first to keep them.
-    Fails with "file not found: <path>".
+    Fails with "file not found: <path>", or "save in progress" while a save is
+    still being written (retry shortly). If a save starts just after this
+    replies, the switch waits for it, and gives up (staying on the current
+    map) if it hasn't finished within 30 s.
     """
     return bridge.request("open_map", path=path)
 
