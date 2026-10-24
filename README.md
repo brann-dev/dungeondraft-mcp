@@ -25,9 +25,9 @@ The mod opens a TCP server inside Dungeondraft and polls it every frame from the
 forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
 
 > **Status: working.** Confirmed end-to-end against Dungeondraft on **Godot
-> 3.4.2** — raw TCP from the modding sandbox works, no fallback needed. 39 tools
+> 3.4.2** — raw TCP from the modding sandbox works, no fallback needed. 43 tools
 > across query / create / modify / terrain / levels / selection / capture /
-> camera / undo (see below).
+> camera / undo / map lifecycle (see below).
 
 ## What the AI can do
 
@@ -46,6 +46,11 @@ forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
 - **Edit:** `move_element`, `modify_object`, `duplicate_object`,
   `delete_element`, `select_elements`, `clear_selection`.
 - **Levels:** `add_level`, `set_level`.
+- **Map lifecycle:** `get_current_map` (open map's path + whether a save is
+  running), `save_map` (save to the current file, like DD's Save button), and
+  `open_map` (switch to another saved map; replies before the new map loads, so
+  poll `get_current_map`; unsaved changes are discarded silently, so `save_map`
+  first).
 - **See:** `screenshot` (current window) and `export_map` (clean full-map
   render, `grid=False` to export without the grid) return images, so the model
   can look at its own work and iterate. `set_grid` shows/hides the editor grid.

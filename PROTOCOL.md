@@ -112,6 +112,30 @@ It is undo-recorded like the other terrain ops.
 | `select_elements` | `ids[]` |
 | `clear_selection` | — |
 
+### Map lifecycle
+
+| cmd | params | result | errors |
+| --- | --- | --- | --- |
+| `get_current_map` | — | `{ map_open, path, dirty, saving }` | — |
+| `save_map` | — | `{ saved: true, path }` | `"no map open"`, `"map has never been saved"`, `"save already in progress"` (checked in that order) |
+| `open_map` | `path` | `{ opening: path }` | `"missing 'path'"`, `"file not found: <path>"` |
+
+- `get_current_map`: `path` is the map file's full path exactly as DD holds it
+  (a Windows path with backslashes), or `""` if the map has never been saved.
+  `dirty` is always `null`, because DD exposes no unsaved-changes flag (see notes).
+  `saving` is `true` while a save is still being written.
+- `save_map` saves to the map's current file, just as clicking DD's Save button
+  does. It never opens a Save As dialog: a map that has never been saved is
+  refused instead. Save a new map once in DD by hand first.
+- `open_map` **replies before the switch happens.** The mod validates `path`,
+  sends `{ opening }`, then calls `ForceOpenMap` one frame later. While the new
+  map loads, the bridge is briefly unreachable (connections fail), and then a
+  fresh bridge instance on the same port takes over. Poll `get_current_map`
+  (retrying connection errors) until `path` names the new map; this took about
+  1.8 s in testing. **Unsaved changes to the current map are discarded silently,
+  without a prompt.** Call `save_map` first to keep them. The bridge's undo/redo
+  stacks reset with the new map.
+
 ### Capture
 
 The caller passes the absolute `path` the mod should write the PNG to (the MCP
@@ -313,3 +337,42 @@ Ctrl+Z in Dungeondraft.
   falls back to freestanding unless `fallback_free:false`. `flip` reverses the
   facing. The response `kind` is `"wall_portal"` when mounted, `"portal"` when
   freestanding.
+- **Map lifecycle (`get_current_map` / `save_map` / `open_map`)** — findings
+  from probing DD's API on 3.4.2:
+  - `Global.Editor` (a `CanvasLayer`, `res://scenes/Editor.tscn`) has
+    `CurrentMapFile`, a String holding the full Windows path, or empty if the
+    map was never saved. Its parent is the **Master** node (`/root/Master`,
+    `res://scenes/Master.tscn`), which has `IsSaving` (bool). The bridge reads it
+    as `Global.Editor.get_parent().get("IsSaving")`. `Global.get("Master")` and
+    `Editor.get("Master")` do **not** reach it.
+  - Neither Editor nor World has any dirty / unsaved / modified property, and
+    the window title shows no unsaved marker either. So `dirty` is reported as
+    `null`.
+  - `Editor.ForceOpenMap(file)` switches maps **without any prompt** and
+    silently discards unsaved changes, even with freshly placed objects. The
+    other open-related methods on Editor are `OpenMap()` (no arguments; the UI
+    file picker), `OnOpenedOrSaved(path)` and `UpdateOpenRecent`.
+  - **`Editor.SaveMap` takes two arguments: `SaveMap(bool saveAs, action)`.** A
+    one-argument call `SaveMap(false)` returns without writing anything, even
+    on a modified map. Most likely the C# binding rejects the wrong argument
+    count, and GDScript never sees an error. `ExecuteAfterSave(action)` and `Master.Save(path, onFinish)`
+    (plus `Master.SaveTags()`) also exist. The bridge calls
+    `Editor._on_SaveButton_pressed()`, the Save button's own handler. It writes
+    the file with no dialog, popup or toast, as long as `CurrentMapFile` is set,
+    which `save_map` checks first.
+  - `open_map` defers `ForceOpenMap` with `call_deferred` plus
+    `yield(Global.World.get_tree(), "idle_frame")`, so the reply is sent before
+    the map is torn down. The bridge script has no `extends` (it is a
+    `Reference`), so it has no `get_tree()` of its own; `Global.World` (a Node)
+    provides one.
+- **Mod compile errors crash Dungeondraft** — DD compiles mod scripts when a
+  map opens, and a GDScript **parse error** makes it crash natively, with no
+  console output (only a Windows `.dmp`), instead of reporting the error. DD has
+  no in-app mod reload either, so every `.gd` change costs a full restart.
+  Example: `self is Node` in this script (which has no `extends`, so it is a
+  Reference) is a parse error in 3.4.2: *A value of type "self" will never be
+  an instance of "Node"*. Compile-check `.gd` changes offline before
+  restarting DD. The stock Godot 3.4.2 binary can load the script in a scratch
+  project with a stub `Global` autoload (an untyped stub needs `var x := <call
+  on Global>` turned into `=`). Avoid static type assertions on `self` and on
+  values from untyped globals.

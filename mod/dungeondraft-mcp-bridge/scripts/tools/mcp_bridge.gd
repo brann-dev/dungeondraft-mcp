@@ -21,7 +21,7 @@ var script_class = "tool"
 
 const HOST := "127.0.0.1"
 const PORT := 8787
-const PROTOCOL_VERSION := 21
+const PROTOCOL_VERSION := 22
 
 # Commands that get wrapped in a Dungeondraft undo record (see _record_and_dispatch).
 const CREATE_CMDS := [
@@ -386,6 +386,10 @@ func _safe_dispatch(req : Dictionary) -> Dictionary:
 		"modify_object": return _modify_object(req)
 		"duplicate_object": return _duplicate_object(req)
 		"delete_element": return _delete_element(req)
+		# --- map lifecycle ---
+		"get_current_map": return _get_current_map()
+		"save_map": return _save_map()
+		"open_map": return _open_map(req)
 		# --- levels ---
 		"add_level": return _add_level(req)
 		"set_level": return _set_level(req)
@@ -1544,6 +1548,75 @@ func _set_level(req : Dictionary) -> Dictionary:
 		return _err("level index out of range: " + str(idx))
 	Global.World.SetLevel(idx)
 	return _ok({ "current_index": idx })
+
+
+# ---------------------------------------------------------------------------
+# Map lifecycle
+# ---------------------------------------------------------------------------
+#
+# Global.Editor.CurrentMapFile is the open map's full path ("" if never saved).
+# Master.IsSaving (Master = the Editor's parent node, /root/Master) is true
+# while a save runs. DD exposes no dirty/unsaved flag, so `dirty` is null.
+
+func _current_map_file() -> String:
+	var f = Global.Editor.get("CurrentMapFile")
+	if typeof(f) != TYPE_STRING:
+		return ""
+	return f
+
+
+func _is_saving() -> bool:
+	var master = Global.Editor.get_parent()
+	if master == null:
+		return false
+	var v = master.get("IsSaving")
+	return typeof(v) == TYPE_BOOL and v
+
+
+func _get_current_map() -> Dictionary:
+	return _ok({
+		"map_open": Global.World.GetCurrentLevel() != null,
+		"path": _current_map_file(),
+		"dirty": null,
+		"saving": _is_saving(),
+	})
+
+
+# Saves through the Save button's own handler, exactly as a user's click does.
+# (Editor.SaveMap is SaveMap(bool saveAs, action): a one-argument
+# SaveMap(false) wrote nothing in testing.) The guards above mean the
+# handler always has a file to save to, so it never opens a Save As dialog.
+func _save_map() -> Dictionary:
+	if Global.World.GetCurrentLevel() == null:
+		return _err("no map open")
+	var path = _current_map_file()
+	if path == "":
+		return _err("map has never been saved")
+	if _is_saving():
+		return _err("save already in progress")
+	if not Global.Editor.has_method("_on_SaveButton_pressed"):
+		return _err("save button handler not available")
+	Global.Editor._on_SaveButton_pressed()
+	return _ok({ "saved": true, "path": path })
+
+
+# Replies first, switches after: ForceOpenMap tears down this map (and DD
+# starts a fresh bridge instance), so the reply must be on the wire before it.
+func _open_map(req : Dictionary) -> Dictionary:
+	var path = req.get("path")
+	if typeof(path) != TYPE_STRING or path == "":
+		return _err("missing 'path'")
+	var f = File.new()
+	if not f.file_exists(path):
+		return _err("file not found: " + path)
+	call_deferred("_do_open_map", path)
+	return _ok({ "opening": path })
+
+
+# This script has no `extends` (no get_tree of its own), so yield on World's tree.
+func _do_open_map(path : String):
+	yield(Global.World.get_tree(), "idle_frame")
+	Global.Editor.ForceOpenMap(path)
 
 
 # ---------------------------------------------------------------------------

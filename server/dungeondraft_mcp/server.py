@@ -585,6 +585,44 @@ def delete_element(id: int) -> dict:
 
 
 # --------------------------------------------------------------------------
+# Map lifecycle
+# --------------------------------------------------------------------------
+
+@mcp.tool()
+def get_current_map() -> dict:
+    """Report the open map: {map_open, path, dirty, saving}.
+
+    path is the map file's full path, or "" if the map has never been saved.
+    dirty is always null: Dungeondraft exposes no unsaved-changes flag.
+    saving is true while a save is still being written.
+    """
+    return bridge.request("get_current_map")
+
+
+@mcp.tool()
+def save_map() -> dict:
+    """Save the open map to its current file, like DD's Save button. Returns {saved, path}.
+
+    Fails with "map has never been saved" (no file yet; save it once in DD),
+    "save already in progress", or "no map open".
+    """
+    return bridge.request("save_map")
+
+
+@mcp.tool()
+def open_map(path: str) -> dict:
+    """Open another saved map file in Dungeondraft. Returns {opening: path}.
+
+    Returns BEFORE the new map has loaded: the switch happens on the next frame
+    and the bridge is briefly unavailable. Poll get_current_map until its path
+    names the new map before sending further commands. Unsaved changes to the
+    current map are discarded silently (no prompt); call save_map first to keep them.
+    Fails with "file not found: <path>".
+    """
+    return bridge.request("open_map", path=path)
+
+
+# --------------------------------------------------------------------------
 # Levels
 # --------------------------------------------------------------------------
 
