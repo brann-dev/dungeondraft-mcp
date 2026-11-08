@@ -25,7 +25,7 @@ The mod opens a TCP server inside Dungeondraft and polls it every frame from the
 forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
 
 > **Status: working.** Confirmed end-to-end against Dungeondraft on **Godot
-> 3.4.2** — raw TCP from the modding sandbox works, no fallback needed. 43 tools
+> 3.4.2** — raw TCP from the modding sandbox works, no fallback needed. 45 tools
 > across query / create / modify / terrain / levels / selection / capture /
 > camera / undo / map lifecycle (see below).
 
@@ -54,9 +54,12 @@ forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
 - **See:** `screenshot` (current window) and `export_map` (clean full-map
   render, `grid=False` to export without the grid) return images, so the model
   can look at its own work and iterate. `set_grid` shows/hides the editor grid.
+  `export_uvtt` writes a Universal VTT `.dd2vtt` (image + walls, doors, lights)
+  for import into Foundry or Roll20.
 - **Camera:** `get_camera`, `set_camera`, `focus_element` (center on one
-  element), `fit_elements` (frame a group) — point the view before a
-  `screenshot` to inspect specific spots like a door cut into a wall.
+  element), `fit_elements` (frame a group), `reset_camera` (recover a lost
+  view) — point the view before a `screenshot` to inspect specific spots like a
+  door cut into a wall.
 - **Undo:** the bridge keeps its own undo/redo stacks for create / move / modify
   / terrain edits, so `undo` / `redo` let the model reliably reverse its own
   changes (independent of Dungeondraft's Ctrl+Z; `delete_element` is not

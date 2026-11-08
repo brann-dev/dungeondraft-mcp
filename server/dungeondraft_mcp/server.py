@@ -11,6 +11,7 @@ list_assets(category, search=...).
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import time
@@ -28,6 +29,7 @@ bridge = BridgeClient(HOST, PORT)
 
 _SCREENSHOT_PATH = os.path.join(tempfile.gettempdir(), "dd_mcp_screenshot.png")
 _EXPORT_PATH = os.path.join(tempfile.gettempdir(), "dd_mcp_export.png")
+_UVTT_PATH = os.path.join(tempfile.gettempdir(), "dd_mcp_export.dd2vtt")
 
 
 def _wait_for_file(path: str, timeout: float = 60.0) -> None:
@@ -42,6 +44,31 @@ def _wait_for_file(path: str, timeout: float = 60.0) -> None:
             last = size
         time.sleep(0.3)
     raise BridgeError(f"render did not complete within {timeout:.0f}s ({path})")
+
+
+def _run_export(fmt: str, path: str, ppi: int, grid: Optional[bool],
+                timeout: float = 60.0) -> dict:
+    """Ask the mod to export `path` as `fmt`, wait for the file, restore the editor grid.
+
+    The mod toggles the grid before rendering and reports `grid_was`; the render
+    spans later frames, so restoring it is our job once the file is complete.
+    """
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    params: dict = {"path": path, "ppi": ppi, "format": fmt}
+    if grid is not None:
+        params["grid"] = grid
+    res = bridge.request("export_map", **params)
+    try:
+        _wait_for_file(path, timeout=timeout)
+    finally:
+        # Un-stage the level and put the camera and grid back. The mod does this
+        # itself once DD reports the export finished; this is the fallback for a
+        # run that died inside DD (which also leaves its IsExporting flag stuck).
+        bridge.request("export_finish")
+    return res
 
 
 # --------------------------------------------------------------------------
@@ -669,20 +696,42 @@ def export_map(ppi: int = 40, grid: Optional[bool] = None) -> Image:
     in the editor. The editor's grid setting is restored afterwards.
     The render runs asynchronously in Dungeondraft; this waits for it to finish.
     """
-    try:
-        os.remove(_EXPORT_PATH)
-    except FileNotFoundError:
-        pass
-    params: dict = {"path": _EXPORT_PATH, "ppi": ppi}
-    if grid is not None:
-        params["grid"] = grid
-    res = bridge.request("export_map", **params)
-    try:
-        _wait_for_file(_EXPORT_PATH)
-    finally:
-        if res.get("grid") != res.get("grid_was"):
-            bridge.request("set_grid", visible=res["grid_was"])
+    _run_export("png", _EXPORT_PATH, ppi, grid)
     return Image(path=_EXPORT_PATH)
+
+
+@mcp.tool()
+def export_uvtt(dest_path: str = "", ppi: int = 100, grid: bool = False) -> dict:
+    """Export the map as Universal VTT (.dd2vtt) for Foundry / Roll20: the image plus walls, doors and lights.
+
+    dest_path: where to write the .dd2vtt (the extension is added if missing);
+    default is a temp file. Point it somewhere your VTT can reach, then import it
+    there (Foundry: the Universal Battlemap / DD Import module).
+    ppi: pixels per grid cell in the embedded image; 100 matches Foundry's default grid.
+    grid: False (default) leaves the grid out, since VTTs draw their own.
+    Returns the path plus a summary parsed from the file: map size in cells and
+    counts of wall segments, object (furniture) walls, portals/doors and lights.
+    Large maps at high ppi take a while; this waits up to 3 minutes.
+    """
+    path = os.path.abspath(os.path.expanduser(dest_path)) if dest_path else _UVTT_PATH
+    if not path.lower().endswith(".dd2vtt"):
+        path += ".dd2vtt"
+    _run_export("uvtt", path, ppi, grid, timeout=180.0)
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    res = data.get("resolution") or {}
+    size = res.get("map_size") or {}
+    return {
+        "path": path,
+        "format_version": data.get("format"),
+        "map_size_cells": [size.get("x"), size.get("y")],
+        "pixels_per_grid": res.get("pixels_per_grid"),
+        "walls": len(data.get("line_of_sight") or []),
+        "object_walls": len(data.get("objects_line_of_sight") or []),
+        "portals": len(data.get("portals") or []),
+        "lights": len(data.get("lights") or []),
+        "bytes": os.path.getsize(path),
+    }
 
 
 @mcp.tool()
@@ -700,6 +749,16 @@ def set_grid(visible: Optional[bool] = None) -> dict:
 # --------------------------------------------------------------------------
 # Camera
 # --------------------------------------------------------------------------
+
+@mcp.tool()
+def reset_camera() -> dict:
+    """Reset the editor view: default anchor, centered on the map, 100% zoom.
+
+    Use when the view is lost or stuck (for example zoomed far out and off the
+    map after an export that failed inside Dungeondraft). Returns the camera state.
+    """
+    return bridge.request("reset_camera")
+
 
 @mcp.tool()
 def get_camera() -> dict:

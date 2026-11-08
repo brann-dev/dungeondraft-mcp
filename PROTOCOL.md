@@ -158,8 +158,9 @@ server uses a temp path and reads it back as an image).
 | cmd | params | result |
 | --- | --- | --- |
 | `screenshot` | `path` | `{ path, width, height }` — window grab, synchronous |
-| `export_map` | `path`, `ppi=40`, `grid?` | `{ path, ppi, async, grid, grid_was }` — full-map render on a background thread; poll `path` for the file, then `set_grid(grid_was)` to restore the editor grid |
+| `export_map` | `path`, `ppi=40`, `grid?`, `format="png"` (`png` / `jpg` / `webp` / `uvtt`), `quality?` (1-100, jpg/webp) | `{ path, ppi, format, async, grid, grid_was }` — full-map render on a background thread; poll `path` for the file. The mod restores the grid, camera and level staging itself when DD finishes (`export_finish` is the fallback). `uvtt` writes a Universal VTT `.dd2vtt` (base64 image + walls / portals / lights) for Foundry or Roll20 import |
 | `set_grid` | `visible?` | `{ grid }` — show/hide the editor grid (omit `visible` to read it) |
+| `export_finish` | — | `{ restored, exporting }` — un-stage the export level and restore camera + grid. The mod does this itself when DD reports the export done; send it after the file is complete (or on timeout) as the fallback for a run that died inside DD |
 
 ### Camera
 
@@ -176,6 +177,7 @@ frame what you want to inspect.
 | `set_camera` | `x?`, `y?`, `zoom?` | camera state |
 | `focus_element` | `id`, `zoom?` | `{ id, focused[x,y], camera{} }` — centers on the element (any kind) |
 | `fit_elements` | `ids[]`, `pad=0.15` | `{ fit, missing[], center[x,y], bounds[[minx,miny],[maxx,maxy]], camera{} }` — frames the union of the ids' world bounds |
+| `reset_camera` | — | camera state — default anchor, map center, zoom 1.0; rescues a lost view |
 
 `focus_element`/`fit_elements` use each element's **world-space bounding rect**:
 `GlobalRect` for walls/paths, the Control rect for texts, a prop's `Rect`, or a
@@ -258,11 +260,31 @@ Ctrl+Z in Dungeondraft.
 - **Export grid** — `Exporter` has **no grid option**: it renders what the editor
   shows, and the Export window's Grid checkbox just calls `Editor.ToggleGrid`.
   `export_map` with `grid` toggles it before `Start`; the render spans later
-  frames, so the mod can't restore it itself — the Python tool calls
-  `set_grid(grid_was)` after the file is written.
-- **`export_map`** — `Exporter.Start(0, ppi, path)` writes asynchronously. If DD
-  chunks a very large map into multiple files, the single-path read would need
+  frames, so the mod restores it from `update()` once `Master.IsExporting`
+  drops (see "Export level staging"), and `export_finish` is the fallback.
+- **`export_map`** — `Exporter.Start(mode, ppi, path)` writes asynchronously. If
+  DD chunks a very large map into multiple files, the single-path read would need
   extending.
+- **Export formats** — `Exporter.Start` modes (modding API reference): 0 PNG,
+  1 JPEG, 2 WEBP, 3 Universal VTT, 4 Mod. `Exporter.Quality` (1-100) applies to
+  JPEG/WEBP. `Start` uses `path` verbatim, so the caller supplies the `.dd2vtt`
+  extension. The Universal VTT JSON holds `resolution` (`map_size` in cells,
+  `pixels_per_grid` = ppi), `line_of_sight` (wall polylines),
+  `objects_line_of_sight`, `portals`, `lights` and a base64 `image`; the Python
+  `export_uvtt` tool parses it and returns the counts.
+- **Export level staging** — `ExportWindow` calls
+  `World.SetSourceLevel(CurrentLevelId)` and `SetOverlayLevel(selected - 1,
+  opacity)` when it opens and `World.RestoreLevelsPostExport()` when it closes.
+  The Exporter's VTT helpers (`ExportLOS` / `ExportPortals` / `ExportLights` /
+  `SaveEnvironment`) read `World.SourceLevel`, so a bare `Exporter.Start` with
+  it null throws inside `Run`, a C# `async Task` that `Start` doesn't await: the
+  exception is swallowed, the intermediate `<path>.png` is left behind with no
+  `.dd2vtt`, and Run's own camera/viewport restore never runs (view left at the
+  export anchor and zoom, `Master.IsExporting` stuck true). The bridge stages
+  the level before `Start`, polls `Master.IsExporting` (static, but readable via
+  the Master node like `IsSaving`) in `update()` and restores levels, grid and a
+  camera snapshot when it drops. `export_finish` is the explicit fallback and
+  also clears a stuck `IsExporting`; `reset_camera` rescues a view left off-map.
 - **`undo` / `redo`** — bridge-managed stacks, not DD's history. DD 3.4.2's
   `History.CreateCustomRecord` does not record programmatic creates, invokes
   custom `undo()` inconsistently, and never round-trips `redo()`, so the bridge

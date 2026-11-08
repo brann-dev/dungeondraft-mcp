@@ -21,7 +21,7 @@ var script_class = "tool"
 
 const HOST := "127.0.0.1"
 const PORT := 8787
-const PROTOCOL_VERSION := 22
+const PROTOCOL_VERSION := 23
 
 # Commands that get wrapped in a Dungeondraft undo record (see _record_and_dispatch).
 const CREATE_CMDS := [
@@ -58,6 +58,7 @@ var _conns := []         # array of { "peer": StreamPeerTCP, "buf": String }
 var _undo_stack := []    # bridge-managed undo ops (see _build_op / _apply_op)
 var _redo_stack := []
 var _colorable = null    # lazily built set of "Colorable"-tagged texture paths
+var _export = null       # export in flight: { grid_was, cam: {anchor, pos, zoom} }; see _finish_export
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +100,9 @@ func update(delta : float):
 		_server = null
 		_conns = []
 		return
+
+	if _export != null and not _is_exporting():
+		_finish_export()   # Exporter.Run finished (or we were never told): un-stage
 
 	while _server.is_connection_available():
 		var peer = _server.take_connection()
@@ -397,11 +401,13 @@ func _safe_dispatch(req : Dictionary) -> Dictionary:
 		"screenshot": return _screenshot(req)
 		"export_map": return _export_map(req)
 		"set_grid": return _set_grid(req)
+		"export_finish": return _export_finish()
 		# --- camera ---
 		"get_camera": return _get_camera()
 		"set_camera": return _set_camera(req)
 		"focus_element": return _focus_element(req)
 		"fit_elements": return _fit_elements(req)
+		"reset_camera": return _reset_camera()
 		# --- history (bridge-managed undo/redo of the model's own edits) ---
 		"undo": return _do_undo()
 		"redo": return _do_redo()
@@ -1654,23 +1660,102 @@ func _screenshot(req : Dictionary) -> Dictionary:
 	return _ok({ "path": path, "width": img.get_width(), "height": img.get_height() })
 
 
-# Render the whole map (no UI) to a clean PNG. Asynchronous: Exporter.Start runs
-# on a separate thread, so the caller (MCP server) polls the path for the file.
+# Exporter.Start(mode, ppi, path) modes, per the modding API reference:
+# 0 = PNG, 1 = JPEG, 2 = WEBP, 3 = Universal VTT, 4 = Mod. Universal VTT is the
+# .dd2vtt JSON (base64 image + walls / portals / lights) that Foundry and Roll20
+# importers read. Start() uses `path` verbatim, so the caller picks the extension.
+const EXPORT_MODES := { "png": 0, "jpg": 1, "jpeg": 1, "webp": 2, "uvtt": 3, "dd2vtt": 3 }
+
+# Render the whole map (no UI) to a file, PNG by default. Asynchronous:
+# Exporter.Start runs on a separate thread, so the caller (MCP server) polls
+# the path for the file.
 func _export_map(req : Dictionary) -> Dictionary:
 	var path = str(req.get("path", ""))
 	if path == "": return _err("missing 'path'")
 	var ppi = int(req.get("ppi", 40))
+	var format = str(req.get("format", "png")).to_lower()
+	if not EXPORT_MODES.has(format):
+		return _err("unknown export format '%s' (png, jpg, webp, uvtt)" % format)
 	var toggle = Global.Editor.get("GridToggle")
 	if toggle == null: return _err("grid toggle not available")
+	var cam = _camera()
+	if cam == null: return _err("camera not available")
+	if _export != null or _is_exporting():
+		return _err("an export is already running")
+	if req.has("quality"):
+		var q = int(req["quality"])
+		if q < 1 or q > 100: return _err("quality must be 1..100")
+		Global.Exporter.Quality = q   # JPEG / WEBP only; PNG and UVTT ignore it
 	# DD's export has no grid option: it renders whatever the editor shows, and
 	# the Export window's Grid checkbox just calls Editor.ToggleGrid. So set it
-	# before Start; the caller restores `grid_was` (set_grid) once the file is
-	# written — the render runs over later frames, so we can't restore here.
+	# before Start; _finish_export puts it back once the render is done (the
+	# render spans later frames). `grid_was` is still reported for callers.
 	var grid_was = toggle.pressed
 	var grid = bool(req["grid"]) if req.has("grid") else grid_was
 	Global.Editor.ToggleGrid(grid)
-	Global.Exporter.Start(0, ppi, path)  # mode 0 = PNG
-	return _ok({ "path": path, "ppi": ppi, "async": true, "grid": grid, "grid_was": grid_was })
+	# Stage the current level the way ExportWindow does when it opens
+	# (SetSourceLevel + no overlay). The Exporter's VTT helpers read
+	# World.SourceLevel; with it null the UVTT bake throws inside Run — a C#
+	# async Task that Start() doesn't await — so the exception is swallowed, no
+	# .dd2vtt is written, "<path>.png" is left behind and Run's own camera /
+	# viewport restore never happens. Snapshot the camera so _finish_export can
+	# put it back even then.
+	_export = { "grid_was": grid_was,
+		"cam": { "anchor": cam.anchor_mode, "pos": cam.global_position, "zoom": cam.zoom.x } }
+	Global.World.SetSourceLevel(int(Global.World.CurrentLevelId))
+	Global.World.SetOverlayLevel(-1, 0.0)
+	Global.Exporter.Start(EXPORT_MODES[format], ppi, path)
+	return _ok({ "path": path, "ppi": ppi, "format": format, "async": true, "grid": grid, "grid_was": grid_was })
+
+
+# ExportWindow calls World.RestoreLevelsPostExport() when it closes; we do it
+# once Exporter.Run is done. Master.IsExporting (static, but readable through
+# the Master node like IsSaving) goes true before Run's first await and false
+# on its last line, after the file is written and the camera restored, so
+# update() polls it. If Run threw, the flag stays true and nothing was
+# restored: the caller's `export_finish` (sent once the file is complete, or on
+# timeout) is the fallback that un-stages anyway.
+func _finish_export() -> void:
+	if _export == null:
+		return
+	var snap = _export
+	_export = null
+	if Global.World.has_method("RestoreLevelsPostExport"):
+		Global.World.RestoreLevelsPostExport()
+	Global.Editor.ToggleGrid(bool(snap["grid_was"]))
+	var cam = _camera()
+	if cam != null and snap.has("cam"):
+		_restore_camera(cam, snap["cam"])
+
+
+func _restore_camera(cam, c : Dictionary) -> void:
+	if cam.has_method("SetAnchorMode"):
+		cam.SetAnchorMode(int(c["anchor"]))   # DD's setter also notifies FloorTileCamera
+	else:
+		cam.anchor_mode = int(c["anchor"])
+	cam.global_position = c["pos"]
+	_apply_zoom(cam, float(c["zoom"]))
+
+
+func _is_exporting() -> bool:
+	var master = Global.Editor.get_parent()
+	if master == null:
+		return false
+	var v = master.get("IsExporting")
+	return typeof(v) == TYPE_BOOL and v
+
+
+func _export_finish() -> Dictionary:
+	var had = _export != null
+	_finish_export()
+	var stuck = _is_exporting()
+	if stuck:
+		# Run died before its last line; clear the flag so the next export isn't refused.
+		var master = Global.Editor.get_parent()
+		if master != null:
+			master.set("IsExporting", false)
+		stuck = _is_exporting()
+	return _ok({ "restored": had, "exporting": stuck })
 
 
 # Show/hide the editor grid (same as the bottom-bar Grid toggle). It also
@@ -1731,6 +1816,17 @@ func _set_camera(req : Dictionary) -> Dictionary:
 		cam.global_position = _xy(req, cam.global_position)
 	if req.has("zoom"):
 		_apply_zoom(cam, float(req["zoom"]))
+	return _ok(_camera_state(cam))
+
+
+# Put the view back to a known state: default anchor (drag-center), map center,
+# 100% zoom. Rescues a view left zoomed out / off-map by an aborted export.
+func _reset_camera() -> Dictionary:
+	if Global.World.GetCurrentLevel() == null: return _err("no map open")
+	var cam = _camera()
+	if cam == null: return _err("camera not available")
+	_restore_camera(cam, { "anchor": Camera2D.ANCHOR_MODE_DRAG_CENTER,
+		"pos": Global.World.WoxelDimensions * 0.5, "zoom": 1.0 })
 	return _ok(_camera_state(cam))
 
 
