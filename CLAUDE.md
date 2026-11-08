@@ -41,6 +41,10 @@ If you change code (not just drive the map), the two halves reload differently:
   Dungeondraft's toolbar, or restart DD (`Dungeondraft.exe "<map path>"` reopens
   a map directly; the bridge is up about 12 s later). Changing an existing
   handler needs only this.
+- **Reload Mods can also crash DD natively when the script's member `var`s
+  changed** (Godot hot-reloads the script into live instances; the crash is in
+  `ModManager.Update` → `ModScript.Update`). After adding or removing a
+  class-level `var`, restart DD instead of reloading.
 - **A GDScript compile (parse) error crashes Dungeondraft natively** when the
   mod loads, with no error message. Compile-check `.gd` changes before
   reloading (see PROTOCOL.md's implementation notes), and avoid static type
