@@ -323,8 +323,9 @@ def place_pattern(
     color: '#rrggbb' tint. Omit to use the tileset's own default tint (wood is
       brown, etc.) instead of white — match the UI by leaving it unset.
     rotation: pattern rotation in degrees.
-    z: absolute z_index. Default -100 sits below objects (z 0) and above terrain
-      shapes (z -200). Raise toward 0+ to overlay on top.
+    z: DD pattern layer. Default -100 is DD's "below objects" layer (above
+      terrain/floor shapes at -200); 100+ overlays on top of objects. The layer
+      is saved with the map, so it survives reload and export.
     """
     if (rect is None) == (points is None):
         raise ValueError("provide exactly one of 'rect' or 'points'")

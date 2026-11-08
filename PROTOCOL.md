@@ -308,11 +308,17 @@ Ctrl+Z in Dungeondraft.
 - **`place_pattern`** — draws a tiled-floor shape via `PatternShapes.DrawRect` /
   `DrawPolygon`, then applies the texture with `PatternShape.SetOptions(tex,
   color, rotation)` (the draw call alone leaves the shape untextured). New shapes
-  land in the tool's default "Layer 100" (z 100, above the Objects node at z 0),
-  so to render the floor **below** objects we set `z_as_relative = false` and an
-  absolute `z_index` (default `z` = -100, between FloorShapes at -200 and Objects
-  at 0). Do **not** use `PatternShapeTool.SetLayer()` on an uncreated index — it
-  hard-crashes the mod (GDScript has no try/catch; valid range undocumented).
+  land in the tool's active layer, by default "Layer 100" (z 100, above the
+  Objects node at z 0), so a floor would cover furniture. The bridge moves the
+  shape with **`PatternShape.SetLayer(z)`** (default `z` = -100, DD's own
+  "below objects" layer): `PatternShapes` keeps one `Node2D` per layer
+  (`GetOrMakeLayer` creates it with `ZIndex = layer`), the layer is what
+  `Save()`/`Load()` persist, and it stays relative to the level. An earlier
+  absolute-`z_index` hack (`z_as_relative = false`) looked right in the editor
+  but reloaded floors came back on layer 100 and the export staging (level at
+  z -2000) drew them over everything. Still do **not** call
+  `PatternShapeTool.SetLayer(index)` — that takes a *menu index* into the
+  tool's LayerMenu and hard-crashes on an invalid one.
 - **default tints** — `draw_wall` / `place_pattern` apply the texture's own
   default color when no `color` is given (walls via `WallTool.GetWallColor(tex)`,
   patterns by reading back `PatternShapeTool.Color` after setting the texture),

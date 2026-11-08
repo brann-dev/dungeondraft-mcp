@@ -21,7 +21,7 @@ var script_class = "tool"
 
 const HOST := "127.0.0.1"
 const PORT := 8787
-const PROTOCOL_VERSION := 23
+const PROTOCOL_VERSION := 24
 
 # Commands that get wrapped in a Dungeondraft undo record (see _record_and_dispatch).
 const CREATE_CMDS := [
@@ -1043,11 +1043,15 @@ func _place_pattern(req : Dictionary) -> Dictionary:
 	# DrawRect/DrawPolygon create the shape but don't apply the texture, so set
 	# it on the new shape directly via SetOptions(texture, color, rotation).
 	#
-	# Z-ORDER: new shapes land in the tool's default "Layer 100" node, whose
-	# z_index is 100 — ABOVE the Objects node (z 0), so the floor would cover
-	# furniture. The shape's own z_index is z_as_relative, i.e. an offset from
-	# that 100. To sit below objects we use an ABSOLUTE z: set z_as_relative=false
-	# and z_index=`z` (default -100, between FloorShapes at -200 and Objects at 0).
+	# Z-ORDER: new shapes land in the tool's active layer, by default DD's
+	# "Layer 100" node (z 100, ABOVE Objects at z 0), so a floor would cover the
+	# furniture. Move the shape with PatternShape.SetLayer(z): PatternShapes
+	# keeps one Node2D per layer (GetOrMakeLayer creates it, ZIndex = layer),
+	# the layer is what Save()/Load() persist, and it stays relative to the
+	# level — so it survives save/reload and the export staging that shifts the
+	# whole level to z -2000. (An earlier absolute-z hack did neither: reloaded
+	# floors came back on layer 100 and exports drew them over everything.)
+	# -100 is DD's own "below objects" layer (hotkey Shift+1).
 	var all = shapes.GetShapes()
 	var result := { "shape": kind, "category": category, "shape_count": all.size() }
 	if color is Color:
@@ -1060,10 +1064,11 @@ func _place_pattern(req : Dictionary) -> Dictionary:
 		var shape = all[all.size() - 1]
 		if shape.has_method("SetOptions"):
 			shape.SetOptions(tex, color, rotation)
-		shape.z_as_relative = false
-		shape.z_index = int(req.get("z", -100))
+		var layer = int(req.get("z", -100))
+		if shape.has_method("SetLayer"):
+			shape.SetLayer(layer)
 		result["id"] = _id(shape)
-		result["z_index"] = shape.z_index
+		result["layer"] = shape.GetLayer() if shape.has_method("GetLayer") else layer
 	return _ok(result)
 
 
