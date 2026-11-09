@@ -745,6 +745,18 @@ def _publish_new_file(destination: Path, payload: bytes, *, like: Path) -> None:
                 os.link(temporary, destination)
         except FileExistsError as exc:
             raise MapFileError(f"{destination} already exists; refusing to replace it") from exc
+        except OSError:
+            # No hard links here (FAT, exFAT, some network and FUSE mounts):
+            # create the destination exclusively and write it directly.
+            try:
+                fd2 = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                              stat.S_IMODE(like.stat().st_mode))
+            except FileExistsError as exc:
+                raise MapFileError(f"{destination} already exists; refusing to replace it") from exc
+            with os.fdopen(fd2, "wb") as out:
+                out.write(payload)
+                out.flush()
+                os.fsync(out.fileno())
     finally:
         if os.path.lexists(temporary):
             os.unlink(temporary)

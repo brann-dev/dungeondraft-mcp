@@ -386,9 +386,6 @@ def add_light(
     range: Dungeondraft's own Range, the number its Light tool shows and its
       saved map and Universal VTT export carry (2.0 lights about two tiles
       from the centre with the default texture). The default is 2.0.
-    woxels: with Dungeondraft's built-in lights, 1.0 fades out about 2 tiles
-    from the center and 2.0 about 4. Dungeondraft's own Range slider shows
-    twice this number.
     asset: optional Lights gradient/cookie texture path.
     """
     params = {"color": color, "energy": energy, "range": range, "shadows": shadows, "asset": asset}
@@ -419,8 +416,9 @@ def add_portal(
 
     asset: a Portals asset path.
     closed: whether the portal blocks sight and light. Omitted, it follows
-      the asset: a door is closed (an openable door in a VTT export), a
-      window is open. Foundry and Roll20 go by this flag, not the picture.
+      the asset: a door is closed (an openable door in a VTT export); a
+      window or an empty frame is open. Foundry and Roll20 go by this flag,
+      not the picture.
     radius: door half-width (~128 ≈ 1-tile door, ~256 ≈ 2-tile door).
     mount: 'wall' (snap to nearest wall, cut gap) or 'free' (freestanding).
     snap_max: max woxel distance a wall may be and still capture the portal.
@@ -429,7 +427,7 @@ def add_portal(
     rotation: degrees, freestanding only.
     """
     if closed is None:
-        closed = "window" not in asset.lower()
+        closed = mapfile.vtt_closed(asset)   # a door blocks; a window or an empty frame is open
     params = {
         "asset": asset,
         "closed": closed,
@@ -552,6 +550,11 @@ def build_room(
     """
     if (rect is None) == (points is None):
         raise ValueError("provide exactly one of 'rect' or 'points'")
+    if floor not in ("pattern", "terrain", "none"):
+        raise ValueError("floor must be 'pattern', 'terrain' or 'none'")
+    if floor == "pattern" and not floor_asset:
+        raise ValueError("floor='pattern' needs floor_asset: a texture from list_assets('Simple Tiles') "
+                         "or another floor_category; or pass floor='none' for walls only")
     params: dict = {
         "floor": floor,
         "floor_category": floor_category,
@@ -587,8 +590,6 @@ def build_room(
             result["wall_ids"].append(
                 draw_wall(run, asset=wall_asset, loop=False, type=wall_type, joint=wall_joint)["id"])
         if floor == "pattern":
-            if not floor_asset:
-                raise ValueError("floor='pattern' needs floor_asset (a Simple Tiles / Smart Tiles texture)")
             result["floor_id"] = place_pattern(
                 floor_asset, points=boundary, category=floor_category, color=floor_color)["id"]
         elif floor == "terrain":
@@ -610,11 +611,13 @@ def _shared_walls(boundary: list, wall_type: int, wall_asset: str) -> dict:
     first = layout.shared_walls(boundary, guess, wall_type=wall_type)
     if not first["shared_wall_ids"]:
         return first
+    # Keep the snapshot's geometry (world space); get_element reports a wall's
+    # raw Points, which are local to the node and differ once a wall was moved.
+    by_id = {w["id"]: w for w in snapshot.get("walls", [])}
     typed = []
     for wid in first["shared_wall_ids"]:
         el = bridge.request("get_element", id=wid)
-        typed.append({"id": wid, "points": el["points"], "loop": el.get("loop", False),
-                      "type": el.get("type", wall_type), "asset": el.get("asset", "")})
+        typed.append(dict(by_id[wid], type=el.get("type", wall_type), asset=el.get("asset", "")))
     return layout.shared_walls(boundary, typed, wall_type=wall_type, wall_asset=wall_asset)
 
 
@@ -2245,8 +2248,8 @@ def prepare_map_with_packs(pack_ids: list[str], destination: str = "") -> dict:
     file whose header includes the given packs (ids from list_asset_packs or
     search_pack_contents) and opens it; the original file is left as it was.
     destination: the new file's path (default: beside the original, with
-    '-packs' added to the name). Save first: the copy is made from the file
-    on disk, and open_map discards unsaved changes. Not undoable.
+    '-packs' added to the name). The map is saved first, so no edit is lost
+    when the copy opens. Not undoable.
     """
     if not pack_ids:
         raise ValueError("give at least one pack id")
@@ -2254,6 +2257,7 @@ def prepare_map_with_packs(pack_ids: list[str], destination: str = "") -> dict:
     if not src:
         raise ValueError("the map has never been saved; save it in Dungeondraft first")
     found = packs.installed()["packs"]
+    _save_and_wait(src)
     infos = [pack.info for pack in found.values()]
     unknown = mapfile.unknown_ids(infos, pack_ids)
     if unknown:
@@ -2291,9 +2295,10 @@ def import_dd2vtt(
     range and shadows, and the ambient light; the image goes under the map as
     a trace at the right scale. It does not pick art: blocking_objects says
     where each sight-blocking object stood and its size, so you can place
-    something matching. The map must already be the export's size (see
-    map_size_tiles and needs_resize). The rebuild is ONE undo step; the
-    ambient light and trace image are not undoable.
+    something matching. The map must be at least the export's size (see
+    map_size_tiles); on a larger map everything lands in the top-left
+    corner. The rebuild is ONE undo step; the ambient light and trace image
+    are not undoable.
     """
     source = Path(path)
     if not source.is_file():
@@ -2307,9 +2312,10 @@ def import_dd2vtt(
     if not confirm:
         plan["note"] = "nothing was changed; call again with confirm=True to rebuild"
         return plan
-    if plan.get("needs_resize"):
-        raise ValueError(f"the map is {tiles} tiles but the export needs {plan['map_size_tiles']}; "
-                         "make a map of that size first")
+    need = plan["map_size_tiles"]
+    if tiles and (tiles[0] < need[0] or tiles[1] < need[1]):
+        raise ValueError(f"the map is {tiles} tiles but the export needs {need}; "
+                         "make a map at least that size first")
     if portals and plan["portals"]:
         door_asset = door_asset or _first_asset("Portals", "door")
         window_asset = window_asset or _first_asset("Portals", "window") or door_asset
@@ -2345,6 +2351,19 @@ def import_dd2vtt(
                                               scale=plan["trace"]["scale"], opacity=plan["trace"]["opacity"])
     return {"confirm": True, "summary": plan["summary"], "made": made,
             "blocking_objects": plan.get("blocking_objects", []), "notes": plan.get("notes", [])}
+
+
+def _save_and_wait(path: str, timeout: float = 30.0) -> None:
+    """save_map, then wait until the write is done and the file is newer."""
+    before = os.path.getmtime(path) if os.path.exists(path) else 0.0
+    bridge.request("save_map")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        state = bridge.request("get_current_map")
+        if not state.get("saving") and os.path.exists(path) and os.path.getmtime(path) > before:
+            return
+        time.sleep(0.2)
+    raise ValueError(f"the save did not finish within {timeout:.0f} s; try again")
 
 
 def _first_asset(category: str, search: str) -> str:
@@ -2449,7 +2468,9 @@ def delete_level(index: int) -> dict:
 
 # Tools batch() won't run: the ones that return an image, the one that swaps
 # the map out from under the rest of the batch, and itself.
-_NOT_BATCHABLE = {"batch", "screenshot", "export_map", "export_uvtt", "open_map"}
+_NOT_BATCHABLE = {"batch", "screenshot", "export_map", "export_uvtt", "open_map",
+                  # history commands close the batch's own undo group
+                  "undo", "redo", "checkpoint", "rollback_checkpoint", "list_checkpoints"}
 
 
 @_tool()
@@ -2462,7 +2483,8 @@ def batch(calls: list[dict], stop_on_error: bool = True, single_undo: bool = Tru
        {"tool": "add_light", "args": {"x": 1024, "y": 768, "range": 1.5}}]
     A later call cannot use an earlier call's result (such as a new id); when
     you need one, end the batch there. Not available inside a batch:
-    screenshot, export_map, export_uvtt, open_map.
+    screenshot, export_map, export_uvtt, open_map, and the history tools
+    (undo, redo, checkpoints).
 
     Returns one entry per call that ran: {tool, ok, result} or {tool, ok: false,
     error}. With stop_on_error (the default) the batch stops at the first

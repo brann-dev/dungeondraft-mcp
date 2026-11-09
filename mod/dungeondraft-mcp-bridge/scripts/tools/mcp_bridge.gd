@@ -188,6 +188,13 @@ func _record_and_dispatch(req : Dictionary) -> Dictionary:
 	if cmd in CAVE_CMDS:
 		cave_before = _cave_snapshot()
 
+	# A request without the open group's token comes from a caller that stopped
+	# talking (a server that died mid-batch): close that group first, so its
+	# edits are not swallowed. Groups the mod opens itself (build_room) carry
+	# no token and match the untokened requests made inside them.
+	if not _groups.empty() and cmd != "end_undo_group":
+		if str(_groups.back().get("token", "")) != str(req.get("undo_group", "")):
+			_close_all_groups()
 	if cmd in HISTORY_CMDS:
 		_close_all_groups()
 
@@ -299,7 +306,8 @@ func _do_redo() -> Dictionary:
 
 func _begin_group(req : Dictionary) -> Dictionary:
 	var label = str(req.get("label", "")).strip_edges()
-	_groups.append({ "kind": "group", "label": label, "entries": [] })
+	_groups.append({ "kind": "group", "label": label, "entries": [],
+		"token": str(req.get("undo_group", "")) })
 	return _ok({ "open_groups": _groups.size(), "label": label })
 
 
@@ -308,6 +316,8 @@ func _begin_group(req : Dictionary) -> Dictionary:
 func _end_group(req : Dictionary) -> Dictionary:
 	if _groups.empty():
 		return _err("no undo group is open")
+	if str(_groups.back().get("token", "")) != str(req.get("undo_group", "")):
+		return _err("the open undo group belongs to another request")
 	var steps = _close_group()
 	return _ok({ "steps": steps, "open_groups": _groups.size(), "undo_depth": _undo_stack.size() })
 
@@ -382,9 +392,9 @@ func _apply_op(op, undo : bool):
 	match op["kind"]:
 		"create":
 			if undo:
-				_detach_node(op["node"], int(op["id"]))
+				_detach_node(_op_node(op), int(op["id"]))
 			else:
-				_attach_node(op["node"], _op_parent(op), int(op["id"]))
+				_attach_node(_op_node(op), _op_parent(op), int(op["id"]))
 		"create_saved":
 			if undo:
 				_delete_saved(op)
@@ -392,9 +402,9 @@ func _apply_op(op, undo : bool):
 				_reload_saved(op)
 		"delete":
 			if undo:
-				_attach_node(op["node"], _op_parent(op), int(op["id"]))
+				_attach_node(_op_node(op), _op_parent(op), int(op["id"]))
 			else:
-				_detach_node(op["node"], int(op["id"]))
+				_detach_node(_op_node(op), int(op["id"]))
 		"delete_saved":
 			if undo:
 				_reload_saved(op)
@@ -447,6 +457,20 @@ func _apply_op(op, undo : bool):
 # The parent to re-attach under: the one the op holds or, when that was a wall
 # since reloaded by undo/redo (a new object carrying the old id), the wall that
 # holds the id now.
+# The node an op attaches or detaches: the one it holds or, when that was
+# freed and reloaded under the same id (a door whose wall was reloaded), the
+# node that holds the id now.
+func _op_node(op):
+	var node = op.get("node")
+	if is_instance_valid(node):
+		return node
+	var id = int(op.get("id", -1))
+	if id >= 0 and Global.World.HasNodeID(id):
+		node = Global.World.GetNodeByID(id)
+		op["node"] = node
+	return node
+
+
 func _op_parent(op):
 	var parent = op.get("parent")
 	if is_instance_valid(parent):
@@ -457,7 +481,9 @@ func _op_parent(op):
 
 
 func _detach_node(node, id : int):
-	if is_instance_valid(node) and node.get_parent() != null:
+	if node == null or not is_instance_valid(node):
+		return   # nothing to take out, and the id may belong to a reloaded node
+	if node.get_parent() != null:
 		node.get_parent().remove_child(node)
 	if Global.World.HasNodeID(id):
 		Global.World.RemoveNodeID(id)
@@ -1208,16 +1234,18 @@ func _draw_path(req : Dictionary) -> Dictionary:
 func _add_light(req : Dictionary) -> Dictionary:
 	var level = Global.World.GetCurrentLevel()
 	if level == null: return _err("no map open")
+	var range_value = float(req.get("range", 2.0))
+	if range_value <= 0.0: return _err("'range' must be > 0")
+	var tex = _asset_tex("Lights", req.get("asset", ""))
+	if str(req.get("asset", "")) != "" and tex == null:
+		return _err("could not load light asset: " + str(req.get("asset")))
 	var light = level.Lights.CreateLight(false)
 	light.position = _xy(req, Global.World.WoxelDimensions * 0.5)
 	light.color = _color(req.get("color", ""), Color(1, 0.9, 0.7))
 	light.energy = float(req.get("energy", 1.0))
 	light.shadow_enabled = bool(req.get("shadows", true))
-	var tex = _asset_tex("Lights", req.get("asset", ""))
 	if tex != null:
 		light.texture = tex
-	var range_value = float(req.get("range", 2.0))
-	if range_value <= 0.0: return _err("'range' must be > 0")
 	light.texture_scale = _light_scale(light, range_value)
 	light.set_meta("preview", false)   # Lights.Save() hard-casts it (see _register_prop)
 	return _ok({ "id": _id(light), "position": _vec(light.position), "range": _light_range(light) })
@@ -2508,9 +2536,11 @@ func _delete_level(req : Dictionary) -> Dictionary:
 	var label = str(level.Label)
 	var id = level.ID
 	if Global.World.CurrentLevelId == idx:
-		Global.World.SetLevel(idx + 1 if idx + 1 < Global.World.levels.size() else idx - 1, false)
+		Global.World.SetLevel(idx - 1 if idx > 0 else idx + 1, false)
 	Global.World.DeleteLevel(level)
 	Global.Editor.UpdateLevelOptions()
+	if Global.World.GetCurrentLevel() == null:
+		Global.World.SetLevel(0, false)
 	var rows = _list_levels()["result"]
 	rows["deleted_id"] = id
 	rows["deleted_label"] = label
@@ -4119,8 +4149,12 @@ func _terrain_samples(req : Dictionary) -> Dictionary:
 		var tex = level.Terrain.GetTexture(i)
 		slots.append(tex.resource_path if tex != null else null)
 	var covers = _cover_polygons(level)
-	var cave = _cave_mesh()
-	var bm = cave.call("get_Bitmap") if (cave != null and cave.has_method("get_Bitmap")) else null
+	# Read-only: the level's own CaveMesh (null when nothing was ever dug),
+	# not _cave_mesh(), which enables the Cave Brush to create one.
+	var cave = level.get("CaveMesh")
+	var bm = null
+	if cave != null and is_instance_valid(cave) and cave.has_method("get_Bitmap"):
+		bm = cave.call("get_Bitmap")
 	var bm_size = bm.get_size() if bm != null else Vector2.ZERO
 	var iw = img.get_width()
 	var ih = img.get_height()

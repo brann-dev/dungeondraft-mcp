@@ -134,7 +134,7 @@ def main() -> int:
     # 6. scatter one step
     sc = s.scatter_objects([asset], rect=[cx-1500, cy-1500, 600, 600], count=5, seed=3, allow_overlap=True)
     us = s.undo()
-    check("scatter is one undo step", us.get("kind") in ("group", "create_prop") and us.get("steps", 1) == sc["placed"], (sc, us))
+    check("scatter is one undo step", us.get("kind") in ("group", "create_saved") and us.get("steps", 1) == sc["placed"], (sc, us))
 
     # 7. checkpoint / rollback
     cp = s.checkpoint("test")
@@ -161,8 +161,6 @@ def main() -> int:
     check("delete_level removed it", dl.get("deleted_id") == lv["id"] and all(l["id"] != lv["id"] for l in dl["levels"]), dl)
     only = None
     try:
-        while len(s.list_levels()["levels"]) > 1:
-            break
         if len(s.list_levels()["levels"]) == 1:
             s.delete_level(0)
     except Exception as exc:
@@ -176,7 +174,6 @@ def main() -> int:
     if w in walls_now: s.delete_element(w)
     n1 = len(s.list_elements("objects", 1000)["elements"])
     check("object count back to start", n1 == n0, (n0, n1))
-    print("history depth now:", s.undo()["undo_depth"] if False else "n/a")
     # ---- features ----
 
 
@@ -271,8 +268,6 @@ def main() -> int:
     if extra_walls: s.delete_elements(extra_walls)
     extra = [e["id"] for e in s.list_elements("objects", 1000)["elements"] if e["id"] not in start_ids]
     if extra: s.delete_elements(extra)
-    for kind in ("patterns",):
-        pass
     check("objects back to start", len(s.list_elements("objects", 1000)["elements"]) == len(start_ids))
     check("walls back to start", {e["id"] for e in s.list_elements("walls", 1000)["elements"]} == start_walls)
     # ---- more ----
