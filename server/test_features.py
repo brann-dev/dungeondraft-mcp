@@ -317,6 +317,12 @@ def main() -> int:
     check("place_object(snap=True) lands where get_snap_settings says", [round(v, 2) for v in pos] == [round(v, 2) for v in snap["snapped"][0]], (pos, snap["snapped"]))
     s.delete_element(placed["id"])
 
+    # ---- preview sheet ----
+    import json as _json
+    sheet = s.preview_assets([asset, asset], columns=2, cell_px=96)
+    cap = _json.loads(sheet[1])
+    check("preview_assets returns an image and a caption with sizes", hasattr(sheet[0], "data") and len(cap["cells"]) == 2 and cap["cells"][0]["size_px"], cap)
+
     # ---- more ----
 
 

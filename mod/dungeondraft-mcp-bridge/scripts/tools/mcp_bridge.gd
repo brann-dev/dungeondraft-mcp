@@ -4472,6 +4472,7 @@ func _preview_assets(req : Dictionary) -> Dictionary:
 	var true_scale = bool(req.get("true_scale", false))
 	var images := []
 	var sizes := []
+	var colorable := []
 	var missing := []
 	var largest := 1.0
 	for a in assets:
@@ -4481,7 +4482,12 @@ func _preview_assets(req : Dictionary) -> Dictionary:
 			missing.append(str(a))
 			images.append(null)
 			sizes.append(null)
+			colorable.append(false)
 			continue
+		# A Colorable asset is drawn as the red mask the sheet shows; it takes
+		# a colour when placed.
+		var path = str(tex.resource_path)
+		colorable.append(path.find("colorable") != -1 or _colorable_paths().has(path))
 		img = img.duplicate()
 		if img.is_compressed():
 			img.decompress()
@@ -4511,8 +4517,8 @@ func _preview_assets(req : Dictionary) -> Dictionary:
 	if err != OK:
 		return _err("could not write the preview sheet (error %d)" % err)
 	return _ok({ "path": ProjectSettings.globalize_path(PREVIEW_PATH), "columns": columns, "rows": rows,
-		"cell_px": cell, "count": assets.size(), "sizes": sizes, "missing": missing,
-		"largest_px": largest, "true_scale": true_scale })
+		"cell_px": cell, "count": assets.size(), "sizes": sizes, "colorable": colorable,
+		"missing": missing, "largest_px": largest, "true_scale": true_scale })
 
 
 # ---------------------------------------------------------------------------
