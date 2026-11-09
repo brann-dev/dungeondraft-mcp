@@ -38,8 +38,9 @@ INSTRUCTIONS = """These tools drive a running Dungeondraft through its MCP Bridg
 then get_status, before anything else. If a call fails with "paused", the user
 paused AI edits in Dungeondraft's MCP Bridge panel: tell them, and make no edits
 until they resume (read-only tools still work). If a call fails with a token
-error, this server and the mod do not share the bridge token: say so and stop;
-restarting Dungeondraft and reconnecting the server fixes it."""
+error, this server could not read the token Dungeondraft wrote, or a
+DD_BRIDGE_TOKEN / DD_BRIDGE_TOKEN_FILE override points elsewhere: say so and
+stop; the user fixes the override or restarts Dungeondraft."""
 
 mcp = FastMCP("dungeondraft", instructions=INSTRUCTIONS)
 
@@ -331,6 +332,9 @@ def place_object(
     snap: True puts it on the user's grid: the Custom Snap Mod's when that mod is
       loaded, else Dungeondraft's half-tile grid (see get_snap_settings).
     """
+    if snap and x is not None and y is not None:
+        x, y = _snapped([[x, y]], "place_object")[0]   # so check=True judges the snapped spot
+        snap = False
     params = {"asset": asset, "scale": scale, "rotation": rotation, "sorting": sorting}
     if x is not None:
         params["x"] = x
@@ -341,7 +345,7 @@ def place_object(
     params["layer"] = layer
     if check or region:
         _refuse_if_blocked("place_object", params, allow_overlap, region)
-    return bridge.request("place_object", **({"snap": True} if snap else {}), **params)
+    return bridge.request("place_object", snap=snap, **params)
 
 
 @_tool()
@@ -363,7 +367,7 @@ def draw_wall(
       loaded, else Dungeondraft's half-tile grid (see get_snap_settings).
     """
     return bridge.request(
-        "draw_wall", **({"snap": True} if snap else {}), points=points, asset=asset, loop=loop, shadow=shadow, type=type, joint=joint, color=color
+        "draw_wall", snap=snap, points=points, asset=asset, loop=loop, shadow=shadow, type=type, joint=joint, color=color
     )
 
 
@@ -391,7 +395,7 @@ def draw_path(
         params["smoothness"] = smoothness
     if width is not None:
         params["width"] = width
-    return bridge.request("draw_path", **({"snap": True} if snap else {}), **params)
+    return bridge.request("draw_path", snap=snap, **params)
 
 
 @_tool()
@@ -420,7 +424,7 @@ def add_light(
         params["x"] = x
     if y is not None:
         params["y"] = y
-    return bridge.request("add_light", **({"snap": True} if snap else {}), **params)
+    return bridge.request("add_light", snap=snap, **params)
 
 
 @_tool()
@@ -472,7 +476,7 @@ def add_portal(
         params["x"] = x
     if y is not None:
         params["y"] = y
-    return bridge.request("add_portal", **({"snap": True} if snap else {}), **params)
+    return bridge.request("add_portal", snap=snap, **params)
 
 
 @_tool()
@@ -546,7 +550,7 @@ def place_pattern(
         params["color"] = color
     if rotation is not None:
         params["rotation"] = rotation
-    return bridge.request("place_pattern", **({"snap": True} if snap else {}), **params)
+    return bridge.request("place_pattern", snap=snap, **params)
 
 
 @_tool()
@@ -608,11 +612,18 @@ def build_room(
     if floor_color:
         params["floor_color"] = floor_color
     boundary = _shape_polygon(rect, points)
+    if snap:
+        # Snap the corners first, so the protected-region check, the shared-wall
+        # analysis, the walls and the floor all see the same outline.
+        boundary = [list(p) for p in _snapped([list(p) for p in boundary], "build_room")]
+        rect, points, snap = None, boundary, False
+        params.pop("rect", None)
+        params["points"] = boundary
     if floor == "terrain":
         _refuse_if_protected("the room's terrain floor", polygon=boundary, radius=64)
     shared = _shared_walls(boundary, wall_type, wall_asset)
     if not shared["shared_wall_ids"]:
-        return bridge.request("build_room", **({"snap": True} if snap else {}), **params)
+        return bridge.request("build_room", **params)
     # Part of the boundary is already walled. Draw only the free sides, so a
     # door on the shared wall opens into both rooms (a second wall there would
     # still block the doorway in a VTT), and the floor on the whole boundary.
@@ -623,10 +634,10 @@ def build_room(
     with _undo_group("build_room"):
         for run in shared["runs"]:
             result["wall_ids"].append(
-                draw_wall(run, asset=wall_asset, loop=False, type=wall_type, joint=wall_joint, snap=snap)["id"])
+                draw_wall(run, asset=wall_asset, loop=False, type=wall_type, joint=wall_joint)["id"])
         if floor == "pattern":
             result["floor_id"] = place_pattern(
-                floor_asset, points=boundary, category=floor_category, color=floor_color, snap=snap)["id"]
+                floor_asset, points=boundary, category=floor_category, color=floor_color)["id"]
         elif floor == "terrain":
             result["floor_pixels"] = fill_region(points=boundary, slot=floor_slot, asset=floor_asset).get("pixels")
     result["note"] = (f"{len(shared['shared_wall_ids'])} existing wall(s) stand on the boundary and were "
@@ -684,7 +695,7 @@ def add_text(
         params["color"] = color
     if font:
         params["font"] = font
-    return bridge.request("add_text", **({"snap": True} if snap else {}), **params)
+    return bridge.request("add_text", snap=snap, **params)
 
 
 @_tool()
@@ -725,6 +736,9 @@ def import_image(
     snap: True puts it on the user's grid: the Custom Snap Mod's when that mod is
       loaded, else Dungeondraft's half-tile grid (see get_snap_settings).
     """
+    if snap and x is not None and y is not None:
+        x, y = _snapped([[x, y]], "import_image")[0]
+        snap = False
     params: dict = {
         "path": os.path.abspath(os.path.expanduser(path)),
         "scale": scale, "rotation": rotation, "sorting": sorting, "shadow": shadow,
@@ -736,7 +750,7 @@ def import_image(
         params["y"] = y
     if check or region:
         _refuse_if_blocked("import_image", params, allow_overlap, region)
-    return bridge.request("import_image", **({"snap": True} if snap else {}), **params)
+    return bridge.request("import_image", snap=snap, **params)
 
 
 @_tool()
@@ -1112,10 +1126,13 @@ def move_element(
     snap: True puts it on the user's grid: the Custom Snap Mod's when that mod is
       loaded, else Dungeondraft's half-tile grid (see get_snap_settings).
     """
+    if snap:
+        x, y = _snapped([[x, y]], "move_element")[0]
+        snap = False
     params = {"id": id, "x": x, "y": y}
     if check or region:
         _refuse_if_blocked("move_element", params, allow_overlap, region)
-    return bridge.request("move_element", **({"snap": True} if snap else {}), **params)
+    return bridge.request("move_element", snap=snap, **params)
 
 
 @_tool()
@@ -2480,6 +2497,11 @@ def _save_and_wait(path: str, timeout: float = 30.0) -> None:
     raise ValueError(f"the save did not finish within {timeout:.0f} s; try again")
 
 
+def _snapped(points: list, for_tool: str) -> list:
+    """Snap points on the mod's grid rules for `for_tool`, as snap=True would."""
+    return bridge.request("get_snap_settings", points=points, **{"for": for_tool})["snapped"]
+
+
 def _first_asset(category: str, search: str) -> str:
     found = bridge.request("list_assets", category=category, search=search, limit=1).get("assets", [])
     return found[0] if found else ""
@@ -2582,9 +2604,9 @@ def delete_level(index: int) -> dict:
 
 # Tools batch() won't run: the ones that return an image, the one that swaps
 # the map out from under the rest of the batch, and itself.
-_NOT_BATCHABLE = {"batch", "screenshot", "export_map", "export_uvtt", "open_map",
-                  # history commands close the batch's own undo group
-                  "undo", "redo", "checkpoint", "rollback_checkpoint", "list_checkpoints"}
+_NOT_BATCHABLE = {"batch", "screenshot", "export_map", "export_uvtt", "open_map", "preview_assets",
+                  # these close or wipe the batch's own undo group
+                  "undo", "redo", "checkpoint", "rollback_checkpoint", "list_checkpoints", "set_map_size"}
 
 
 @_tool()

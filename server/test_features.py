@@ -61,11 +61,13 @@ def main() -> int:
         check("ping without a token answers unauthenticated", bare["ok"] and bare["result"]["authenticated"] is False, bare)
         wrong = raw(cmd="get_status", token="0" * 64)
         check("a wrong token is refused", not wrong["ok"] and wrong["error"].startswith("bad token"), wrong)
-    try:
-        s.native_describe("Tool:mcp_bridge"); guarded = None
-    except Exception as exc:
-        guarded = str(exc)
-    check("the bridge's own panel is unreachable", guarded is not None, guarded)
+    guarded = []
+    for target in ("Tool:mcp_bridge", "Editor.Tools.mcp_bridge", "Editor.Tools.mcp_bridge.ScriptInstance"):
+        try:
+            s.native_describe(target); guarded.append(None)
+        except Exception as exc:
+            guarded.append(str(exc))
+    check("the bridge's own panel and script are unreachable", all(g is not None for g in guarded), guarded)
     if pg.get("paused"):
         print("AI edits are paused in Dungeondraft's MCP Bridge panel: resume them and run again")
         return 1
@@ -310,6 +312,15 @@ def main() -> int:
         t2 = s.get_terrain(samples=4)
         check("terrain still reads after resizing", len(t2["samples"]) == 16, t2.get("slots"))
     snap = s.get_snap_settings(points=[[cx + 37, cy + 91]])
+    if not snap.get("mod_loaded"):
+        wall_step = s.bridge.request("get_snap_settings", points=[[cx + 37, cy + 91]], **{"for": "draw_wall"})["snapped"][0]
+        full = 256.0 if not snap.get("half_grid_snap") else 128.0
+        check("walls snap to Dungeondraft's whole-tile grid unless half-grid snap is on",
+              wall_step[0] % full == 0 and wall_step[1] % full == 0 and snap["snapped"][0][0] % 128 == 0, (wall_step, snap["snapped"]))
+    checked = s.place_object(asset, cx + 37, cy + 91, snap=True, check=True, allow_overlap=True)
+    cpos = s.get_element(checked["id"])["position"]
+    check("place_object(snap=True, check=True) lands on the grid", [round(v, 2) for v in cpos] == [round(v, 2) for v in snap["snapped"][0]], cpos)
+    s.delete_element(checked["id"])
     check("get_snap_settings answers", "vanilla_snapping" in snap and len(snap.get("snapped", [])) == 1, snap)
     print("  snap:", {k: v for k, v in snap.items() if k != "snapped"})
     placed = s.place_object(asset, cx + 37, cy + 91, snap=True)
