@@ -305,6 +305,7 @@ def place_object(
     check: bool = False,
     allow_overlap: bool = False,
     region: str = "",
+    snap: bool = False,
 ) -> dict:
     """Place an object (prop) on the current map. Returns the new element id.
 
@@ -325,6 +326,8 @@ def place_object(
     whole footprint must stay inside (implies check). get_asset_footprint tells
     you an asset's size first; check_object_placement tries a spot without
     placing anything.
+    snap: True puts it on the user's grid: the Custom Snap Mod's when that mod is
+      loaded, else Dungeondraft's half-tile grid (see get_snap_settings).
     """
     params = {"asset": asset, "scale": scale, "rotation": rotation, "sorting": sorting}
     if x is not None:
@@ -336,7 +339,7 @@ def place_object(
     params["layer"] = layer
     if check or region:
         _refuse_if_blocked("place_object", params, allow_overlap, region)
-    return bridge.request("place_object", **params)
+    return bridge.request("place_object", **({"snap": True} if snap else {}), **params)
 
 
 @_tool()
@@ -348,14 +351,17 @@ def draw_wall(
     type: int = 0,
     joint: int = 1,
     color: str = "",
+    snap: bool = False,
 ) -> dict:
     """Draw a wall through a list of [x, y] woxel points. Returns the new element id.
 
     asset: optional Walls asset path. loop: close into a loop (e.g. a room).
     type: 0=auto, 1=manual, 2=cave. joint: 0=sharp, 1=bevel, 2=round.
+    snap: True puts it on the user's grid: the Custom Snap Mod's when that mod is
+      loaded, else Dungeondraft's half-tile grid (see get_snap_settings).
     """
     return bridge.request(
-        "draw_wall", points=points, asset=asset, loop=loop, shadow=shadow, type=type, joint=joint, color=color
+        "draw_wall", **({"snap": True} if snap else {}), points=points, asset=asset, loop=loop, shadow=shadow, type=type, joint=joint, color=color
     )
 
 
@@ -367,6 +373,7 @@ def draw_path(
     sorting: int = 0,
     smoothness: Optional[float] = None,
     width: Optional[float] = None,
+    snap: bool = False,
 ) -> dict:
     """Draw a path/road/river through a list of [x, y] woxel points. Returns the new element id.
 
@@ -374,13 +381,15 @@ def draw_path(
     layer: draw layer (see list_layers); on the default, 100, a path lies under
     the objects placed there. sorting: 0=over, 1=under other paths on its layer.
     smoothness: optional curve smoothing. width: optional width scale multiplier.
+    snap: True puts it on the user's grid: the Custom Snap Mod's when that mod is
+      loaded, else Dungeondraft's half-tile grid (see get_snap_settings).
     """
     params = {"points": points, "asset": asset, "layer": layer, "sorting": sorting}
     if smoothness is not None:
         params["smoothness"] = smoothness
     if width is not None:
         params["width"] = width
-    return bridge.request("draw_path", **params)
+    return bridge.request("draw_path", **({"snap": True} if snap else {}), **params)
 
 
 @_tool()
@@ -392,6 +401,7 @@ def add_light(
     range: float = 2.0,
     shadows: bool = True,
     asset: str = "",
+    snap: bool = False,
 ) -> dict:
     """Add a light at a woxel position. Returns the new element id.
 
@@ -400,13 +410,15 @@ def add_light(
       saved map and Universal VTT export carry (2.0 lights about two tiles
       from the centre with the default texture). The default is 2.0.
     asset: optional Lights gradient/cookie texture path.
+    snap: True puts it on the user's grid: the Custom Snap Mod's when that mod is
+      loaded, else Dungeondraft's half-tile grid (see get_snap_settings).
     """
     params = {"color": color, "energy": energy, "range": range, "shadows": shadows, "asset": asset}
     if x is not None:
         params["x"] = x
     if y is not None:
         params["y"] = y
-    return bridge.request("add_light", **params)
+    return bridge.request("add_light", **({"snap": True} if snap else {}), **params)
 
 
 @_tool()
@@ -421,6 +433,7 @@ def add_portal(
     flip: bool = False,
     fallback_free: bool = True,
     rotation: float = 0.0,
+    snap: bool = False,
 ) -> dict:
     """Add a door/window portal at a woxel position. Returns the new element id.
 
@@ -438,6 +451,8 @@ def add_portal(
     flip: reverse the door's facing. fallback_free: if mount='wall' but no wall
     is within snap_max, place a freestanding portal instead of erroring.
     rotation: degrees, freestanding only.
+    snap: True puts it on the user's grid: the Custom Snap Mod's when that mod is
+      loaded, else Dungeondraft's half-tile grid (see get_snap_settings).
     """
     if closed is None:
         closed = mapfile.vtt_closed(asset)   # a door blocks; a window or an empty frame is open
@@ -455,7 +470,7 @@ def add_portal(
         params["x"] = x
     if y is not None:
         params["y"] = y
-    return bridge.request("add_portal", **params)
+    return bridge.request("add_portal", **({"snap": True} if snap else {}), **params)
 
 
 @_tool()
@@ -498,6 +513,7 @@ def place_pattern(
     color: str = "",
     rotation: Optional[float] = None,
     z: int = -100,
+    snap: bool = False,
 ) -> dict:
     """Place a tiled floor/pattern shape (the Building Tool's "Floor" / Pattern Shape).
 
@@ -514,6 +530,8 @@ def place_pattern(
     z: DD pattern layer. Default -100 is DD's "below objects" layer (above
       terrain/floor shapes at -200); 100+ overlays on top of objects. The layer
       is saved with the map, so it survives reload and export.
+    snap: True puts it on the user's grid: the Custom Snap Mod's when that mod is
+      loaded, else Dungeondraft's half-tile grid (see get_snap_settings).
     """
     if (rect is None) == (points is None):
         raise ValueError("provide exactly one of 'rect' or 'points'")
@@ -526,7 +544,7 @@ def place_pattern(
         params["color"] = color
     if rotation is not None:
         params["rotation"] = rotation
-    return bridge.request("place_pattern", **params)
+    return bridge.request("place_pattern", **({"snap": True} if snap else {}), **params)
 
 
 @_tool()
@@ -541,6 +559,7 @@ def build_room(
     floor_slot: int = 1,
     wall_type: int = 0,
     wall_joint: int = 1,
+    snap: bool = False,
 ) -> dict:
     """Build a room in one call: a looped wall AND a matching floor on the SAME path.
 
@@ -560,6 +579,7 @@ def build_room(
     wall_type: 0=auto, 1=manual, 2=cave. wall_joint: 0=sharp, 1=bevel, 2=round.
 
     Returns { wall_id, floor_id?, points }.
+    snap: True puts the boundary's corners on the user's grid (see get_snap_settings).
     """
     if (rect is None) == (points is None):
         raise ValueError("provide exactly one of 'rect' or 'points'")
@@ -590,7 +610,7 @@ def build_room(
         _refuse_if_protected("the room's terrain floor", polygon=boundary, radius=64)
     shared = _shared_walls(boundary, wall_type, wall_asset)
     if not shared["shared_wall_ids"]:
-        return bridge.request("build_room", **params)
+        return bridge.request("build_room", **({"snap": True} if snap else {}), **params)
     # Part of the boundary is already walled. Draw only the free sides, so a
     # door on the shared wall opens into both rooms (a second wall there would
     # still block the doorway in a VTT), and the floor on the whole boundary.
@@ -601,10 +621,10 @@ def build_room(
     with _undo_group("build_room"):
         for run in shared["runs"]:
             result["wall_ids"].append(
-                draw_wall(run, asset=wall_asset, loop=False, type=wall_type, joint=wall_joint)["id"])
+                draw_wall(run, asset=wall_asset, loop=False, type=wall_type, joint=wall_joint, snap=snap)["id"])
         if floor == "pattern":
             result["floor_id"] = place_pattern(
-                floor_asset, points=boundary, category=floor_category, color=floor_color)["id"]
+                floor_asset, points=boundary, category=floor_category, color=floor_color, snap=snap)["id"]
         elif floor == "terrain":
             result["floor_pixels"] = fill_region(points=boundary, slot=floor_slot, asset=floor_asset).get("pixels")
     result["note"] = (f"{len(shared['shared_wall_ids'])} existing wall(s) stand on the boundary and were "
@@ -642,11 +662,14 @@ def add_text(
     size: Optional[int] = None,
     color: str = "",
     font: str = "",
+    snap: bool = False,
 ) -> dict:
     """Add a text label at a woxel position. Returns the new element id and size.
 
     size: font size in points (default ~32). color: '#rrggbb' (default black).
     font: a DD font name; omit to keep the default font.
+    snap: True puts it on the user's grid: the Custom Snap Mod's when that mod is
+      loaded, else Dungeondraft's half-tile grid (see get_snap_settings).
     """
     params = {"text": text}
     if x is not None:
@@ -659,7 +682,7 @@ def add_text(
         params["color"] = color
     if font:
         params["font"] = font
-    return bridge.request("add_text", **params)
+    return bridge.request("add_text", **({"snap": True} if snap else {}), **params)
 
 
 @_tool()
@@ -675,6 +698,7 @@ def import_image(
     check: bool = False,
     allow_overlap: bool = False,
     region: str = "",
+    snap: bool = False,
 ) -> dict:
     """Embed an image file from disk into the map as an object. Returns the new element id.
 
@@ -696,6 +720,8 @@ def import_image(
     the file changed since); save an edited image under a new name.
 
     check / allow_overlap / region: the placement check, as in place_object.
+    snap: True puts it on the user's grid: the Custom Snap Mod's when that mod is
+      loaded, else Dungeondraft's half-tile grid (see get_snap_settings).
     """
     params: dict = {
         "path": os.path.abspath(os.path.expanduser(path)),
@@ -708,7 +734,7 @@ def import_image(
         params["y"] = y
     if check or region:
         _refuse_if_blocked("import_image", params, allow_overlap, region)
-    return bridge.request("import_image", **params)
+    return bridge.request("import_image", **({"snap": True} if snap else {}), **params)
 
 
 @_tool()
@@ -1075,16 +1101,19 @@ def move_element(
     check: bool = False,
     allow_overlap: bool = False,
     region: str = "",
+    snap: bool = False,
 ) -> dict:
     """Move any element to a new woxel position by id.
 
     check / allow_overlap / region: for an object, the placement check as in
     place_object, applied to where it would land (other kinds are not checked).
+    snap: True puts it on the user's grid: the Custom Snap Mod's when that mod is
+      loaded, else Dungeondraft's half-tile grid (see get_snap_settings).
     """
     params = {"id": id, "x": x, "y": y}
     if check or region:
         _refuse_if_blocked("move_element", params, allow_overlap, region)
-    return bridge.request("move_element", **params)
+    return bridge.request("move_element", **({"snap": True} if snap else {}), **params)
 
 
 @_tool()
@@ -2082,6 +2111,25 @@ def arrange_objects(
 
 
 @_tool()
+def get_snap_settings(points: Optional[list[list[float]]] = None) -> dict:
+    """Report the grid the user snaps to, and snap points to it. Read-only.
+
+    vanilla_snapping / half_snap / cell_size describe Dungeondraft's own
+    snapping. mod_loaded says whether Lievven's Custom Snap Mod is installed;
+    then mod has its geometry (square, hex_vertical, hex_horizontal,
+    isometric), interval, offset and preset. points: up to 200 [x, y] to snap;
+    snapped returns where each would land, which is what snap=True does on
+    place_object, move_element, add_light, add_portal, add_text, draw_wall,
+    draw_path, place_pattern, build_room and import_image. The user's own
+    snap settings are never changed.
+    """
+    params: dict = {}
+    if points:
+        params["points"] = points
+    return bridge.request("get_snap_settings", **params)
+
+
+@_tool()
 def get_map_style() -> dict:
     """Read the map-wide finishing effects: building wear and grid line style. Read-only.
 
@@ -2111,6 +2159,23 @@ def set_map_style(building_wear: str = "", grid_style: str = "") -> dict:
     if not params:
         raise ValueError("give building_wear and/or grid_style")
     return bridge.request("set_map_style", **params)
+
+
+@_tool()
+def set_map_size(width: int, height: int) -> dict:
+    """Resize the map, in TILES (8 to 128 a side), as Dungeondraft's own Change Map Size does. NOT undoable.
+
+    The map grows or shrinks on its right and bottom edges; the top-left
+    corner stays, so nothing placed moves. Shrinking does not delete what now
+    lies outside the map. Trimming from the top or left is not offered, since
+    Dungeondraft's own trim there loses terrain paint. Every level's terrain,
+    cave and floor layers are resized together and read back; the bridge's
+    undo history is cleared afterwards, as Dungeondraft clears its own.
+    save_map first if in doubt. Returns the new size and the previous one.
+    """
+    if not (8 <= width <= 128 and 8 <= height <= 128):
+        raise ValueError("width and height must each be 8 to 128 tiles")
+    return bridge.request("set_map_size", width=width, height=height)
 
 
 @_tool()

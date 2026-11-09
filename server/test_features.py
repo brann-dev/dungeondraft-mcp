@@ -299,6 +299,24 @@ def main() -> int:
     if extra: s.delete_elements(extra)
     check("objects back to start", len(s.list_elements("objects", 1000)["elements"]) == len(start_ids))
     check("walls back to start", {e["id"] for e in s.list_elements("walls", 1000)["elements"]} == start_walls)
+    # ---- map size and snapping ----
+    size0 = s.get_status()["map_size_woxels"]
+    tiles0 = [int(size0[0] // 256), int(size0[1] // 256)]
+    if tiles0[0] < 128 and tiles0[1] < 128:
+        grown = s.set_map_size(tiles0[0] + 2, tiles0[1] + 2)
+        check("set_map_size grew the map", grown.get("changed") and s.get_status()["map_size_woxels"] == [size0[0] + 512, size0[1] + 512], grown)
+        back = s.set_map_size(tiles0[0], tiles0[1])
+        check("set_map_size shrank it back", back.get("changed") and s.get_status()["map_size_woxels"] == size0, back)
+        t2 = s.get_terrain(samples=4)
+        check("terrain still reads after resizing", len(t2["samples"]) == 16, t2.get("slots"))
+    snap = s.get_snap_settings(points=[[cx + 37, cy + 91]])
+    check("get_snap_settings answers", "vanilla_snapping" in snap and len(snap.get("snapped", [])) == 1, snap)
+    print("  snap:", {k: v for k, v in snap.items() if k != "snapped"})
+    placed = s.place_object(asset, cx + 37, cy + 91, snap=True)
+    pos = s.get_element(placed["id"])["position"]
+    check("place_object(snap=True) lands where get_snap_settings says", [round(v, 2) for v in pos] == [round(v, 2) for v in snap["snapped"][0]], (pos, snap["snapped"]))
+    s.delete_element(placed["id"])
+
     # ---- more ----
 
 
