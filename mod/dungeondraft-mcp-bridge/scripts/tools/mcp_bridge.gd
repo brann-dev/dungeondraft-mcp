@@ -21,16 +21,23 @@ var script_class = "tool"
 
 const HOST := "127.0.0.1"
 const PORT := 8787
-const PROTOCOL_VERSION := 27
+const PROTOCOL_VERSION := 28
 
 # Commands that get wrapped in a Dungeondraft undo record (see _record_and_dispatch).
 const CREATE_CMDS := [
 	"place_object", "draw_wall", "draw_path", "add_light",
 	"add_portal", "add_roof", "add_text", "duplicate_object", "import_image",
+	"place_pattern",
 ]
 const TRANSFORM_CMDS := ["move_element", "modify_object"]
 const TERRAIN_CMDS := ["fill_terrain", "fill_region", "paint_terrain", "paint_path"]
 const CAVE_CMDS := ["dig_cave", "clear_caves"]
+# History keeps this many steps; past it the oldest is dropped, and a checkpoint
+# older than the drop can no longer be rolled back.
+const MAX_UNDO_OPS := 200
+const MAX_CHECKPOINTS := 16
+# Commands that settle history before they run: any open undo group is closed.
+const HISTORY_CMDS := ["undo", "redo", "checkpoint", "list_checkpoints", "rollback_checkpoint"]
 # Neutral opaque tint for pattern floors when no color is given. PatternShapeTool
 # has no per-texture default (and its .Color leaks across calls), so we apply a
 # deterministic wood/stone-neutral tone; callers pass an explicit color to override.
@@ -65,6 +72,10 @@ var _server : TCP_Server = null
 var _conns := []         # array of { "peer": StreamPeerTCP, "buf": String }
 var _undo_stack := []    # bridge-managed undo ops (see _build_op / _apply_op)
 var _redo_stack := []
+var _op_serial := 0      # numbers every op pushed; checkpoints remember where they stood
+var _lost_serial := 0    # the newest serial dropped from history (see _push_op)
+var _groups := []        # open undo groups, innermost last (begin_undo_group / end_undo_group)
+var _checkpoints := {}   # label -> { "label", "after": serial, "opened": msec }
 var _colorable = null    # lazily built set of "Colorable"-tagged texture paths
 var _export = null       # export in flight: { grid_was, cam: {anchor, pos, zoom} }; see _finish_export
 
@@ -177,6 +188,9 @@ func _record_and_dispatch(req : Dictionary) -> Dictionary:
 	if cmd in CAVE_CMDS:
 		cave_before = _cave_snapshot()
 
+	if cmd in HISTORY_CMDS:
+		_close_all_groups()
+
 	var result = _safe_dispatch(req)
 	if typeof(result) == TYPE_DICTIONARY and result.get("ok", false):
 		# Handlers that know their own before/after state hand over a ready op
@@ -186,8 +200,7 @@ func _record_and_dispatch(req : Dictionary) -> Dictionary:
 		if op == null:
 			op = _build_op(cmd, req, result, pre, terrain_before, cave_before)
 		if op != null:
-			_undo_stack.append(op)
-			_redo_stack = []   # a fresh edit invalidates the redo branch
+			_push_op(op)
 	return result
 
 
@@ -199,13 +212,7 @@ func _build_op(cmd, req, result, pre, terrain_before, cave_before = null):
 		if id != null and int(id) >= 0:
 			var node = Global.World.GetNodeByID(int(id))
 			if node != null:
-				if node.get_parent().has_method("LoadObject"):
-					# Props can't be detached/re-attached: Prop._EnterTree builds a
-					# fresh, empty Sprite on every re-entry, so a re-added prop loses
-					# its texture (unselectable, saved texture-less). Mirror DD's
-					# ObjectRecord instead: serialize + delete on undo, LoadObject on redo.
-					return { "kind": "create_prop", "parent": node.get_parent(), "id": int(id) }
-				return { "kind": "create", "node": node, "parent": node.get_parent(), "id": int(id) }
+				return _create_op(node, int(id))
 	elif cmd in TRANSFORM_CMDS and pre != null:
 		var node = Global.World.GetNodeByID(int(req["id"]))
 		if node != null:
@@ -221,13 +228,60 @@ func _build_op(cmd, req, result, pre, terrain_before, cave_before = null):
 	return null
 
 
+# Record an op: into the innermost open group, or onto the undo stack with a
+# serial number. A fresh edit invalidates the redo branch, and history past
+# MAX_UNDO_OPS drops its oldest step.
+func _push_op(op) -> void:
+	if not _groups.empty():
+		_groups.back()["entries"].append(op)
+		return
+	_op_serial += 1
+	op["serial"] = _op_serial
+	_undo_stack.append(op)
+	_discard_redo()
+	while _undo_stack.size() > MAX_UNDO_OPS:
+		var dropped = _undo_stack.pop_front()
+		_lost_serial = int(max(_lost_serial, int(dropped.get("serial", 0))))
+		_release_op(dropped)
+
+
+# Free the nodes an op still holds out of the tree (an undone create, a delete
+# that was not undone) once the op can no longer be reached.
+func _release_op(op) -> void:
+	if typeof(op) != TYPE_DICTIONARY:
+		return
+	if op.get("kind") == "group":
+		for entry in op.get("entries", []):
+			_release_op(entry)
+		return
+	var node = op.get("node")
+	if node != null and is_instance_valid(node) and node.get_parent() == null:
+		node.queue_free()
+
+
+func _discard_redo() -> void:
+	for op in _redo_stack:
+		_release_op(op)
+	_redo_stack = []
+
+
+# What undo() / redo() report about a step.
+func _op_summary(op : Dictionary, out : Dictionary) -> Dictionary:
+	out["kind"] = op["kind"]
+	if op["kind"] == "group":
+		out["steps"] = op["entries"].size()
+		if str(op.get("label", "")) != "":
+			out["label"] = op["label"]
+	return out
+
+
 func _do_undo() -> Dictionary:
 	if _undo_stack.empty():
 		return _ok({ "undone": false, "reason": "nothing to undo" })
 	var op = _undo_stack.pop_back()
 	_apply_op(op, true)
 	_redo_stack.append(op)
-	return _ok({ "undone": true, "kind": op["kind"], "undo_depth": _undo_stack.size() })
+	return _ok(_op_summary(op, { "undone": true, "undo_depth": _undo_stack.size() }))
 
 
 func _do_redo() -> Dictionary:
@@ -235,8 +289,93 @@ func _do_redo() -> Dictionary:
 		return _ok({ "redone": false, "reason": "nothing to redo" })
 	var op = _redo_stack.pop_back()
 	_apply_op(op, false)
+	_op_serial += 1
+	op["serial"] = _op_serial   # the newest edit again, for checkpoints
 	_undo_stack.append(op)
-	return _ok({ "redone": true, "kind": op["kind"], "redo_depth": _redo_stack.size() })
+	return _ok(_op_summary(op, { "redone": true, "redo_depth": _redo_stack.size() }))
+
+
+# --- undo groups: several edits that undo() and redo() treat as one step ----
+
+func _begin_group(req : Dictionary) -> Dictionary:
+	var label = str(req.get("label", "")).strip_edges()
+	_groups.append({ "kind": "group", "label": label, "entries": [] })
+	return _ok({ "open_groups": _groups.size(), "label": label })
+
+
+# Close the innermost group. One recorded edit is pushed as itself, several as
+# one group op, none pushes nothing.
+func _end_group(req : Dictionary) -> Dictionary:
+	if _groups.empty():
+		return _err("no undo group is open")
+	var steps = _close_group()
+	return _ok({ "steps": steps, "open_groups": _groups.size(), "undo_depth": _undo_stack.size() })
+
+
+func _close_group() -> int:
+	var group = _groups.pop_back()
+	var entries = group["entries"]
+	if entries.size() == 1:
+		_push_op(entries[0])
+	elif entries.size() > 1:
+		_push_op(group)
+	return entries.size()
+
+
+func _close_all_groups() -> void:
+	while not _groups.empty():
+		_close_group()
+
+
+# --- checkpoints: a mark in history that rollback_checkpoint rewinds to -----
+
+func _checkpoint(req : Dictionary) -> Dictionary:
+	var label = str(req.get("label", "")).strip_edges()
+	if label == "" or label.length() > 64:
+		return _err("'label' is required, up to 64 characters")
+	if not _checkpoints.has(label) and _checkpoints.size() >= MAX_CHECKPOINTS:
+		return _err("%d checkpoints are open; roll one back or reuse a label" % MAX_CHECKPOINTS)
+	_checkpoints[label] = { "label": label, "after": _op_serial, "opened": OS.get_ticks_msec() }
+	return _ok({ "label": label, "undo_depth": _undo_stack.size(), "history_limit": MAX_UNDO_OPS })
+
+
+func _checkpoint_view(cp : Dictionary) -> Dictionary:
+	var steps := 0
+	for op in _undo_stack:
+		if int(op.get("serial", 0)) > int(cp["after"]):
+			steps += 1
+	return { "label": cp["label"], "steps_since": steps,
+		"reachable": _lost_serial <= int(cp["after"]),
+		"age_ms": OS.get_ticks_msec() - int(cp["opened"]) }
+
+
+func _list_checkpoints() -> Dictionary:
+	var out := []
+	for label in _checkpoints:
+		out.append(_checkpoint_view(_checkpoints[label]))
+	return _ok({ "checkpoints": out })
+
+
+# Undo every step recorded since the checkpoint, newest first. The checkpoint
+# stays open, so the next attempt can be rolled back to the same point. Refuses,
+# changing nothing, once history has dropped a step made after it.
+func _rollback_checkpoint(req : Dictionary) -> Dictionary:
+	var label = str(req.get("label", "")).strip_edges()
+	if not _checkpoints.has(label):
+		return _err("no checkpoint '%s'; open ones: %s" % [label, str(_checkpoints.keys())])
+	var cp = _checkpoints[label]
+	if _lost_serial > int(cp["after"]):
+		return _err(("history no longer reaches checkpoint '%s': a step made after it was " +
+			"dropped (history keeps %d steps). Nothing was changed; undo step by step, " +
+			"or reopen the last saved map.") % [label, MAX_UNDO_OPS])
+	var kinds := []
+	while not _undo_stack.empty() and int(_undo_stack.back().get("serial", 0)) > int(cp["after"]):
+		var res = _do_undo()
+		if not res.get("ok", false) or not res["result"].get("undone", false):
+			break
+		kinds.append(res["result"]["kind"])
+	return _ok({ "label": label, "rolled_back": kinds.size(), "kinds": kinds,
+		"undo_depth": _undo_stack.size(), "redo_depth": _redo_stack.size() })
 
 
 func _apply_op(op, undo : bool):
@@ -245,12 +384,30 @@ func _apply_op(op, undo : bool):
 			if undo:
 				_detach_node(op["node"], int(op["id"]))
 			else:
-				_attach_node(op["node"], op["parent"], int(op["id"]))
-		"create_prop":
+				_attach_node(op["node"], _op_parent(op), int(op["id"]))
+		"create_saved":
 			if undo:
-				_delete_prop(op)
+				_delete_saved(op)
 			else:
-				_reload_prop(op)
+				_reload_saved(op)
+		"delete":
+			if undo:
+				_attach_node(op["node"], _op_parent(op), int(op["id"]))
+			else:
+				_detach_node(op["node"], int(op["id"]))
+		"delete_saved":
+			if undo:
+				_reload_saved(op)
+			else:
+				_delete_saved(op)
+		"group":
+			if undo:
+				# Newest first: a later entry may sit on an earlier one (a door on a wall).
+				for i in range(op["entries"].size() - 1, -1, -1):
+					_apply_op(op["entries"][i], true)
+			else:
+				for entry in op["entries"]:
+					_apply_op(entry, false)
 		"transform":
 			_apply_props(Global.World.GetNodeByID(int(op["id"])), op["old"] if undo else op["new"])
 		"terrain":
@@ -283,6 +440,20 @@ func _apply_op(op, undo : bool):
 		"material":
 			if is_instance_valid(op["mesh"]):
 				_set_material_bitmap(op["mesh"], op["before"] if undo else op["after"])
+		"map_style":
+			_restore_map_style(op["before"] if undo else op["after"])
+
+
+# The parent to re-attach under: the one the op holds or, when that was a wall
+# since reloaded by undo/redo (a new object carrying the old id), the wall that
+# holds the id now.
+func _op_parent(op):
+	var parent = op.get("parent")
+	if is_instance_valid(parent):
+		return parent
+	if op.has("parent_id") and Global.World.HasNodeID(int(op["parent_id"])):
+		return Global.World.GetNodeByID(int(op["parent_id"]))
+	return parent
 
 
 func _detach_node(node, id : int):
@@ -296,34 +467,96 @@ func _attach_node(node, parent, id : int):
 	if not is_instance_valid(node):
 		return
 	if node.get_parent() == null and is_instance_valid(parent):
-		parent.add_child(node)
+		if parent.has_method("InsertPortal") and node.get("WallID") != null:
+			# A door goes back into its wall's portal list; InsertPortal adds the
+			# child itself (next frame) and cuts the gap. Plain add_child would
+			# show the door on a wall that no longer knows about it.
+			parent.InsertPortal(node, true)
+		else:
+			parent.add_child(node)
+			if parent.has_method("AddToSearchTable"):
+				parent.AddToSearchTable(node, false)   # selectable again in the editor
 	Global.World.SetNodeID(node, id)
 	if node.has_method("RemakeLines"):
 		node.RemakeLines()   # walls/paths cache geometry; refresh after re-adding
 
 
-# Undo a prop create: snapshot it (Prop.Save keeps node_id) for redo, then free it.
-# Prop._ExitTree drops it from the select search table itself.
-func _delete_prop(op) -> void:
+# The op that undoes the creation of `node`. Props and walls can't be detached
+# and re-attached (see _saved_kind), so they mirror DD's own ObjectRecord /
+# WallRecord: serialise + delete on undo, reload on redo. Everything else is
+# detached and held.
+func _create_op(node, id : int) -> Dictionary:
+	var saved = _saved_kind(node)
+	if saved != null:
+		return { "kind": "create_saved", "parent": node.get_parent(), "id": id,
+			"loader": saved["loader"], "save_args": saved["save_args"] }
+	var op := { "kind": "create", "node": node, "parent": node.get_parent(), "id": id }
+	if _is_wall(node.get_parent()):
+		op["parent_id"] = _id(node.get_parent())   # a door's wall may be reloaded (see _op_parent)
+	return op
+
+
+# Kinds that must go through Dungeondraft's own save/load instead of being
+# detached and re-attached, with the parent's loader and the Save() arguments
+# (a C# default is not filled in for a call from GDScript, so Prop.Save's
+# `copy` must be passed):
+# - a Prop: Prop._EnterTree builds a fresh, empty Sprite on every re-entry, so
+#   a re-added prop loses its texture (unselectable, saved texture-less);
+# - a Wall: Wall._ExitTree deletes its mounted portals and drops its id the
+#   moment it leaves the tree, so a detached wall comes back without its doors.
+# Returns null for everything else.
+func _saved_kind(node):
+	var parent = node.get_parent()
+	if parent == null:
+		return null
+	if parent.has_method("LoadObject"):
+		return { "loader": "LoadObject", "save_args": [false] }
+	if _is_wall(node) and parent.has_method("LoadWall"):
+		return { "loader": "LoadWall", "save_args": [] }
+	return null
+
+
+# Delete a saved-kind node: snapshot it (Save keeps node_id) so it can be
+# reloaded, then free it. Prop._ExitTree drops it from the select search table
+# itself; Wall._ExitTree deletes the wall's portals with it.
+func _delete_saved(op) -> void:
 	var id = int(op["id"])
 	if not Global.World.HasNodeID(id):
 		return
 	var node = Global.World.GetNodeByID(id)
 	if node == null:
 		return
-	op["data"] = node.Save(false)
+	op["data"] = node.callv("Save", op["save_args"])
 	op["index"] = node.get_index()
 	Global.World.DeleteNodeByID(id)
+	# DeleteNodeByID frees the node at the end of the frame; take it out of the
+	# tree now so a request handled in the same frame no longer lists it.
+	if is_instance_valid(node) and node.get_parent() != null:
+		node.get_parent().remove_child(node)
 
 
-# Redo a prop create: LoadObject rebuilds it from the snapshot with the same id,
-# the "preview" meta and its search-table entry (DD's ObjectRecord.Create path).
-func _reload_prop(op) -> void:
+# Reload a saved-kind node from its snapshot with the same id (DD's
+# ObjectRecord.Create / WallRecord path): LoadObject returns the prop, LoadWall
+# returns nothing, so the wall is found by the id its data carried.
+func _reload_saved(op) -> void:
 	if op.get("data") == null or not is_instance_valid(op["parent"]):
 		return
-	var prop = op["parent"].LoadObject(op["data"])
-	if prop != null:
-		op["parent"].move_child(prop, min(int(op["index"]), op["parent"].get_child_count() - 1))
+	var id = int(op["id"])
+	var node = op["parent"].call(op["loader"], op["data"])
+	if node == null and Global.World.HasNodeID(id):
+		node = Global.World.GetNodeByID(id)
+	if node == null or not is_instance_valid(node):
+		return
+	op["parent"].move_child(node, min(int(op["index"]), op["parent"].get_child_count() - 1))
+	# Load can register the node under a fresh id when the saved one is taken.
+	# Callers hold the op's id, so make sure that is what resolves.
+	var current = Global.World.GetNodeByID(id) if Global.World.HasNodeID(id) else null
+	if current != node:
+		var fresh = _id(node)
+		if fresh != id and Global.World.HasNodeID(fresh):
+			Global.World.RemoveNodeID(fresh)
+		Global.World.SetNodeID(node, id)
+		node.set_meta("node_id", id)
 
 
 func _apply_props(node, snap):
@@ -422,6 +655,8 @@ func _safe_dispatch(req : Dictionary) -> Dictionary:
 		"list_elements": return _list_elements(req)
 		"get_element": return _get_element(req)
 		"list_levels": return _list_levels()
+		"list_asset_packs": return _list_asset_packs()
+		"terrain_samples": return _terrain_samples(req)
 		"dig_cave": return _dig_cave(req)
 		"clear_caves": return _clear_caves(req)
 		# --- create ---
@@ -452,6 +687,7 @@ func _safe_dispatch(req : Dictionary) -> Dictionary:
 		"set_element_layer": return _set_element_layer(req)
 		"duplicate_object": return _duplicate_object(req)
 		"delete_element": return _delete_element(req)
+		"delete_elements": return _delete_elements(req)
 		# --- map lifecycle ---
 		"get_current_map": return _get_current_map()
 		"save_map": return _save_map()
@@ -463,9 +699,16 @@ func _safe_dispatch(req : Dictionary) -> Dictionary:
 		"clone_level": return _clone_level(req)
 		"reorder_levels": return _reorder_levels(req)
 		"compare_levels": return _compare_levels(req)
+		"delete_level": return _delete_level(req)
 		"list_layers": return _list_layers()
 		"add_layer": return _add_layer(req)
 		"configure_level": return _configure_level(req)
+		"get_map_style": return _get_map_style()
+		"list_prefabs": return _list_prefabs(req)
+		"place_prefab": return _place_prefab(req)
+		"generator_options": return _generator_options()
+		"generate_dungeon": return _generate_dungeon(req)
+		"set_map_style": return _set_map_style(req)
 		"set_trace_image": return _set_trace_image(req)
 		# --- capture ---
 		"screenshot": return _screenshot(req)
@@ -481,6 +724,11 @@ func _safe_dispatch(req : Dictionary) -> Dictionary:
 		# --- history (bridge-managed undo/redo of the model's own edits) ---
 		"undo": return _do_undo()
 		"redo": return _do_redo()
+		"begin_undo_group": return _begin_group(req)
+		"end_undo_group": return _end_group(req)
+		"checkpoint": return _checkpoint(req)
+		"list_checkpoints": return _list_checkpoints()
+		"rollback_checkpoint": return _rollback_checkpoint(req)
 		# --- selection ---
 		"select_elements": return _select_elements(req)
 		"clear_selection": return _clear_selection()
@@ -964,13 +1212,34 @@ func _add_light(req : Dictionary) -> Dictionary:
 	light.position = _xy(req, Global.World.WoxelDimensions * 0.5)
 	light.color = _color(req.get("color", ""), Color(1, 0.9, 0.7))
 	light.energy = float(req.get("energy", 1.0))
-	light.texture_scale = float(req.get("range", 1.0))
 	light.shadow_enabled = bool(req.get("shadows", true))
 	var tex = _asset_tex("Lights", req.get("asset", ""))
 	if tex != null:
 		light.texture = tex
+	var range_value = float(req.get("range", 2.0))
+	if range_value <= 0.0: return _err("'range' must be > 0")
+	light.texture_scale = _light_scale(light, range_value)
 	light.set_meta("preview", false)   # Lights.Save() hard-casts it (see _register_prop)
-	return _ok({ "id": _id(light), "position": _vec(light.position) })
+	return _ok({ "id": _id(light), "position": _vec(light.position), "range": _light_range(light) })
+
+
+# Dungeondraft's Range, the number its Light tool shows and its saved map and
+# Universal VTT export carry, is the Light2D texture scale times
+# texture_width / 512 (LightTool: TextureScale = Range * 512 / width). The
+# built-in light textures are 1024 px, so Range is twice the scale. The bridge
+# takes and reports Range everywhere.
+func _light_width(light) -> float:
+	if light.texture != null and light.texture.get_width() > 0:
+		return float(light.texture.get_width())
+	return 1024.0
+
+
+func _light_range(light) -> float:
+	return light.texture_scale * _light_width(light) / 512.0
+
+
+func _light_scale(light, range_value : float) -> float:
+	return range_value * 512.0 / _light_width(light)
 
 
 # Find the wall segment nearest to `pos`. Returns
@@ -1200,15 +1469,20 @@ func _build_room(req : Dictionary) -> Dictionary:
 
 	var result := {}
 
+	# The wall and the floor are recorded inside one undo group, so undo() takes
+	# the whole room back in one step.
+	_groups.append({ "kind": "group", "label": "build_room", "entries": [] })
+
 	# 1) Wall loop along the boundary.
 	var wall_req := {
-		"points": pts_raw, "loop": true,
+		"cmd": "draw_wall", "points": pts_raw, "loop": true,
 		"asset": req.get("wall_asset", ""),
 		"type": req.get("wall_type", 0), "joint": req.get("wall_joint", 1),
 		"shadow": req.get("wall_shadow", true),
 	}
-	var wall_res = _draw_wall(wall_req)
+	var wall_res = _record_and_dispatch(wall_req)
 	if not wall_res.get("ok", false):
+		_close_group()
 		return wall_res
 	result["wall_id"] = wall_res["result"].get("id")
 
@@ -1216,30 +1490,31 @@ func _build_room(req : Dictionary) -> Dictionary:
 	var floor_kind = str(req.get("floor", "pattern"))
 	if floor_kind == "pattern":
 		var fr := {
-			"points": pts_raw,
+			"cmd": "place_pattern", "points": pts_raw,
 			"asset": req.get("floor_asset", ""),
 			"category": req.get("floor_category", "Simple Tiles"),
 		}
 		if req.has("floor_color"): fr["color"] = req["floor_color"]
 		if req.has("floor_z"): fr["z"] = req["floor_z"]
-		var fres = _place_pattern(fr)
+		var fres = _record_and_dispatch(fr)
 		if fres.get("ok", false):
 			result["floor_id"] = fres["result"].get("id")
 		else:
 			result["floor_error"] = fres.get("error")
 	elif floor_kind == "terrain":
 		var tr := {
-			"points": pts_raw, "slot": int(req.get("floor_slot", 1)),
+			"cmd": "fill_region", "points": pts_raw, "slot": int(req.get("floor_slot", 1)),
 		}
 		if req.has("floor_asset") and str(req.get("floor_asset", "")) != "":
 			tr["asset"] = req["floor_asset"]
-		var tres = _fill_region(tr)
+		var tres = _record_and_dispatch(tr)
 		if tres.get("ok", false):
 			result["floor_pixels"] = tres["result"].get("pixels")
 		else:
 			result["floor_error"] = tres.get("error")
 	# floor_kind == "none" -> walls only
 
+	_close_group()
 	result["points"] = pts_raw
 	return _ok(result)
 
@@ -1855,11 +2130,11 @@ func _modify_object(req : Dictionary) -> Dictionary:
 	return _ok(d)
 
 
-# What modify_light changes on a light, and its undo puts back. `range` is the
-# Light2D's texture_scale (see add_light).
+# What modify_light changes on a light, and its undo puts back. `scale` is the
+# Light2D's texture_scale; callers speak in Dungeondraft's Range (_light_range).
 func _light_state(light) -> Dictionary:
 	return {
-		"color": light.color, "energy": light.energy, "range": light.texture_scale,
+		"color": light.color, "energy": light.energy, "scale": light.texture_scale,
 		"shadows": light.shadow_enabled, "rotation": light.rotation, "texture": light.texture,
 	}
 
@@ -1867,11 +2142,11 @@ func _light_state(light) -> Dictionary:
 func _apply_light_state(light, s : Dictionary) -> void:
 	light.color = s["color"]
 	light.energy = s["energy"]
-	light.texture_scale = s["range"]
 	light.shadow_enabled = s["shadows"]
 	light.rotation = s["rotation"]
 	if s["texture"] != null:
 		light.texture = s["texture"]
+	light.texture_scale = s["scale"]
 
 
 func _modify_light(req : Dictionary) -> Dictionary:
@@ -1884,15 +2159,21 @@ func _modify_light(req : Dictionary) -> Dictionary:
 	if req.has("energy"):
 		want["energy"] = float(req["energy"])
 		if want["energy"] < 0.0: return _err("'energy' must be >= 0")
-	if req.has("range"):
-		want["range"] = float(req["range"])
-		if want["range"] <= 0.0: return _err("'range' must be > 0")
 	if req.has("shadows"): want["shadows"] = bool(req["shadows"])
 	if req.has("rotation"): want["rotation"] = deg2rad(float(req["rotation"]))
 	if req.has("asset") and str(req.get("asset", "")) != "":
 		var tex = _asset_tex("Lights", req["asset"])
 		if tex == null: return _err("could not load light asset: " + str(req["asset"]))
 		want["texture"] = tex
+	# Range is converted against the texture the light will have, and a
+	# texture change alone keeps the Range the light showed before.
+	var width = float(want["texture"].get_width()) if want["texture"] != null else 1024.0
+	if req.has("range"):
+		var range_value = float(req["range"])
+		if range_value <= 0.0: return _err("'range' must be > 0")
+		want["scale"] = range_value * 512.0 / width
+	elif want["texture"] != old["texture"]:
+		want["scale"] = _light_range(light) * 512.0 / width
 	_apply_light_state(light, want)
 	return _ok_op(_describe(light), { "kind": "light", "id": _id(light), "old": old, "new": want })
 
@@ -2057,11 +2338,63 @@ func _duplicate_object(req : Dictionary) -> Dictionary:
 	return _ok({ "id": _id(prop), "position": _vec(prop.position) })
 
 
+# Delete, keeping the element for undo: a prop is serialised and freed (as
+# Dungeondraft's own ObjectRecord does, see _build_op), anything else is
+# detached from the tree and held by the op.
 func _delete_element(req : Dictionary) -> Dictionary:
 	var ident = req.get("id")
 	if ident == null: return _err("missing 'id'")
-	var ok = Global.World.DeleteNodeByID(int(ident))
-	return _ok({ "deleted": ok, "id": ident })
+	var id = int(ident)
+	var node = Global.World.GetNodeByID(id)
+	if node == null:
+		return _err("no element with id %d" % id)
+	var op = _delete_op(node, id)
+	return _ok_op({ "deleted": true, "id": id, "undoable": true }, op)
+
+
+func _delete_op(node, id : int) -> Dictionary:
+	var parent = node.get_parent()
+	var saved = _saved_kind(node)
+	if saved != null:
+		var op := { "kind": "delete_saved", "parent": parent, "id": id,
+			"loader": saved["loader"], "save_args": saved["save_args"] }
+		_delete_saved(op)
+		return op
+	_detach_node(node, id)
+	var op := { "kind": "delete", "node": node, "parent": parent, "id": id }
+	if _is_wall(parent):
+		op["parent_id"] = _id(parent)
+	return op
+
+
+# Delete several elements as ONE undo step. Every id is checked first, so an
+# unknown id deletes nothing.
+func _delete_elements(req : Dictionary) -> Dictionary:
+	var ids = req.get("ids", [])
+	if typeof(ids) != TYPE_ARRAY or ids.empty():
+		return _err("'ids' must be a non-empty array of element ids")
+	if ids.size() > 100:
+		return _err("'ids' is capped at 100 per call")
+	var nodes := {}
+	var unknown := []
+	for raw in ids:
+		if not (typeof(raw) in [TYPE_INT, TYPE_REAL]):
+			return _err("every id must be an integer, got: " + str(raw))
+		var id = int(raw)
+		if nodes.has(id):
+			continue
+		var node = Global.World.GetNodeByID(id)
+		if node == null:
+			unknown.append(id)
+		else:
+			nodes[id] = node
+	if not unknown.empty():
+		return _err("no element with id %s; nothing was deleted" % str(unknown))
+	var entries := []
+	for id in nodes:
+		entries.append(_delete_op(nodes[id], int(id)))
+	var op := { "kind": "group", "label": "delete_elements", "entries": entries }
+	return _ok_op({ "deleted": entries.size(), "ids": nodes.keys(), "undoable": true }, op)
 
 
 # ---------------------------------------------------------------------------
@@ -2161,6 +2494,27 @@ func _compare_levels(req : Dictionary) -> Dictionary:
 		"comparing": true, "reference_index": idx, "reference_id": ref.ID,
 		"reference_opacity": ref_opacity, "current_opacity": cur_opacity,
 	})
+
+
+# Delete a level (floor) by index. Not undoable: Dungeondraft frees the level
+# and everything on it. Refuses to delete the last level; if the level is the
+# current one, the editor is switched to a neighbour first.
+func _delete_level(req : Dictionary) -> Dictionary:
+	var idx = int(req.get("index", -1))
+	var level = Global.World.TryGetLevel(idx)
+	if level == null: return _err("level index out of range: " + str(req.get("index")))
+	if Global.World.levels.size() <= 1:
+		return _err("refusing to delete the only level: a map must keep at least one")
+	var label = str(level.Label)
+	var id = level.ID
+	if Global.World.CurrentLevelId == idx:
+		Global.World.SetLevel(idx + 1 if idx + 1 < Global.World.levels.size() else idx - 1, false)
+	Global.World.DeleteLevel(level)
+	Global.Editor.UpdateLevelOptions()
+	var rows = _list_levels()["result"]
+	rows["deleted_id"] = id
+	rows["deleted_label"] = label
+	return _ok(rows)
 
 
 # Tick a toggle button without firing its handler (which would act a second time).
@@ -3607,7 +3961,7 @@ func _describe(node) -> Dictionary:
 	if node is Light2D:
 		d["color"] = _hex(node.color)
 		d["energy"] = node.energy
-		d["range"] = node.texture_scale
+		d["range"] = _light_range(node)
 		d["shadows"] = node.shadow_enabled
 	if node.has_method("SetBlockLight"):       # objects and paths
 		d["block_light"] = bool(node.get("BlockLight"))
@@ -3731,6 +4085,469 @@ func _hex(c : Color) -> String:
 	if c.a < 1.0:
 		hex += "%02x" % int(round(c.a * 255.0))
 	return hex
+
+
+# ---------------------------------------------------------------------------
+# Terrain read-back
+# ---------------------------------------------------------------------------
+
+const SAMPLES_MAX := 64
+
+# Sample the painted terrain on a regular grid: each point's splat weight per
+# slot, and whether a pattern floor or dug cave covers it (the Floor tool's
+# shapes are Clipper paths with no safe accessor, so they do not count). The
+# server's get_terrain and validate_scene read this.
+func _terrain_samples(req : Dictionary) -> Dictionary:
+	var level = Global.World.GetCurrentLevel()
+	if level == null: return _err("no map open")
+	var img = level.Terrain.CloneSplatImage()
+	if img == null: return _err("terrain splat unavailable")
+	var img2 = level.Terrain.CloneSplatImage2() if level.Terrain.ExpandedSlots else null
+	var dims = Global.World.WoxelDimensions
+	var x0 := 0.0
+	var y0 := 0.0
+	var w := float(dims.x)
+	var h := float(dims.y)
+	if req.has("rect"):
+		var r = req["rect"]
+		if typeof(r) != TYPE_ARRAY or r.size() < 4: return _err("'rect' must be [x, y, w, h] in woxels")
+		x0 = float(r[0]); y0 = float(r[1]); w = float(r[2]); h = float(r[3])
+		if w <= 0.0 or h <= 0.0: return _err("rect width and height must be positive")
+	var n = int(clamp(int(req.get("samples", 32)), 2, SAMPLES_MAX))
+	var slots := []
+	for i in range(8 if level.Terrain.ExpandedSlots else 4):
+		var tex = level.Terrain.GetTexture(i)
+		slots.append(tex.resource_path if tex != null else null)
+	var covers = _cover_polygons(level)
+	var cave = _cave_mesh()
+	var bm = cave.call("get_Bitmap") if (cave != null and cave.has_method("get_Bitmap")) else null
+	var bm_size = bm.get_size() if bm != null else Vector2.ZERO
+	var iw = img.get_width()
+	var ih = img.get_height()
+	img.lock()
+	if img2 != null: img2.lock()
+	var samples := []
+	for j in range(n):
+		for i in range(n):
+			var wx = x0 + w * (float(i) / float(n - 1))
+			var wy = y0 + h * (float(j) / float(n - 1))
+			var px = int(clamp(wx / float(dims.x) * float(iw), 0, iw - 1))
+			var py = int(clamp(wy / float(dims.y) * float(ih), 0, ih - 1))
+			var c = img.get_pixel(px, py)
+			var weights := [stepify(c.r, 0.01), stepify(c.g, 0.01), stepify(c.b, 0.01), stepify(c.a, 0.01)]
+			if img2 != null:
+				var c2 = img2.get_pixel(px, py)
+				weights += [stepify(c2.r, 0.01), stepify(c2.g, 0.01), stepify(c2.b, 0.01), stepify(c2.a, 0.01)]
+			var point = Vector2(wx, wy)
+			var covered := false
+			for poly in covers:
+				if Geometry.is_point_in_polygon(point, poly):
+					covered = true
+					break
+			if not covered and bm != null:
+				# cell = floor(woxel / 64) + 1 (the mesh's edge buffer); a set bit is open cave floor
+				var cell = Vector2(floor(wx / 64.0) + 1, floor(wy / 64.0) + 1)
+				if cell.x >= 0 and cell.y >= 0 and cell.x < bm_size.x and cell.y < bm_size.y and bm.get_bit(cell):
+					covered = true
+			samples.append({ "x": wx, "y": wy, "weights": weights, "covered": covered })
+	img.unlock()
+	if img2 != null: img2.unlock()
+	return _ok({ "level_id": level.ID, "map_size": [dims.x, dims.y], "rect": [x0, y0, w, h],
+		"samples_per_side": n, "slots": slots, "smooth_blending": bool(level.Terrain.SmoothBlending),
+		"samples": samples })
+
+
+# World-space polygons of the level's pattern floors.
+func _cover_polygons(level) -> Array:
+	var out := []
+	var shapes = level.PatternShapes
+	if shapes == null or not shapes.has_method("GetShapes"):
+		return out
+	for shape in shapes.GetShapes():
+		if not is_instance_valid(shape):
+			continue
+		var poly = shape.get("GlobalPolygon")
+		if poly == null and shape is Polygon2D:
+			poly = shape.get_global_transform().xform(shape.polygon)
+		if poly != null and poly.size() >= 3:
+			out.append(poly)
+	return out
+
+
+# ---------------------------------------------------------------------------
+# Map style: building wear and grid line style (the Map Settings tool)
+# ---------------------------------------------------------------------------
+
+# MapSettings.GRID_TEXTURES, in order.
+const GRID_STYLE_NAMES := ["dashes", "dotted", "narrow_line", "thick_line"]
+const GRID_STYLE_FILES := ["dashes.png", "dotted_line.png", "narrow_line.png", "thick_line.png"]
+
+func _map_settings_tool():
+	if not Global.Editor.Tools.has("MapSettings"):
+		return null
+	return Global.Editor.Tools["MapSettings"]
+
+
+func _wear_name(tex) -> String:
+	if tex == null:
+		return "none"
+	return str(tex.resource_path).get_file().get_basename()
+
+
+func _map_style_snapshot() -> Dictionary:
+	var grid = Global.World.get("GridMesh")
+	return { "wear": Global.World.get("BuildingWear"), "grid": grid.texture if grid != null else null }
+
+
+func _get_map_style() -> Dictionary:
+	var settings = _map_settings_tool()
+	if settings == null: return _err("this build has no Map Settings tool")
+	var snap = _map_style_snapshot()
+	var options := []
+	var controls = settings.get("Controls")
+	var wear_list = controls.get("BuildingWear") if typeof(controls) == TYPE_DICTIONARY else null
+	if wear_list != null and wear_list.has_method("get_item_count"):
+		for i in range(wear_list.get_item_count()):
+			var icon = wear_list.get_item_icon(i)
+			options.append({ "index": i, "name": _wear_name(icon) if i > 0 else "none",
+				"texture": str(icon.resource_path) if icon != null else "" })
+	var grid_path = str(snap["grid"].resource_path) if snap["grid"] != null else ""
+	var grid_style = null
+	for i in range(GRID_STYLE_FILES.size()):
+		if grid_path.ends_with("/" + GRID_STYLE_FILES[i]):
+			grid_style = GRID_STYLE_NAMES[i]
+	return _ok({
+		"building_wear": _wear_name(snap["wear"]),
+		"building_wear_texture": str(snap["wear"].resource_path) if snap["wear"] != null else "",
+		"building_wear_options": options,
+		"grid_style": grid_style, "grid_texture": grid_path, "grid_style_options": GRID_STYLE_NAMES,
+	})
+
+
+# Apply a building wear (by option name or index) and/or a grid line style
+# through the Map Settings tool's own setters, as its panel would; the panel's
+# dropdown is re-read from the world afterwards. One undo step.
+func _set_map_style(req : Dictionary) -> Dictionary:
+	var settings = _map_settings_tool()
+	if settings == null: return _err("this build has no Map Settings tool")
+	if not settings.has_method("SetBuildingWear") or not settings.has_method("SetGridStyle"):
+		return _err("this build's Map Settings tool cannot set the style")
+	if not req.has("building_wear") and not req.has("grid_style"):
+		return _err("give building_wear and/or grid_style")
+	var current = _get_map_style()
+	if not current.get("ok", false): return current
+	var wear_index := -1
+	if req.has("building_wear"):
+		var want = str(req["building_wear"]).to_lower()
+		for opt in current["result"]["building_wear_options"]:
+			if str(opt["name"]).to_lower() == want or str(opt["index"]) == want:
+				wear_index = int(opt["index"])
+		if wear_index < 0:
+			var names := []
+			for opt in current["result"]["building_wear_options"]: names.append(opt["name"])
+			return _err("building_wear must be one of: " + str(names))
+	var grid_index := -1
+	if req.has("grid_style"):
+		grid_index = GRID_STYLE_NAMES.find(str(req["grid_style"]))
+		if grid_index < 0: return _err("grid_style must be one of: " + str(GRID_STYLE_NAMES))
+	var before = _map_style_snapshot()
+	if wear_index >= 0: settings.SetBuildingWear(wear_index)
+	if grid_index >= 0: settings.SetGridStyle(grid_index)
+	if settings.has_method("UpdateStyleFromWorld"): settings.UpdateStyleFromWorld()
+	var after = _map_style_snapshot()
+	var out = _get_map_style()
+	if not out.get("ok", false): return out
+	return _ok_op(out["result"], { "kind": "map_style", "before": before, "after": after })
+
+
+func _restore_map_style(snap : Dictionary) -> void:
+	Global.World.SetBuildingWear(snap["wear"])
+	var grid = Global.World.get("GridMesh")
+	if grid != null:
+		grid.texture = snap["grid"]
+	var settings = _map_settings_tool()
+	if settings != null and settings.has_method("UpdateStyleFromWorld"):
+		settings.UpdateStyleFromWorld()
+
+
+# ---------------------------------------------------------------------------
+# Prefabs (groups saved with the Prefab settings) and the Map Wizard generator
+# ---------------------------------------------------------------------------
+
+const WIZARD_DESIGNS := ["Dungeon", "Cave"]
+
+func _prefab_tool():
+	if not Global.Editor.Tools.has("PrefabTool"):
+		return null
+	var editor_tool = Global.Editor.Tools["PrefabTool"]
+	var controls = editor_tool.get("Controls")
+	if typeof(controls) != TYPE_DICTIONARY or not controls.has("Set") or not controls.has("List"):
+		return null
+	return { "tool": editor_tool, "set": controls["Set"], "list": controls["List"] }
+
+
+# Enable a tool so its panel and state are live, remembering whether it was
+# the active one; _tool_done puts it back. The tool the UI points at is left
+# enabled: disabling that one is what crashes the editor.
+func _tool_take(tool_name : String, editor_tool) -> bool:
+	var was_active = str(Global.Editor.ActiveToolName) == tool_name
+	if not was_active and editor_tool.has_method("Enable"):
+		editor_tool.Enable()
+	return was_active
+
+
+func _tool_done(editor_tool, was_active : bool) -> void:
+	if not was_active and editor_tool.has_method("Disable"):
+		editor_tool.Disable()
+
+
+func _prefab_set_names(setbtn) -> Array:
+	var names := []
+	for i in range(setbtn.get_item_count()):
+		names.append(str(setbtn.get_item_text(i)))
+	return names
+
+
+func _select_prefab_set(c : Dictionary, want : String) -> String:
+	var setbtn = c["set"]
+	for i in range(setbtn.get_item_count()):
+		if str(setbtn.get_item_text(i)) == want:
+			setbtn.select(i)
+			setbtn.emit_signal("item_selected", i)   # the tool's SetSet refills the list
+			return ""
+	return "no prefab set named '%s'; available: %s" % [want, str(_prefab_set_names(setbtn))]
+
+
+func _list_prefabs(req : Dictionary) -> Dictionary:
+	var c = _prefab_tool()
+	if c == null: return _err("the Prefab tool is not available")
+	var was_active = _tool_take("PrefabTool", c["tool"])
+	if req.has("set") and str(req["set"]) != "":
+		var bad = _select_prefab_set(c, str(req["set"]))
+		if bad != "":
+			_tool_done(c["tool"], was_active)
+			return _err(bad)
+	var setbtn = c["set"]
+	var sel = setbtn.get_selected()
+	var prefabs := []
+	var lst = c["list"]
+	for i in range(lst.get_item_count()):
+		prefabs.append(str(lst.get_item_text(i)))
+	_tool_done(c["tool"], was_active)
+	return _ok({ "sets": _prefab_set_names(setbtn),
+		"set": str(setbtn.get_item_text(sel)) if sel >= 0 else "", "prefabs": prefabs })
+
+
+# Every node of the level's collections (and pattern floors) by instance id;
+# what a prefab adds is whatever appears.
+func _level_children(level) -> Dictionary:
+	var seen := {}
+	for kind in COLLECTIONS:
+		var coll = _collection(level, kind)
+		if coll == null: continue
+		for child in coll.get_children():
+			seen[child.get_instance_id()] = child
+	var shapes = level.PatternShapes
+	if shapes != null and shapes.has_method("GetShapes"):
+		for shape in shapes.GetShapes():
+			seen[shape.get_instance_id()] = shape
+	return seen
+
+
+# A node the prefab placed that can be shifted by changing its position:
+# props, lights, free portals and texts. Walls, paths, roofs and pattern
+# floors carry absolute points and stay where the prefab was saved.
+func _prefab_movable(node) -> bool:
+	if _is_text(node):
+		return true
+	return node is Node2D and not (node is Polygon2D) and node.get("Points") == null
+
+
+func _place_prefab(req : Dictionary) -> Dictionary:
+	var level = Global.World.GetCurrentLevel()
+	if level == null: return _err("no map open")
+	var c = _prefab_tool()
+	if c == null: return _err("the Prefab tool is not available")
+	var name = str(req.get("name", ""))
+	if name == "": return _err("'name' is required; list_prefabs shows what there is")
+	var editor_tool = c["tool"]
+	var was_active = _tool_take("PrefabTool", editor_tool)
+	if req.has("set") and str(req["set"]) != "":
+		var bad = _select_prefab_set(c, str(req["set"]))
+		if bad != "":
+			_tool_done(editor_tool, was_active)
+			return _err(bad)
+	var lst = c["list"]
+	var idx := -1
+	for i in range(lst.get_item_count()):
+		if str(lst.get_item_text(i)) == name:
+			idx = i
+			break
+	if idx < 0:
+		_tool_done(editor_tool, was_active)
+		return _err("no prefab named '%s' in this set; list_prefabs shows what there is" % name)
+	var before = _level_children(level)
+	lst.select(idx)
+	editor_tool.OnSelectPrefab(idx)   # PrefabTool.Instance(): deserialises the prefab into the level
+	var created := []
+	var now = _level_children(level)
+	for iid in now:
+		if not before.has(iid):
+			created.append(now[iid])
+	# Shift the movable pieces so their centre lands on (x, y).
+	var centre := Vector2.ZERO
+	var movable := []
+	var fixed := []
+	for node in created:
+		if _prefab_movable(node):
+			centre += node.rect_position if _is_text(node) else node.position
+			movable.append(node)
+		else:
+			fixed.append(node)
+	if not movable.empty():
+		centre /= movable.size()
+	if not movable.empty() and (req.has("x") or req.has("y")):
+		var delta = Vector2(float(req.get("x", centre.x)), float(req.get("y", centre.y))) - centre
+		for node in movable:
+			if _is_text(node):
+				node.rect_position += delta
+			else:
+				node.position += delta
+		centre += delta
+	editor_tool.Confirm()   # hands the group to Dungeondraft's own history and forgets the preview
+	_tool_done(editor_tool, was_active)
+	var ids := []
+	var entries := []
+	for node in created:
+		var id = _id(node)
+		ids.append(id)
+		entries.append(_create_op(node, id))
+	var result := { "prefab": name, "ids": ids, "count": created.size(), "centre": _vec(centre) }
+	if not fixed.empty():
+		var unmoved := []
+		for node in fixed: unmoved.append(_id(node))
+		result["unmoved"] = unmoved
+		result["note"] = ("walls, paths, roofs and pattern floors in a prefab keep their saved " +
+			"position; move them with modify_wall or move_element")
+	if entries.empty():
+		return _ok(result)
+	return _ok_op(result, { "kind": "group", "label": "place_prefab", "entries": entries })
+
+
+func _generator_tool():
+	if not Global.Editor.Tools.has("Generator"):
+		return null
+	return Global.Editor.Tools["Generator"]
+
+
+func _generator_dials(gen) -> Dictionary:
+	var dials := {}
+	for name in ["Boundary", "Complexity", "Density"]:
+		var ctl = gen.get(name)
+		if ctl != null and ctl.get("value") != null:
+			dials[name.to_lower()] = { "value": ctl.value, "min": ctl.min_value, "max": ctl.max_value,
+				"step": ctl.step }
+	return dials
+
+
+func _generator_options() -> Dictionary:
+	var gen = _generator_tool()
+	if gen == null: return _err("this build has no Generator tool")
+	return _ok({ "design": str(gen.get("Design")), "designs": WIZARD_DESIGNS, "dials": _generator_dials(gen) })
+
+
+# Run Dungeondraft's own Map Wizard generator on the current level. Not
+# undoable through the bridge: a layout is thousands of nodes.
+func _generate_dungeon(req : Dictionary) -> Dictionary:
+	var level = Global.World.GetCurrentLevel()
+	if level == null: return _err("no map open")
+	var gen = _generator_tool()
+	if gen == null: return _err("this build has no Generator tool")
+	if not gen.has_method("Generate"): return _err("the Generator tool exposes no Generate")
+	var design = str(req.get("design", ""))
+	if design != "" and not (design in WIZARD_DESIGNS):
+		return _err("'design' must be one of " + str(WIZARD_DESIGNS))
+	var dials = _generator_dials(gen)
+	for name in ["boundary", "complexity", "density"]:
+		if req.has(name):
+			if not dials.has(name): return _err("no '%s' dial on this build" % name)
+			var v = float(req[name])
+			if v < float(dials[name]["min"]) or v > float(dials[name]["max"]):
+				return _err("'%s' must be between %s and %s" % [name, str(dials[name]["min"]), str(dials[name]["max"])])
+	var before := {}
+	for kind in COLLECTIONS:
+		before[kind] = _collection(level, kind).get_child_count()
+	var was_active = _tool_take("Generator", gen)
+	if design != "":
+		gen.Design = design
+	for name in ["boundary", "complexity", "density"]:
+		if req.has(name):
+			gen.get(name.capitalize()).value = float(req[name])
+	gen.Generate()
+	_tool_done(gen, was_active)
+	var after := {}
+	for kind in COLLECTIONS:
+		after[kind] = _collection(level, kind).get_child_count()
+	return _ok({ "design": str(gen.get("Design")), "dials": _generator_dials(gen),
+		"counts_before": before, "counts_after": after, "level_id": level.ID,
+		"note": "not undoable through the bridge; the layout was added to the current level" })
+
+
+# ---------------------------------------------------------------------------
+# Asset packs
+# ---------------------------------------------------------------------------
+
+const PACKS_DIR := "res://packs"
+
+# Which asset packs are mounted, and which the open map includes. A map sees
+# only the packs in its header's manifest (chosen when it was made); the rest
+# are mounted but invisible to list_assets, and an asset placed from one would
+# not survive a reload.
+func _list_asset_packs() -> Dictionary:
+	var installed := []
+	var dir = Directory.new()
+	if dir.open(PACKS_DIR) == OK and dir.list_dir_begin(true, true) == OK:
+		var entry = dir.get_next()
+		while entry != "":
+			if dir.current_is_dir():
+				installed.append(_read_pack_json(entry))
+			entry = dir.get_next()
+		dir.list_dir_end()
+	var included := []
+	var header = Global.Header
+	if header != null and header.get("AssetManifest") != null:
+		for pack in header.AssetManifest:
+			if pack == null:
+				continue
+			included.append({ "id": str(pack.get("ID")), "name": str(pack.get("Name")),
+				"version": str(pack.get("Version")), "author": str(pack.get("Author")) })
+	var included_ids := {}
+	for pack in included:
+		included_ids[pack["id"]] = true
+	var unused := []
+	for pack in installed:
+		if not included_ids.has(pack["id"]):
+			unused.append(pack)
+	return _ok({
+		"installed": installed, "included_in_this_map": included,
+		"installed_but_not_in_this_map": unused,
+		"uses_default_assets": bool(header.get("UsesDefaultAssets")) if header != null else null,
+	})
+
+
+func _read_pack_json(pack_id : String) -> Dictionary:
+	var out := { "id": pack_id, "name": "", "version": "", "author": "" }
+	var f = File.new()
+	if f.open("%s/%s/pack.json" % [PACKS_DIR, pack_id], File.READ) != OK:
+		return out
+	var parsed = JSON.parse(f.get_as_text())
+	f.close()
+	if parsed.error != OK or typeof(parsed.result) != TYPE_DICTIONARY:
+		return out
+	for key in ["name", "version", "author", "keywords", "allow_3rd_party_mapping_software_to_read"]:
+		if parsed.result.has(key):
+			out[key] = parsed.result[key]
+	return out
 
 
 func _ok(result) -> Dictionary:

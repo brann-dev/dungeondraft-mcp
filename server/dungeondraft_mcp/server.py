@@ -11,28 +11,107 @@ list_assets(category, search=...).
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
+import functools
 import inspect
 import json
 import os
 import random
 import tempfile
 import time
-from typing import Any, Optional
+import uuid
+from pathlib import Path
+from typing import Any, Callable, Optional
 
+import pydantic_core
 from mcp.server.fastmcp import FastMCP, Image
 
-from . import spatial
+from . import floorplan, layout, mapfile, packs, spatial, uvtt_import
+from . import scene as scene_checks
 from .bridge_client import BridgeClient, BridgeError
 
 HOST = os.environ.get("DD_BRIDGE_HOST", "127.0.0.1")
 PORT = int(os.environ.get("DD_BRIDGE_PORT", "8787"))
 
 mcp = FastMCP("dungeondraft")
-bridge = BridgeClient(HOST, PORT)
+
+# The open undo group, if any: every bridge request made inside _undo_group()
+# carries its token, so the mod records those edits as one undo() step and can
+# tell a stale group (its owner went away) from a live one.
+_undo_group_token: contextvars.ContextVar[str] = contextvars.ContextVar("undo_group", default="")
+
+
+class _Bridge(BridgeClient):
+    def request(self, cmd: str, **params) -> dict:
+        token = _undo_group_token.get()
+        if token and "undo_group" not in params:
+            params["undo_group"] = token
+        return super().request(cmd, **params)
+
+
+bridge = _Bridge(HOST, PORT)
+
+
+@contextlib.contextmanager
+def _undo_group(label: str):
+    """Record every edit made inside the block as ONE undo() step."""
+    token = uuid.uuid4().hex
+    bridge.request("begin_undo_group", label=label, undo_group=token)
+    reset = _undo_group_token.set(token)
+    try:
+        yield
+    finally:
+        _undo_group_token.reset(reset)
+        try:
+            bridge.request("end_undo_group", undo_group=token)
+        except BridgeError:
+            pass   # the mod closes a group whose owner stopped talking to it
+
+
+def _model_text(result: Any) -> Any:
+    """What a tool result looks like to the model: JSON sent compact.
+
+    The SDK serialises a returned dict with indent=2, which puts every number
+    of a nested array on its own line; a spatial snapshot or an asset listing
+    costs several times the tokens it needs to. Same serialiser, same
+    fallbacks, no indentation. Images and strings pass through untouched.
+    """
+    if isinstance(result, (dict, list)):
+        return pydantic_core.to_json(result, fallback=str).decode()
+    return result
+
+
+def _tool() -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Register a tool and return the function itself unchanged.
+
+    Python callers (batch(), the tests) keep getting dicts; only the MCP
+    boundary sees the compact text. structured_output=False pins the wire
+    contract to one text block, so a later SDK cannot start sending every
+    result twice. An exception this package did not anticipate is reported
+    with its type instead of an empty error.
+    """
+    def register(fn: Callable[..., Any]) -> Callable[..., Any]:
+        @functools.wraps(fn)
+        def for_the_model(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return _model_text(fn(*args, **kwargs))
+            except (BridgeError, ValueError, TypeError):
+                raise
+            except Exception as exc:   # noqa: BLE001 - reported, not swallowed
+                detail = (str(exc).strip() or "no message")[:300]
+                raise RuntimeError(
+                    f"{fn.__name__} failed unexpectedly: {type(exc).__name__}: {detail}. "
+                    "This is a bug in the server, not in your request; retrying the "
+                    "same call is unlikely to help.") from exc
+        mcp.tool(structured_output=False)(for_the_model)
+        return fn
+    return register
 
 _SCREENSHOT_PATH = os.path.join(tempfile.gettempdir(), "dd_mcp_screenshot.png")
 _EXPORT_PATH = os.path.join(tempfile.gettempdir(), "dd_mcp_export.png")
 _UVTT_PATH = os.path.join(tempfile.gettempdir(), "dd_mcp_export.dd2vtt")
+_TRACE_PATH = os.path.join(tempfile.gettempdir(), "dd_mcp_trace")   # + the image's suffix
 
 
 def _wait_for_file(path: str, timeout: float = 60.0) -> None:
@@ -119,13 +198,13 @@ def _refuse_if_protected(what: str, **shape) -> None:
 # Read / query
 # --------------------------------------------------------------------------
 
-@mcp.tool()
+@_tool()
 def ping() -> dict:
     """Check connectivity to the running Dungeondraft bridge and report the Godot engine version."""
     return bridge.request("ping")
 
 
-@mcp.tool()
+@_tool()
 def get_status() -> dict:
     """Report the current map: whether one is open, its size and center in woxels, per-type element counts, and level info.
 
@@ -134,13 +213,13 @@ def get_status() -> dict:
     return bridge.request("get_status")
 
 
-@mcp.tool()
+@_tool()
 def list_asset_categories() -> dict:
     """List the valid asset category names (Objects, Walls, Paths, Terrain, Lights, Portals, Roofs, ...)."""
     return bridge.request("list_asset_categories")
 
 
-@mcp.tool()
+@_tool()
 def list_assets(category: str = "Objects", search: str = "", limit: int = 100) -> dict:
     """List asset paths in a category, optionally filtered by a case-insensitive substring.
 
@@ -151,7 +230,7 @@ def list_assets(category: str = "Objects", search: str = "", limit: int = 100) -
     return bridge.request("list_assets", category=category, search=search, limit=limit)
 
 
-@mcp.tool()
+@_tool()
 def list_elements(kind: str = "objects", limit: int = 200) -> dict:
     """List elements currently on the map with their ids, positions, rotation, scale and asset.
 
@@ -161,7 +240,7 @@ def list_elements(kind: str = "objects", limit: int = 200) -> dict:
     return bridge.request("list_elements", kind=kind, limit=limit)
 
 
-@mcp.tool()
+@_tool()
 def get_element(id: int) -> dict:
     """Get details (kind, position, rotation, scale, asset) for a single element by id.
 
@@ -171,7 +250,7 @@ def get_element(id: int) -> dict:
     return bridge.request("get_element", id=id)
 
 
-@mcp.tool()
+@_tool()
 def list_levels() -> dict:
     """List the map's levels (floors) with their index, id and label, plus the current index and id.
 
@@ -182,7 +261,7 @@ def list_levels() -> dict:
     return bridge.request("list_levels")
 
 
-@mcp.tool()
+@_tool()
 def list_layers() -> dict:
     """List the current level's draw layers, bottom to top: {layer, label, locked}.
 
@@ -200,7 +279,7 @@ def list_layers() -> dict:
 # Create
 # --------------------------------------------------------------------------
 
-@mcp.tool()
+@_tool()
 def place_object(
     asset: str,
     x: Optional[float] = None,
@@ -247,7 +326,7 @@ def place_object(
     return bridge.request("place_object", **params)
 
 
-@mcp.tool()
+@_tool()
 def draw_wall(
     points: list[list[float]],
     asset: str = "",
@@ -267,7 +346,7 @@ def draw_wall(
     )
 
 
-@mcp.tool()
+@_tool()
 def draw_path(
     points: list[list[float]],
     asset: str,
@@ -291,20 +370,22 @@ def draw_path(
     return bridge.request("draw_path", **params)
 
 
-@mcp.tool()
+@_tool()
 def add_light(
     x: Optional[float] = None,
     y: Optional[float] = None,
     color: str = "",
     energy: float = 1.0,
-    range: float = 1.0,
+    range: float = 2.0,
     shadows: bool = True,
     asset: str = "",
 ) -> dict:
     """Add a light at a woxel position. Returns the new element id.
 
     color: '#rrggbb' (default warm). energy: brightness.
-    range: size of the light as a multiple of its texture, not a distance in
+    range: Dungeondraft's own Range, the number its Light tool shows and its
+      saved map and Universal VTT export carry (2.0 lights about two tiles
+      from the centre with the default texture). The default is 2.0.
     woxels: with Dungeondraft's built-in lights, 1.0 fades out about 2 tiles
     from the center and 2.0 about 4. Dungeondraft's own Range slider shows
     twice this number.
@@ -318,12 +399,12 @@ def add_light(
     return bridge.request("add_light", **params)
 
 
-@mcp.tool()
+@_tool()
 def add_portal(
     asset: str,
     x: Optional[float] = None,
     y: Optional[float] = None,
-    closed: bool = False,
+    closed: Optional[bool] = None,
     radius: float = 64.0,
     mount: str = "wall",
     snap_max: float = 256.0,
@@ -336,7 +417,10 @@ def add_portal(
     By default the portal MOUNTS on the nearest wall and the wall cuts a gap
     around it (like placing a door by hand).
 
-    asset: a Portals asset path. closed: blocks light.
+    asset: a Portals asset path.
+    closed: whether the portal blocks sight and light. Omitted, it follows
+      the asset: a door is closed (an openable door in a VTT export), a
+      window is open. Foundry and Roll20 go by this flag, not the picture.
     radius: door half-width (~128 ≈ 1-tile door, ~256 ≈ 2-tile door).
     mount: 'wall' (snap to nearest wall, cut gap) or 'free' (freestanding).
     snap_max: max woxel distance a wall may be and still capture the portal.
@@ -344,6 +428,8 @@ def add_portal(
     is within snap_max, place a freestanding portal instead of erroring.
     rotation: degrees, freestanding only.
     """
+    if closed is None:
+        closed = "window" not in asset.lower()
     params = {
         "asset": asset,
         "closed": closed,
@@ -361,7 +447,7 @@ def add_portal(
     return bridge.request("add_portal", **params)
 
 
-@mcp.tool()
+@_tool()
 def add_roof(
     points: list[list[float]],
     asset: str,
@@ -392,7 +478,7 @@ def add_roof(
     )
 
 
-@mcp.tool()
+@_tool()
 def place_pattern(
     asset: str,
     rect: Optional[list[float]] = None,
@@ -432,7 +518,7 @@ def place_pattern(
     return bridge.request("place_pattern", **params)
 
 
-@mcp.tool()
+@_tool()
 def build_room(
     rect: Optional[list[float]] = None,
     points: Optional[list[list[float]]] = None,
@@ -483,12 +569,56 @@ def build_room(
         params["floor_asset"] = floor_asset
     if floor_color:
         params["floor_color"] = floor_color
+    boundary = _shape_polygon(rect, points)
     if floor == "terrain":
-        _refuse_if_protected("the room's terrain floor", polygon=_shape_polygon(rect, points), radius=64)
-    return bridge.request("build_room", **params)
+        _refuse_if_protected("the room's terrain floor", polygon=boundary, radius=64)
+    shared = _shared_walls(boundary, wall_type, wall_asset)
+    if not shared["shared_wall_ids"]:
+        return bridge.request("build_room", **params)
+    # Part of the boundary is already walled. Draw only the free sides, so a
+    # door on the shared wall opens into both rooms (a second wall there would
+    # still block the doorway in a VTT), and the floor on the whole boundary.
+    if shared["enclosed"] and floor == "none":
+        raise ValueError("every side of the boundary is already walled and floor='none': nothing to build")
+    result: dict = {"wall_ids": [], "shared_wall_ids": shared["shared_wall_ids"],
+                    "points": boundary, "notes": list(shared.get("notes", []))}
+    with _undo_group("build_room"):
+        for run in shared["runs"]:
+            result["wall_ids"].append(
+                draw_wall(run, asset=wall_asset, loop=False, type=wall_type, joint=wall_joint)["id"])
+        if floor == "pattern":
+            if not floor_asset:
+                raise ValueError("floor='pattern' needs floor_asset (a Simple Tiles / Smart Tiles texture)")
+            result["floor_id"] = place_pattern(
+                floor_asset, points=boundary, category=floor_category, color=floor_color)["id"]
+        elif floor == "terrain":
+            result["floor_pixels"] = fill_region(points=boundary, slot=floor_slot, asset=floor_asset).get("pixels")
+    result["note"] = (f"{len(shared['shared_wall_ids'])} existing wall(s) stand on the boundary and were "
+                      f"reused; {len(result['wall_ids'])} new wall run(s) drawn")
+    return result
 
 
-@mcp.tool()
+def _shared_walls(boundary: list, wall_type: int, wall_asset: str) -> dict:
+    """Existing walls that already stand on the room boundary, same kind only.
+
+    The snapshot has every wall's geometry but not its type, so a first pass
+    assumes the type matches to find the candidates, and only those few are
+    read back with get_element before the real decision.
+    """
+    snapshot = bridge.request("spatial_snapshot")
+    guess = [dict(w, type=wall_type) for w in snapshot.get("walls", [])]
+    first = layout.shared_walls(boundary, guess, wall_type=wall_type)
+    if not first["shared_wall_ids"]:
+        return first
+    typed = []
+    for wid in first["shared_wall_ids"]:
+        el = bridge.request("get_element", id=wid)
+        typed.append({"id": wid, "points": el["points"], "loop": el.get("loop", False),
+                      "type": el.get("type", wall_type), "asset": el.get("asset", "")})
+    return layout.shared_walls(boundary, typed, wall_type=wall_type, wall_asset=wall_asset)
+
+
+@_tool()
 def add_text(
     text: str,
     x: Optional[float] = None,
@@ -516,7 +646,7 @@ def add_text(
     return bridge.request("add_text", **params)
 
 
-@mcp.tool()
+@_tool()
 def import_image(
     path: str,
     x: Optional[float] = None,
@@ -565,7 +695,7 @@ def import_image(
     return bridge.request("import_image", **params)
 
 
-@mcp.tool()
+@_tool()
 def set_trace_image(
     path: str = "",
     x: Optional[float] = None,
@@ -594,7 +724,7 @@ def set_trace_image(
     return bridge.request("set_trace_image", **params)
 
 
-@mcp.tool()
+@_tool()
 def scatter_objects(
     assets: list[str],
     rect: Optional[list[float]] = None,
@@ -621,7 +751,7 @@ def scatter_objects(
     don't overlap each other or what is already there. allow_overlap=True lets
     them overlap, which is what a forest canopy needs. Spots that fail are
     re-drawn, so fewer than count may fit; the result says how many were placed
-    and returns their ids. Each object is a separate undo() step.
+    and returns their ids. One undo() removes the whole scatter.
     """
     if (rect is None) == (points is None):
         raise ValueError("provide exactly one of 'rect' or 'points'")
@@ -638,6 +768,7 @@ def scatter_objects(
     rng = random.Random(seed)
     ids: list[int] = []
     attempts = 0
+    group = _undo_group("scatter_objects")
     while len(ids) < count and attempts < count * 30:
         attempts += 1
         x, y = round(rng.uniform(x0, x1), 1), round(rng.uniform(y0, y1), 1)
@@ -649,10 +780,14 @@ def scatter_objects(
         footprint = spatial.transform(locals_[asset], (x, y), (s, s), turn)
         if spatial.check_footprint(scene, footprint, layer=layer, allow_overlap=allow_overlap):
             continue
+        if not ids:
+            group.__enter__()   # the first placement opens the undo group
         made = bridge.request("place_object", asset=asset, x=x, y=y, scale=s, rotation=turn, layer=layer)
         ids.append(made["id"])
         # Later objects must keep clear of this one too.
         scene["objects"].append({"id": made["id"], "asset": asset, "layer": layer, "polygon": footprint})
+    if ids:
+        group.__exit__(None, None, None)
     result: dict = {"placed": len(ids), "requested": count, "ids": ids, "seed": seed}
     if len(ids) < count:
         result["note"] = (f"only {len(ids)} of {count} fit after {attempts} tries; "
@@ -660,7 +795,7 @@ def scatter_objects(
     return result
 
 
-@mcp.tool()
+@_tool()
 def draw_water(
     rect: Optional[list[float]] = None,
     points: Optional[list[list[float]]] = None,
@@ -702,7 +837,7 @@ def draw_water(
     return bridge.request("draw_water", **params)
 
 
-@mcp.tool()
+@_tool()
 def draw_material(
     asset: str,
     rect: Optional[list[float]] = None,
@@ -748,7 +883,7 @@ def draw_material(
 # Terrain
 # --------------------------------------------------------------------------
 
-@mcp.tool()
+@_tool()
 def set_terrain_slot(asset: str, slot: int = 0, expand: bool = False) -> dict:
     """Assign a Terrain asset to a terrain slot index so it can be filled/painted with that slot.
 
@@ -762,7 +897,7 @@ def set_terrain_slot(asset: str, slot: int = 0, expand: bool = False) -> dict:
     return bridge.request("set_terrain_slot", **params)
 
 
-@mcp.tool()
+@_tool()
 def fill_terrain(slot: int = 0, asset: str = "") -> dict:
     """Flood-fill the whole current level with a terrain slot. If asset is given, it is assigned to the slot first."""
     params = {"slot": slot}
@@ -772,7 +907,7 @@ def fill_terrain(slot: int = 0, asset: str = "") -> dict:
     return bridge.request("fill_terrain", **params)
 
 
-@mcp.tool()
+@_tool()
 def fill_region(
     rect: Optional[list[float]] = None,
     points: Optional[list[list[float]]] = None,
@@ -802,7 +937,7 @@ def fill_region(
     return bridge.request("fill_region", **params)
 
 
-@mcp.tool()
+@_tool()
 def paint_terrain(
     slot: int = 0,
     x: Optional[float] = None,
@@ -832,7 +967,7 @@ def paint_terrain(
     return bridge.request("paint_terrain", **params)
 
 
-@mcp.tool()
+@_tool()
 def paint_path(
     points: list[list[float]],
     slot: int = 0,
@@ -859,7 +994,7 @@ def paint_path(
     return bridge.request("paint_path", **params)
 
 
-@mcp.tool()
+@_tool()
 def dig_cave(
     points: list[list[float]],
     radius: float = 256.0,
@@ -893,7 +1028,7 @@ def dig_cave(
     return bridge.request("dig_cave", **params)
 
 
-@mcp.tool()
+@_tool()
 def clear_caves() -> dict:
     """Wipe the entire cave layer back to solid rock.
 
@@ -909,7 +1044,7 @@ def clear_caves() -> dict:
 # Modify / delete
 # --------------------------------------------------------------------------
 
-@mcp.tool()
+@_tool()
 def move_element(
     id: int,
     x: float,
@@ -929,7 +1064,7 @@ def move_element(
     return bridge.request("move_element", **params)
 
 
-@mcp.tool()
+@_tool()
 def modify_object(
     id: int,
     scale: Optional[float] = None,
@@ -970,7 +1105,7 @@ def modify_object(
     return bridge.request("modify_object", **params)
 
 
-@mcp.tool()
+@_tool()
 def modify_wall(
     id: int,
     points: Optional[list[list[float]]] = None,
@@ -1016,7 +1151,7 @@ def modify_wall(
     return bridge.request("modify_wall", **params)
 
 
-@mcp.tool()
+@_tool()
 def modify_light(
     id: int,
     color: str = "",
@@ -1028,9 +1163,8 @@ def modify_light(
 ) -> dict:
     """Change an existing light by id: color, brightness, size, shadows, rotation or texture. Returns the light.
 
-    color: '#rrggbb'. energy: brightness (>= 0). range: size as a multiple of
-    the light's texture, as in add_light (1.0 fades out about 2 tiles from the
-    center). shadows: whether walls and light-blocking objects cut it off.
+    color: '#rrggbb'. energy: brightness (>= 0). range: Dungeondraft's own Range, as the Light tool shows it (see
+      add_light); a texture change alone keeps the Range.
     rotation: degrees, for a directional texture. asset: a Lights asset path.
     Anything omitted is kept; move a light with move_element. Undoable.
     """
@@ -1050,7 +1184,7 @@ def modify_light(
     return bridge.request("modify_light", **params)
 
 
-@mcp.tool()
+@_tool()
 def modify_text(
     id: int,
     text: Optional[str] = None,
@@ -1074,7 +1208,7 @@ def modify_text(
     return bridge.request("modify_text", **params)
 
 
-@mcp.tool()
+@_tool()
 def set_element_layer(id: int, layer: int) -> dict:
     """Move an object, path or pattern floor to another draw layer (see list_layers).
 
@@ -1085,7 +1219,7 @@ def set_element_layer(id: int, layer: int) -> dict:
     return bridge.request("set_element_layer", id=id, layer=layer)
 
 
-@mcp.tool()
+@_tool()
 def duplicate_object(
     id: int,
     dx: float = 64.0,
@@ -1106,17 +1240,33 @@ def duplicate_object(
     return bridge.request("duplicate_object", **params)
 
 
-@mcp.tool()
+@_tool()
 def delete_element(id: int) -> dict:
-    """Delete any element from the map by id."""
+    """Delete any element from the map by id. Reversible with undo().
+
+    An object is kept serialised and anything else is held off the map, so
+    undo() puts it back with the same id. To take back what build_room,
+    scatter_objects or a batch just made, call undo() once instead of
+    deleting the pieces: each of those is one undo step.
+    """
     return bridge.request("delete_element", id=id)
+
+
+@_tool()
+def delete_elements(ids: list[int]) -> dict:
+    """Delete several elements in ONE call and ONE undo() step.
+
+    ids: up to 100 element ids. Every id is checked first, so an unknown id
+    deletes nothing. Reversible with one undo().
+    """
+    return bridge.request("delete_elements", ids=ids)
 
 
 # --------------------------------------------------------------------------
 # Map lifecycle
 # --------------------------------------------------------------------------
 
-@mcp.tool()
+@_tool()
 def get_current_map() -> dict:
     """Report the open map: {map_open, path, dirty, saving}.
 
@@ -1127,7 +1277,7 @@ def get_current_map() -> dict:
     return bridge.request("get_current_map")
 
 
-@mcp.tool()
+@_tool()
 def save_map() -> dict:
     """Save the open map to its current file, like DD's Save button. Returns {saved, path, saving}.
 
@@ -1141,7 +1291,7 @@ def save_map() -> dict:
     return bridge.request("save_map")
 
 
-@mcp.tool()
+@_tool()
 def open_map(path: str) -> dict:
     """Open another saved map file in Dungeondraft. Returns {opening: path}.
 
@@ -1161,7 +1311,7 @@ def open_map(path: str) -> dict:
 # Levels
 # --------------------------------------------------------------------------
 
-@mcp.tool()
+@_tool()
 def add_level(label: str = "Level", terrain: bool = False) -> dict:
     """Add a new, empty level (floor) to the map. Returns its id, label and index.
 
@@ -1178,19 +1328,19 @@ def add_level(label: str = "Level", terrain: bool = False) -> dict:
     return bridge.request("add_level", label=label, terrain=terrain)
 
 
-@mcp.tool()
+@_tool()
 def set_level(index: int) -> dict:
     """Switch the active level (floor) by its index (see list_levels). All edits go to the active level."""
     return bridge.request("set_level", index=index)
 
 
-@mcp.tool()
+@_tool()
 def rename_level(index: int, label: str) -> dict:
     """Rename a level (floor) by its index. Returns the level list."""
     return bridge.request("rename_level", index=index, label=label)
 
 
-@mcp.tool()
+@_tool()
 def clone_level(index: int, label: str = "") -> dict:
     """Copy a whole level (floor) with everything on it. Returns the copy's id, label and index.
 
@@ -1206,13 +1356,13 @@ def clone_level(index: int, label: str = "") -> dict:
     return bridge.request("clone_level", **params)
 
 
-@mcp.tool()
+@_tool()
 def reorder_levels(ids: list[int]) -> dict:
     """Set the order of the levels (floors): every level id exactly once, top floor first. Returns the level list."""
     return bridge.request("reorder_levels", ids=ids)
 
 
-@mcp.tool()
+@_tool()
 def compare_levels(
     index: int = -1,
     reference_opacity: float = 0.35,
@@ -1230,7 +1380,7 @@ def compare_levels(
         reference_opacity=reference_opacity, current_opacity=current_opacity)
 
 
-@mcp.tool()
+@_tool()
 def add_layer(layer: int, label: str = "") -> dict:
     """Add a draw layer to the current level, e.g. 150 to sit between layers 100 and 200. Returns the layer list.
 
@@ -1244,7 +1394,7 @@ def add_layer(layer: int, label: str = "") -> dict:
     return bridge.request("add_layer", **params)
 
 
-@mcp.tool()
+@_tool()
 def configure_level(
     ambient_light: str = "",
     lighting: Optional[bool] = None,
@@ -1278,7 +1428,7 @@ def configure_level(
 # Capture — let the model see its own work
 # --------------------------------------------------------------------------
 
-@mcp.tool()
+@_tool()
 def screenshot() -> Image:
     """Capture the current Dungeondraft window (the on-screen view) and return it as an image.
 
@@ -1289,7 +1439,7 @@ def screenshot() -> Image:
     return Image(path=res["path"])
 
 
-@mcp.tool()
+@_tool()
 def export_map(ppi: int = 40, grid: Optional[bool] = None) -> Image:
     """Render the entire current map to a clean PNG (no UI) and return it as an image.
 
@@ -1302,7 +1452,7 @@ def export_map(ppi: int = 40, grid: Optional[bool] = None) -> Image:
     return Image(path=_EXPORT_PATH)
 
 
-@mcp.tool()
+@_tool()
 def export_uvtt(dest_path: str = "", ppi: int = 100, grid: bool = False) -> dict:
     """Export the map as Universal VTT (.dd2vtt) for Foundry / Roll20: the image plus walls, doors and lights.
 
@@ -1336,7 +1486,7 @@ def export_uvtt(dest_path: str = "", ppi: int = 100, grid: bool = False) -> dict
     }
 
 
-@mcp.tool()
+@_tool()
 def set_grid(visible: Optional[bool] = None) -> dict:
     """Show (True) or hide (False) the editor grid, like DD's Grid toggle; omit to just read it.
 
@@ -1352,7 +1502,7 @@ def set_grid(visible: Optional[bool] = None) -> dict:
 # Camera
 # --------------------------------------------------------------------------
 
-@mcp.tool()
+@_tool()
 def reset_camera() -> dict:
     """Reset the editor view: default anchor, centered on the map, 100% zoom.
 
@@ -1362,7 +1512,7 @@ def reset_camera() -> dict:
     return bridge.request("reset_camera")
 
 
-@mcp.tool()
+@_tool()
 def get_camera() -> dict:
     """Report the editor camera: world-center position [x,y], zoom, and viewport size.
 
@@ -1372,7 +1522,7 @@ def get_camera() -> dict:
     return bridge.request("get_camera")
 
 
-@mcp.tool()
+@_tool()
 def set_camera(
     x: Optional[float] = None,
     y: Optional[float] = None,
@@ -1394,7 +1544,7 @@ def set_camera(
     return bridge.request("set_camera", **params)
 
 
-@mcp.tool()
+@_tool()
 def focus_element(id: int, zoom: Optional[float] = None) -> dict:
     """Center the camera on an element by id (works for any kind, including text).
 
@@ -1407,7 +1557,7 @@ def focus_element(id: int, zoom: Optional[float] = None) -> dict:
     return bridge.request("focus_element", **params)
 
 
-@mcp.tool()
+@_tool()
 def fit_elements(ids: list[int], pad: float = 0.15) -> dict:
     """Frame a group of elements: center and zoom so their bounding box fits the view.
 
@@ -1422,13 +1572,13 @@ def fit_elements(ids: list[int], pad: float = 0.15) -> dict:
 # Selection
 # --------------------------------------------------------------------------
 
-@mcp.tool()
+@_tool()
 def select_elements(ids: list[int]) -> dict:
     """Select the given element ids in Dungeondraft's UI (replaces the current selection)."""
     return bridge.request("select_elements", ids=ids)
 
 
-@mcp.tool()
+@_tool()
 def clear_selection() -> dict:
     """Clear the current selection in Dungeondraft."""
     return bridge.request("clear_selection")
@@ -1442,7 +1592,7 @@ def _round_points(points) -> list:
     return [[round(x, 1), round(y, 1)] for x, y in points]
 
 
-@mcp.tool()
+@_tool()
 def get_asset_footprint(asset: str) -> dict:
     """How big an Objects asset really is: call this before choosing a scale or a spot for furniture.
 
@@ -1463,7 +1613,7 @@ def get_asset_footprint(asset: str) -> dict:
     }
 
 
-@mcp.tool()
+@_tool()
 def check_object_placement(
     asset: str = "",
     id: Optional[int] = None,
@@ -1526,7 +1676,7 @@ def check_object_placement(
             "footprint": _round_points(proposal.polygon), "layer": proposal.layer}
 
 
-@mcp.tool()
+@_tool()
 def validate_layout(region: str = "", door_clearance: float = 128.0, limit: int = 100) -> dict:
     """Audit every object on the current level for layout mistakes. Run it after furnishing.
 
@@ -1545,7 +1695,7 @@ def validate_layout(region: str = "", door_clearance: float = 128.0, limit: int 
     return spatial.audit(scene, door_clearance=door_clearance, region=region, limit=limit)
 
 
-@mcp.tool()
+@_tool()
 def set_spatial_region(
     name: str,
     kind: str = "clearance",
@@ -1580,13 +1730,13 @@ def set_spatial_region(
     return bridge.request("set_spatial_region", **params)
 
 
-@mcp.tool()
+@_tool()
 def remove_spatial_region(name: str) -> dict:
     """Remove a region set with set_spatial_region from the current level. Returns the remaining regions."""
     return bridge.request("remove_spatial_region", name=name)
 
 
-@mcp.tool()
+@_tool()
 def list_spatial_regions() -> dict:
     """List the current level's regions (name, kind, points) set with set_spatial_region."""
     return bridge.request("list_spatial_regions")
@@ -1605,7 +1755,7 @@ def list_spatial_regions() -> dict:
 #   {"$type": "Vector2", "value": [x, y]} and objects as
 #   {"$target": "Object:<n>", "class": ...}, which you can pass back in.
 
-@mcp.tool()
+@_tool()
 def native_targets() -> dict:
     """List the named entry points into Dungeondraft's own objects: the roots, every tool and every window.
 
@@ -1616,7 +1766,7 @@ def native_targets() -> dict:
     return bridge.request("native_targets")
 
 
-@mcp.tool()
+@_tool()
 def native_describe(target: str = "Level", search: str = "") -> dict:
     """List a Dungeondraft object's methods (with argument names and types) and properties.
 
@@ -1630,7 +1780,7 @@ def native_describe(target: str = "Level", search: str = "") -> dict:
     return bridge.request("native_describe", target=target, search=search)
 
 
-@mcp.tool()
+@_tool()
 def native_get(target: str, properties: list[str]) -> dict:
     """Read properties of a Dungeondraft object by name. Read-only.
 
@@ -1640,7 +1790,7 @@ def native_get(target: str, properties: list[str]) -> dict:
     return bridge.request("native_get", target=target, properties=properties)
 
 
-@mcp.tool()
+@_tool()
 def native_set(target: str, property: str, value: Any) -> dict:
     """Set a property on a Dungeondraft object. Returns the value it holds afterwards.
 
@@ -1656,7 +1806,7 @@ def native_set(target: str, property: str, value: Any) -> dict:
     return bridge.request("native_set", target=target, property=property, value=value)
 
 
-@mcp.tool()
+@_tool()
 def native_call(target: str, method: str, args: Optional[list[Any]] = None) -> dict:
     """Call a method of Dungeondraft's own API on a live object. Returns its result.
 
@@ -1680,7 +1830,7 @@ def native_call(target: str, method: str, args: Optional[list[Any]] = None) -> d
     return bridge.request("native_call", target=target, method=method, args=args or [])
 
 
-@mcp.tool()
+@_tool()
 def ui_tree(target: str = "Editor", search: str = "", limit: int = 200) -> dict:
     """List the controls in part of Dungeondraft's own UI: buttons, toggles, sliders, text fields, option lists, labels.
 
@@ -1694,7 +1844,7 @@ def ui_tree(target: str = "Editor", search: str = "", limit: int = 200) -> dict:
     return bridge.request("ui_tree", target=target, search=search, limit=limit)
 
 
-@mcp.tool()
+@_tool()
 def ui_action(target: str, action: str, value: Any = None) -> dict:
     """Operate one of Dungeondraft's own controls, as if the user had: for features with no dedicated tool.
 
@@ -1719,21 +1869,571 @@ def ui_action(target: str, action: str, value: Any = None) -> dict:
 # History
 # --------------------------------------------------------------------------
 
-@mcp.tool()
+@_tool()
 def undo() -> dict:
-    """Reverse the last reversible edit you made (create / move / modify / terrain / cave / water / material).
+    """Reverse the last reversible edit you made (create / delete / move / modify / terrain / cave / water / material).
 
     The bridge keeps its own undo/redo stack, so this reliably steps back through
-    your own edits. Note: it is independent of Dungeondraft's Ctrl+Z, and
-    delete_element is not reversible.
+    your own edits; it is independent of Dungeondraft's Ctrl+Z. A batch, a
+    scatter, a built room or a multi-element delete is one step. Not
+    reversible: delete_level, set_terrain_slot, and native_* / ui_* calls.
+    History keeps the last 200 steps.
     """
     return bridge.request("undo")
 
 
-@mcp.tool()
+@_tool()
 def redo() -> dict:
     """Re-apply the last edit reversed by undo()."""
     return bridge.request("redo")
+
+
+# --------------------------------------------------------------------------
+# Terrain read-back, floorplan and scene checks, arrangement
+# --------------------------------------------------------------------------
+
+@_tool()
+def get_terrain(rect: Optional[list[float]] = None, samples: int = 16) -> dict:
+    """Read the painted terrain back: sample the splat weights on a grid. Read-only.
+
+    rect: [x, y, w, h] in woxels; omit for the whole map. samples: points per
+    side, 2-64 (16 = 256 points). Each sample is {x, y, weights, covered}:
+    weights are the splat channel values for slots 0-3 (and 4-7 with expanded
+    slots), summing to about 1; covered is true where a pattern floor or a
+    dug cave hides the terrain. slots lists each slot's texture. Slot 0 is
+    whatever the other slots leave unclaimed, so a blank map reads [1,0,0,0].
+    """
+    if not 2 <= samples <= 64:
+        raise ValueError("samples must be 2 to 64")
+    params: dict = {"samples": samples}
+    if rect is not None:
+        params["rect"] = rect
+    return bridge.request("terrain_samples", **params)
+
+
+@_tool()
+def validate_floorplan(cell_woxels: int = 64, min_room_tiles: float = 1.0) -> dict:
+    """Check a floorplan's structure BEFORE furnishing it: is every room reachable, does every door open onto something, is there a way in. Read-only.
+
+    Walls are rasterised onto a grid of cell_woxels (64 = a quarter tile) and
+    the enclosed areas flood-filled; areas under min_room_tiles are ignored as
+    slivers. Returns the rooms (area, bounds, centre, their doors, whether a
+    chain of doors reaches the outside), each portal's two sides, the
+    entrances, and findings: sealed_room, unreachable_room, portal_to_nothing,
+    no_entrance. A sealed room and a connected one have identical element
+    counts; this is how to tell them apart.
+    """
+    if cell_woxels < 8:
+        raise ValueError("cell_woxels must be at least 8")
+    return floorplan.analyse(bridge.request("spatial_snapshot"),
+                             cell_woxels=cell_woxels, min_room_tiles=min_room_tiles)
+
+
+@_tool()
+def validate_scene(samples: int = 32, emitter_reach: float = 256.0) -> dict:
+    """Check that the map has ground and that its light has causes. Read-only.
+
+    bare_ground: open ground with no terrain painted and no floor over it,
+    sampled on a samples x samples grid (points under walls are skipped);
+    reports the share and the largest bare patches with their bounds. Floors
+    drawn with Dungeondraft's Floor tool are not detected, so a Floor-tool room
+    reads as bare. light_causes: every light should have a visible source
+    nearby (a candle, torch, lantern, brazier, fire, lamp...) within
+    emitter_reach woxels; lists lights with no cause and sources with no
+    light. A wide light (range >= 4) counts as mood light and is never flagged.
+    """
+    if not 2 <= samples <= 64:
+        raise ValueError("samples must be 2 to 64")
+    terrain = bridge.request("terrain_samples", samples=samples)
+    snapshot = bridge.request("spatial_snapshot")
+    ground = scene_checks.bare_ground(terrain["samples"], slots=terrain.get("slots"),
+                                      walls=snapshot.get("walls"))
+    lights = scene_checks.light_causes(
+        bridge.request("list_elements", kind="lights", limit=1000)["elements"],
+        bridge.request("list_elements", kind="objects", limit=2000)["elements"],
+        emitter_reach=emitter_reach)
+    return {"ok": ground["ok"] and lights["ok"], "bare_ground": ground, "light_causes": lights}
+
+
+@_tool()
+def arrange_objects(
+    mode: str,
+    assets: list[str],
+    count: Optional[int] = None,
+    along: Optional[list[list[float]]] = None,
+    wall_id: Optional[int] = None,
+    toward: Optional[list[float]] = None,
+    target_id: Optional[int] = None,
+    facing: str = "down",
+    shape: str = "auto",
+    gap: Optional[float] = None,
+    margin: Optional[float] = None,
+    clearance: float = -16.0,
+    scale: float = 1.0,
+    layer: int = spatial.DEFAULT_LAYER,
+    color: str = "",
+    jitter: bool = True,
+    seed: Optional[int] = None,
+    dry_run: bool = False,
+) -> dict:
+    """Lay furniture out against a wall, around a table, or on a surface, in ONE undo step.
+
+    Fitted to each asset's DRAWN area (what get_asset_footprint reports), never
+    its canvas, so a shelf sits flush to its wall. assets are used in turn,
+    repeated to count.
+
+    mode='along_wall': a row backed against a wall, fronts into the room.
+      along: [[x0,y0],[x1,y1]], the stretch of wall to line (woxels); wall_id
+      picks the wall when two overlap there; toward: a point inside the room,
+      needed for a wall that is not a closed loop. Doors on the wall and the
+      corners are kept clear by margin (default 32). count=None fills the
+      stretch; gap spaces the row (None spreads it evenly).
+    mode='around_target': seats ringing the object target_id (a table), each
+      facing it. count seats (default 4); shape 'auto' | 'round' | 'rect';
+      clearance from the table edge, negative tucks them under (default -16,
+      placed with allow_overlap).
+    mode='on_surface': count items (default 3) on top of target_id, inside
+      its edges, not overlapping each other; margin inset (default 12).
+    facing: which way the assets' front points at rotation 0: 'down' (DD's
+      own furniture), 'up', 'left', 'right'. scale, layer, color apply to all.
+    seed makes a jittered result reproducible. dry_run=True returns the
+    placements without placing anything.
+
+    Returns the placements (asset, x, y, rotation, scale), what was skipped
+    and why, and, when placed, the new ids and any placement refused as in
+    place_object(check=True).
+    """
+    if mode not in ("along_wall", "around_target", "on_surface"):
+        raise ValueError("mode must be 'along_wall', 'around_target' or 'on_surface'")
+    if not assets:
+        raise ValueError("give at least one asset")
+    specs = []
+    for asset in dict.fromkeys(assets):
+        spec = dict(bridge.request("asset_footprint", asset=asset))
+        spec["asset"] = asset
+        specs.append(spec)
+    snapshot = bridge.request("spatial_snapshot")
+    if mode == "along_wall":
+        if along is None or len(along) != 2:
+            raise ValueError("along_wall needs along=[[x0, y0], [x1, y1]]")
+        plan = layout.arrange_along_wall(
+            specs, snapshot.get("walls", []), along, doors=snapshot.get("portals", []),
+            wall_id=wall_id, toward=toward, count=count, gap=gap,
+            margin=32.0 if margin is None else margin, facing=facing, scale=scale)
+        overlap_ok = False
+    else:
+        if target_id is None:
+            raise ValueError(f"{mode} needs target_id (the table or surface, an object id)")
+        target = spatial.find_object(snapshot, target_id)
+        if target is None:
+            raise ValueError(f"no object with id {target_id} on this level")
+        if mode == "around_target":
+            plan = layout.arrange_around_target(
+                specs, target, count=4 if count is None else count, shape=shape,
+                clearance=clearance, jitter=jitter, facing=facing, scale=scale, seed=seed)
+            overlap_ok = clearance < 0
+        else:
+            plan = layout.arrange_on_surface(
+                specs, target, count=3 if count is None else count,
+                margin=12.0 if margin is None else margin, scale=scale, seed=seed)
+            overlap_ok = True
+    result = dict(plan)
+    result["mode"] = mode
+    if dry_run or not plan["placements"]:
+        result["placed"] = 0
+        return result
+    calls = []
+    for placed in plan["placements"]:
+        args = {"asset": placed["asset"], "x": placed["x"], "y": placed["y"],
+                "rotation": placed["rotation"], "scale": placed["scale"], "layer": layer,
+                "check": True, "allow_overlap": overlap_ok}
+        if color:
+            args["color"] = color
+        calls.append({"tool": "place_object", "args": args})
+    run = _run_calls(calls, stop_on_error=False, single_undo=True, label=f"arrange_{mode}")
+    result["ids"] = [r["result"]["id"] for r in run["results"] if r["ok"]]
+    result["refused"] = [{"placement": plan["placements"][i], "error": r["error"]}
+                         for i, r in enumerate(run["results"]) if not r["ok"]]
+    result["placed"] = len(result["ids"])
+    return result
+
+
+@_tool()
+def get_map_style() -> dict:
+    """Read the map-wide finishing effects: building wear and grid line style. Read-only.
+
+    Reports the current building_wear (none, or a wear texture's name) with
+    every option the Map Settings tool offers, and the grid_style (dashes,
+    dotted, narrow_line, thick_line).
+    """
+    return bridge.request("get_map_style")
+
+
+@_tool()
+def set_map_style(building_wear: str = "", grid_style: str = "") -> dict:
+    """Set map-wide finishing effects, as one undoable edit.
+
+    building_wear: an option name from get_map_style ('none' clears it), or
+      its index. It applies to building floors and walls on every level, so
+      use it only when that global look fits the map.
+    grid_style: 'dashes', 'dotted', 'narrow_line' or 'thick_line'. This is
+      the grid's line pattern, not whether the grid shows (set_grid) or is
+      exported (export_map).
+    """
+    params: dict = {}
+    if building_wear:
+        params["building_wear"] = building_wear
+    if grid_style:
+        params["grid_style"] = grid_style
+    if not params:
+        raise ValueError("give building_wear and/or grid_style")
+    return bridge.request("set_map_style", **params)
+
+
+@_tool()
+def list_prefabs(set: str = "") -> dict:
+    """List Dungeondraft's prefabs: groups saved with the Prefab tool, ready to place.
+
+    Returns the prefab sets, and the prefabs in the selected set (name one
+    with set to see its prefabs). Prefabs are the user's own saved groups,
+    so a fresh install may have none.
+    """
+    return bridge.request("list_prefabs", **({"set": set} if set else {}))
+
+
+@_tool()
+def place_prefab(name: str, set: str = "", x: Optional[float] = None, y: Optional[float] = None) -> dict:
+    """Place a prefab by name, as the Prefab tool would, in ONE undo step.
+
+    name: a prefab from list_prefabs; set: its set when it is not in the
+    selected one. x, y: where the group's centre lands (woxels); omitted, it
+    lands where it was saved. Props, lights, free portals and texts are
+    moved; walls, paths, roofs and pattern floors keep their saved position
+    (their ids come back as unmoved). Returns the new element ids.
+    """
+    params: dict = {"name": name}
+    if set:
+        params["set"] = set
+    if x is not None:
+        params["x"] = x
+    if y is not None:
+        params["y"] = y
+    return bridge.request("place_prefab", **params)
+
+
+@_tool()
+def generator_options() -> dict:
+    """Read the Map Wizard's generator settings: the design (Dungeon or Cave) and its dials with their ranges. Read-only."""
+    return bridge.request("generator_options")
+
+
+@_tool()
+def generate_dungeon(
+    design: str = "",
+    boundary: Optional[float] = None,
+    complexity: Optional[float] = None,
+    density: Optional[float] = None,
+) -> dict:
+    """Run Dungeondraft's own Map Wizard generator: a whole dungeon or cave layout in one call.
+
+    design: 'Dungeon' (rooms and corridors) or 'Cave' (organic caverns);
+    omitted, the wizard's current choice. boundary, complexity, density: the
+    wizard's dials, within the ranges generator_options reports. The layout
+    is ADDED to the current level, so run it on an empty level (add_level,
+    then set_level) and save_map first: it is NOT undoable through the
+    bridge. Returns the element counts before and after.
+    """
+    params: dict = {}
+    if design:
+        params["design"] = design
+    for key, value in (("boundary", boundary), ("complexity", complexity), ("density", density)):
+        if value is not None:
+            params[key] = value
+    return bridge.request("generate_dungeon", **params)
+
+
+# --------------------------------------------------------------------------
+# Map files and asset packs (offline readers, see mapfile.py / packs.py)
+# --------------------------------------------------------------------------
+
+def _installed_packs() -> tuple[Optional[dict], list[str]]:
+    """Installed packs by id (None when the pack folder is unknown), plus notes."""
+    try:
+        return packs.installed()["packs"], []
+    except packs.PackError as exc:
+        return None, [str(exc)]
+
+
+@_tool()
+def inspect_map_file(path: str, compare_to: str = "") -> dict:
+    """Summarise a .dungeondraft_map file without opening it. Read-only; works with Dungeondraft closed.
+
+    Reports what a render cannot show: the packs the map includes and whether
+    each is installed (packs_missing are dropped when it opens), its size,
+    and per level the counts per kind, the most used textures with the pack
+    each comes from, object scales, terrain slot shares, materials, doors and
+    windows whose closed flag contradicts their name (a Universal VTT export
+    treats each as the other), lights and texts. compare_to: a second map
+    file to diff against (counts, textures, packs, terrain). Handy for maps
+    you download or are sent, and for two versions of one map.
+    """
+    found, notes = _installed_packs()
+    out = mapfile.inspect(Path(path), installed=None if found is None else list(found),
+                          compare_to=Path(compare_to) if compare_to else None)
+    if notes:
+        out.setdefault("notes", []).extend(notes)
+    return out
+
+
+@_tool()
+def list_asset_packs() -> dict:
+    """Which asset packs are installed, and which this map can actually use.
+
+    Dungeondraft scopes packs per MAP: a map includes a set of packs, chosen
+    when it was created, and list_assets only ever offers assets from those.
+    A map that includes none sees roughly 1800 core assets however large the
+    library is, and nothing fails: it quietly builds everything from the core
+    set. installed_but_not_in_this_map are mounted but invisible here, and an
+    object placed from one would not survive a reload. prepare_map_with_packs
+    adds packs to a copy of the map; search_pack_contents looks inside packs
+    the map lacks. active_for_new_maps is what a new map would include.
+    """
+    out = bridge.request("list_asset_packs")
+    try:
+        out["active_for_new_maps"] = packs.active_pack_ids()
+        out["pack_folder"] = str(packs.assets_directory())
+    except packs.PackError as exc:
+        out["note"] = str(exc)
+    return out
+
+
+@_tool()
+def search_pack_contents(
+    terms: list[str],
+    category: str = "Objects",
+    pack_ids: Optional[list[str]] = None,
+    limit: int = 20,
+) -> dict:
+    """Search INSIDE every installed asset pack, including packs this map lacks. Read-only; Dungeondraft need not be running.
+
+    list_assets sees only the packs this map includes. Use this to choose
+    packs by what they contain: terms are words in any order ('round table',
+    'hay bale'), matched against each asset's path and the pack's tags and
+    ranked by filename similarity; a term with no hits is retried with an
+    equivalent wording (rug/carpet, armour/armor...) and says so. category:
+    as in list_assets. pack_ids restricts the search. Packs whose authors
+    opted out of third-party reading are listed as not_searched. Only each
+    pack's file index and tags are read, never the art.
+    """
+    found = packs.installed()["packs"]
+    return packs.search(found, terms, category, pack_ids=pack_ids, limit=limit)
+
+
+@_tool()
+def prepare_map_with_packs(pack_ids: list[str], destination: str = "") -> dict:
+    """Copy the open map into one that INCLUDES more asset packs, and open the copy.
+
+    A map's set of packs is fixed when it is created, so a map made without
+    a pack can never reach its assets. This writes a copy of the saved map
+    file whose header includes the given packs (ids from list_asset_packs or
+    search_pack_contents) and opens it; the original file is left as it was.
+    destination: the new file's path (default: beside the original, with
+    '-packs' added to the name). Save first: the copy is made from the file
+    on disk, and open_map discards unsaved changes. Not undoable.
+    """
+    if not pack_ids:
+        raise ValueError("give at least one pack id")
+    src = bridge.request("get_current_map").get("path") or ""
+    if not src:
+        raise ValueError("the map has never been saved; save it in Dungeondraft first")
+    found = packs.installed()["packs"]
+    infos = [pack.info for pack in found.values()]
+    unknown = mapfile.unknown_ids(infos, pack_ids)
+    if unknown:
+        raise ValueError(f"not installed: {unknown}; installed ids: {sorted(found)}")
+    source = Path(src)
+    dest = Path(destination) if destination else source.with_name(f"{source.stem}-packs{source.suffix}")
+    if dest.suffix != ".dungeondraft_map":
+        raise ValueError("destination must end in .dungeondraft_map")
+    report = mapfile.prepare_copy(source, dest, mapfile.build_manifest(infos, pack_ids))
+    report["opening"] = bridge.request("open_map", path=str(dest))
+    return report
+
+
+@_tool()
+def import_dd2vtt(
+    path: str,
+    confirm: bool = False,
+    walls: bool = True,
+    portals: bool = True,
+    lights: bool = True,
+    ambient: bool = True,
+    trace: bool = True,
+    wall_asset: str = "",
+    door_asset: str = "",
+    window_asset: str = "",
+) -> dict:
+    """Rebuild a Universal VTT export (.dd2vtt) on the open map: walls, doors and windows, lights and ambient light, with the export's image underneath as a trace to follow.
+
+    Without confirm it only reads the file and reports the plan: the map size
+    it needs, counts and notes. Show the user, then call again with
+    confirm=True. It recreates walls from line_of_sight (rejoined through each
+    doorway so every door mounts on a wall), portals at their exported width
+    (closed ones as door_asset, open ones as window_asset; by default the
+    first door and window in the Portals category), lights with their colour,
+    range and shadows, and the ambient light; the image goes under the map as
+    a trace at the right scale. It does not pick art: blocking_objects says
+    where each sight-blocking object stood and its size, so you can place
+    something matching. The map must already be the export's size (see
+    map_size_tiles and needs_resize). The rebuild is ONE undo step; the
+    ambient light and trace image are not undoable.
+    """
+    source = Path(path)
+    if not source.is_file():
+        raise ValueError(f"file not found: {path}")
+    parsed = uvtt_import.parse(source.read_bytes())
+    status = bridge.request("get_status")
+    size = status.get("map_size_woxels")
+    tiles = [size[0] / 256, size[1] / 256] if size else None
+    plan = uvtt_import.plan(parsed, current_map_size_tiles=tiles)
+    plan["confirm"] = confirm
+    if not confirm:
+        plan["note"] = "nothing was changed; call again with confirm=True to rebuild"
+        return plan
+    if plan.get("needs_resize"):
+        raise ValueError(f"the map is {tiles} tiles but the export needs {plan['map_size_tiles']}; "
+                         "make a map of that size first")
+    if portals and plan["portals"]:
+        door_asset = door_asset or _first_asset("Portals", "door")
+        window_asset = window_asset or _first_asset("Portals", "window") or door_asset
+    made: dict = {"walls": [], "portals": [], "lights": [], "ambient_light": None, "trace_image": None,
+                  "skipped": []}
+    with _undo_group("import_dd2vtt"):
+        if walls:
+            for wall in plan["walls"]:
+                made["walls"].append(draw_wall(wall["points"], asset=wall_asset, loop=wall["loop"])["id"])
+        if portals:
+            for portal in plan["portals"]:
+                asset = door_asset if portal["kind"] == "door" else window_asset
+                try:
+                    made["portals"].append(add_portal(
+                        asset, x=portal["x"], y=portal["y"], closed=portal["closed"],
+                        radius=portal["radius"], mount=portal["mount"], flip=portal["flip"],
+                        rotation=portal["rotation_degrees"])["id"])
+                except BridgeError as exc:
+                    made["skipped"].append({"portal": portal, "error": str(exc)})
+        if lights:
+            for light in plan["lights"]:
+                made["lights"].append(add_light(
+                    x=light["x"], y=light["y"], color=light["color"], energy=light["energy"],
+                    range=light["range"], shadows=light["shadows"])["id"])
+    if ambient and plan.get("ambient_light"):
+        made["ambient_light"] = configure_level(ambient_light=plan["ambient_light"]).get("ambient_light")
+    if trace and plan.get("trace"):
+        image = uvtt_import.decode_image(parsed)
+        trace_path = _TRACE_PATH + image.suffix
+        with open(trace_path, "wb") as handle:
+            handle.write(image.data)
+        made["trace_image"] = set_trace_image(trace_path, x=plan["trace"]["x"], y=plan["trace"]["y"],
+                                              scale=plan["trace"]["scale"], opacity=plan["trace"]["opacity"])
+    return {"confirm": True, "summary": plan["summary"], "made": made,
+            "blocking_objects": plan.get("blocking_objects", []), "notes": plan.get("notes", [])}
+
+
+def _first_asset(category: str, search: str) -> str:
+    found = bridge.request("list_assets", category=category, search=search, limit=1).get("assets", [])
+    return found[0] if found else ""
+
+
+# --------------------------------------------------------------------------
+# History: checkpoints, grouped edits
+# --------------------------------------------------------------------------
+
+@_tool()
+def checkpoint(label: str) -> dict:
+    """Mark a point in history, so everything after it can be undone in one call.
+
+    Call it before a multi-step change (a room, a set piece, a lighting
+    pass); rollback_checkpoint(label) then undoes every edit made since,
+    newest first. Reusing a label moves its mark to now. History keeps the
+    last 200 steps, so a checkpoint older than that can no longer be reached.
+    """
+    return bridge.request("checkpoint", label=label)
+
+
+@_tool()
+def rollback_checkpoint(label: str) -> dict:
+    """Undo every edit made since checkpoint(label), in one call.
+
+    Reports how many steps it reversed and their kinds. The checkpoint stays
+    open, so a second attempt can be rolled back to the same point. Refuses,
+    changing nothing, when history no longer reaches it. Edits that are not
+    undoable (delete_level, set_terrain_slot, native_* and ui_* calls) are
+    not reversed.
+    """
+    return bridge.request("rollback_checkpoint", label=label)
+
+
+@_tool()
+def list_checkpoints() -> dict:
+    """List the open checkpoints: label, steps made since, and whether a rollback still reaches it."""
+    return bridge.request("list_checkpoints")
+
+
+@_tool()
+def place_objects(objects: list[dict], stop_on_error: bool = True) -> dict:
+    """Place many objects at chosen positions in ONE call and ONE undo() step.
+
+    objects: up to 100 entries, each with exactly place_object's arguments:
+    {"asset": ..., "x": ..., "y": ..., "rotation": ..., "scale": ...,
+    "layer": ..., "color": ..., "check": ..., "allow_overlap": ...}. Use it
+    when you know where several things go: a row of tables, the dressing on a
+    bar, eight trees ringing a clearing. scatter_objects is for RANDOM
+    placement over an area.
+
+    Returns one entry per object: {ok, result} with the new id, or {ok:
+    false, error}. With stop_on_error (the default) it stops at the first
+    refusal; what was placed before stays, and one undo() removes all of it.
+    """
+    if not 1 <= len(objects) <= 100:
+        raise ValueError("give 1 to 100 objects")
+    calls = [{"tool": "place_object", "args": o} for o in objects]
+    return _run_calls(calls, stop_on_error, single_undo=True, label="place_objects")
+
+
+@_tool()
+def move_elements(ids: list[int], dx: float, dy: float) -> dict:
+    """Move several elements by the same offset, in one call and ONE undo() step.
+
+    ids: up to 100 element ids; dx, dy: the offset in woxels. Every id is
+    read first, so an unknown id moves nothing. The placement check is not
+    applied here; move_element(check=True) checks one object at a time.
+    """
+    if not 1 <= len(ids) <= 100:
+        raise ValueError("give 1 to 100 ids")
+    before = {int(i): bridge.request("get_element", id=int(i)) for i in dict.fromkeys(ids)}
+    for i, el in before.items():
+        if not isinstance(el.get("position"), list):
+            raise ValueError(f"element {i} has no position to move")
+    moved = []
+    with _undo_group("move_elements"):
+        for i, el in before.items():
+            x, y = el["position"][0] + dx, el["position"][1] + dy
+            res = bridge.request("move_element", id=i, x=x, y=y)
+            moved.append({"id": i, "position": res.get("position", [x, y])})
+    return {"moved": len(moved), "dx": dx, "dy": dy, "elements": moved}
+
+
+@_tool()
+def delete_level(index: int) -> dict:
+    """Delete a level (floor) by its index (see list_levels). NOT undoable.
+
+    Dungeondraft frees the level and everything on it, so save_map first if
+    in doubt. The last remaining level cannot be deleted; deleting the
+    current level switches the editor to a neighbour first. Returns the
+    level list, with the deleted level's id and label.
+    """
+    return bridge.request("delete_level", index=index)
 
 
 # --------------------------------------------------------------------------
@@ -1745,8 +2445,8 @@ def redo() -> dict:
 _NOT_BATCHABLE = {"batch", "screenshot", "export_map", "export_uvtt", "open_map"}
 
 
-@mcp.tool()
-def batch(calls: list[dict], stop_on_error: bool = True) -> dict:
+@_tool()
+def batch(calls: list[dict], stop_on_error: bool = True, single_undo: bool = True) -> dict:
     """Run several tool calls in order in one request. Use it for runs of independent edits.
 
     calls: [{"tool": "<tool name>", "args": {...}}, ...] (up to 100), with the
@@ -1759,11 +2459,19 @@ def batch(calls: list[dict], stop_on_error: bool = True) -> dict:
 
     Returns one entry per call that ran: {tool, ok, result} or {tool, ok: false,
     error}. With stop_on_error (the default) the batch stops at the first
-    failure, leaving the earlier calls done: it is not all-or-nothing. Each
-    edit is still its own undo() step.
+    failure, leaving the earlier calls done: it is not all-or-nothing. With
+    single_undo (the default) every edit in the batch is ONE undo() step;
+    pass False to keep each edit its own step.
     """
     if not 1 <= len(calls) <= 100:
         raise ValueError("give 1 to 100 calls")
+    return _run_calls(calls, stop_on_error, single_undo, label="batch")
+
+
+def _run_calls(calls: list[dict], stop_on_error: bool, single_undo: bool, label: str) -> dict:
+    if single_undo:
+        with _undo_group(label):
+            return _run_calls(calls, stop_on_error, False, label)
     results: list[dict] = []
     for call in calls:
         name = call.get("tool", "") if isinstance(call, dict) else ""

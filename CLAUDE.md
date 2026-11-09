@@ -26,16 +26,27 @@ blindly.
 - Every element has an integer `id`; create calls return it, `list_elements` /
   `get_element` report it. Feed ids back into move/modify/delete.
 - Discover assets with `list_assets` (it takes a `category` and a substring
-  `search`); list categories with `list_asset_categories`.
+  `search`); list categories with `list_asset_categories`. A map only sees
+  the asset packs it includes: `list_asset_packs` says which, and a map made
+  without packs silently sees just the core assets. `search_pack_contents`
+  looks inside every installed pack; `prepare_map_with_packs` gives a copy of
+  the map more packs.
 - **Look at your work**: `screenshot` (current view) and the camera tools
   (`set_camera`, `focus_element`, `fit_elements`) return/aim the view so you can
   inspect what you built and iterate. Use them.
 - The bridge keeps its **own** `undo` / `redo` stacks (independent of DD's
-  Ctrl+Z). `delete_element` is **not** undoable.
-- **Furnishing a room:** read `get_asset_footprint` before choosing a scale
-  (sprites vary wildly in size), place with `check=True` so an object that
-  would cross a wall, block a door or overlap another is refused with the
-  reason, and run `validate_layout` when done. A refusal means nothing changed:
+  Ctrl+Z). Deletes are undoable; `batch`, `scatter_objects`, `build_room`,
+  `place_objects`, `move_elements` and `delete_elements` are each ONE undo
+  step. `checkpoint(label)` before a multi-step change lets
+  `rollback_checkpoint(label)` take all of it back. `delete_level` is not
+  undoable.
+- **Furnishing a room:** run `validate_floorplan` first (is every room
+  reachable, does every door open onto something), read `get_asset_footprint`
+  before choosing a scale (sprites vary wildly in size), place with
+  `check=True` so an object that would cross a wall, block a door or overlap
+  another is refused with the reason, use `arrange_objects` for a row along a
+  wall, seats around a table or items on a surface, and run `validate_layout`
+  and `validate_scene` (bare ground, lights with no source) when done. A refusal means nothing changed:
   move, turn or shrink the object rather than dropping the check. Overlaps that
   are intended (chairs under a table, canopies) take `allow_overlap=True`, or a
   different `layer` (rugs lower, tabletop items higher). Footprints are
@@ -44,7 +55,10 @@ blindly.
   on one layer later objects cover earlier ones, and a higher layer always wins.
 - `configure_level(ambient_light=...)` sets the mood (a dark blue for night
   makes the placed lights glow). `batch` runs many independent edits in one
-  call, and `scatter_objects` fills an area with trees or rubble.
+  call, and `scatter_objects` fills an area with trees or rubble. Light
+  `range` is Dungeondraft's own Range (what its Light tool shows); a door
+  placed with `add_portal` is closed (blocks sight) unless the asset is a
+  window, which is what VTT exports go by.
 - Levels are listed **top floor first**; a level's `index` shifts when levels
   are added or cloned (new ones land at index 0). Its `id` holds while the map
   is open but is reassigned on load.
