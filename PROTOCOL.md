@@ -15,8 +15,9 @@ Every request except `ping` must carry `"token": "<64 hex chars>"`. The mod
 writes a random token to Dungeondraft's user folder on first start
 (`user://mcp_bridge_token`, the folder that holds `config.ini`), and the
 Python server reads that file for every request (`DD_BRIDGE_TOKEN_FILE` and
-`DD_BRIDGE_TOKEN` override it, and the server sets the file to mode 0600 on
-POSIX). A request without the right token gets `{ ok: false, error: "bad
+`DD_BRIDGE_TOKEN` override it). On POSIX the mod runs `chmod 600` on the file
+as it writes it, and the server re-applies 0600 whenever it reads a looser
+mode; Godot's `File` cannot set permissions itself. A request without the right token gets `{ ok: false, error: "bad
 token: ..." }` or `"this bridge requires a token ..."`. The user can turn the
 requirement off ("Require token") or write a new token ("New token") in the
 **MCP Bridge** panel under Settings; the choice persists in
@@ -37,9 +38,15 @@ unreachable through `native_*` and `ui_action`.
 ## Request
 
 Any request may carry `"snap": true`: the mod then snaps its `x`/`y`, every
-entry of `points` and both corners of `rect` to the user's grid before the
-handler runs (`_snap_request`): the Custom Snap Mod's `get_snapped_position`
-when that mod is loaded, else `WorldUI.GetSnappedPosition` (half tiles).
+entry of `points` and a `rect` (origin and far corner; the size is kept when
+snapping would collapse it) to the user's grid before the handler runs
+(`_snap_request`): the Custom Snap Mod's `get_snapped_position` when that mod
+is loaded, else Dungeondraft's grid at the step its own tool for that kind
+uses: half a cell for objects, paths, portals, lights and texts, a whole cell
+for walls, floors, patterns and roofs unless the half-grid-snap preference is
+on. The server snaps `place_object`, `move_element`, `import_image` and
+`build_room` itself first (`get_snap_settings` with `for`), so a placement
+check judges the snapped spot.
 
 ```json
 { "cmd": "place_object", "id": 7, "asset": "objects/chair.png", "x": 100, "y": 200 }
@@ -186,7 +193,7 @@ polygon, >= 3 points, with some area).
 | `configure_level` | `ambient_light?`, `lighting?`, `terrain_visible?`, `smooth_terrain?`, `water_shoreline?` → `{ level_id, ambient_light, lighting, terrain_visible, smooth_terrain, water_shoreline }` (no params = just read) |
 | `set_trace_image` | `path` (empty = remove), `x?`, `y?`, `scale=1`, `opacity=0.5` → `{ trace_image, path?, position?, scale?, opacity?, image_size? }` |
 | `get_map_style` | — → `{ building_wear, building_wear_texture, building_wear_options: [{index, name, texture}], grid_style, grid_texture, grid_style_options }` (the Map Settings tool's wear list and `MapSettings.GRID_TEXTURES`) |
-| `get_snap_settings` | `points?[[x,y]...]` (≤200) → `{ vanilla_snapping, half_snap, cell_size, mod_loaded, mod?: { enabled, geometry, interval, offset, radius_to_corner, preset? }, snapped? }` (the Custom Snap Mod's `snappy_mod` tool instance when loaded) |
+| `get_snap_settings` | `points?[[x,y]...]` (≤200), `for?` (a command name: snap as that tool would) → `{ vanilla_snapping, half_grid_snap, cell_size, mod_loaded, mod?: { enabled, geometry, interval, offset, radius_to_corner, preset? }, snapped?, note }` (the Custom Snap Mod's `snappy_mod` tool instance when loaded; else half a cell, or a whole cell for `draw_wall` / `modify_wall` / `build_room` / `place_pattern` / `add_roof` unless `Preferences.HalfGridSnap`) |
 | `preview_assets` | `assets[]` (≤32), `category="Objects"`, `columns=4` (1–8), `cell_px=192` (64–512), `true_scale=false` → `{ path, columns, rows, cell_px, count, sizes[], missing[], largest_px, true_scale }`. Renders a contact sheet with Godot's Image (each texture's `get_data()`, resized and blended into a cell) to `user://mcp_bridge_preview.png`; `path` is that file's absolute path. |
 | `set_map_style` | `building_wear?` (option name or index), `grid_style?` (dashes / dotted / narrow_line / thick_line) → as `get_map_style`; applied through `MapSettings.SetBuildingWear` / `SetGridStyle`, undoable (`map_style` op snapshots `World.BuildingWear` and the grid texture) |
 | `list_prefabs` | `set?` → `{ sets, set, prefabs }` (the Prefab tool's Set dropdown and List; the tool is enabled for the read and disabled again unless it was active) |

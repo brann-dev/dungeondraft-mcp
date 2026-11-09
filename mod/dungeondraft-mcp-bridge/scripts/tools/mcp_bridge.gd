@@ -98,6 +98,7 @@ var _paused := false     # "Pause AI edits" in the panel: only READ_ONLY_CMDS ru
 var _panel = null
 var _panel_labels := {}  # key -> Label in the panel
 var _last_request := ""
+var _asset_sets := {}    # category -> { asset path: true }, see _asset_known
 var _colorable = null    # lazily built set of "Colorable"-tagged texture paths
 var _export = null       # export in flight: { grid_was, cam: {anchor, pos, zoom} }; see _finish_export
 
@@ -224,8 +225,9 @@ func _auth_error(req : Dictionary) -> String:
 		return ("this bridge requires a token and the request carried none: update the MCP server " +
 			"(0.4 or newer reads the token from Dungeondraft's user folder), or turn off " +
 			"'Require token' in Dungeondraft's MCP Bridge panel")
-	return ("bad token: the MCP server's token does not match this Dungeondraft's. Restart " +
-		"Dungeondraft and reconnect the server, or turn off 'Require token' in the MCP Bridge panel")
+	return ("bad token: the MCP server's token does not match this Dungeondraft's. If DD_BRIDGE_TOKEN " +
+		"or DD_BRIDGE_TOKEN_FILE is set on the server, it must point at this Dungeondraft's token; " +
+		"otherwise restart Dungeondraft, or turn off 'Require token' in the MCP Bridge panel")
 
 
 # Read the token the last start wrote, or make a new one (32 random bytes as
@@ -256,7 +258,11 @@ func _regenerate_token() -> String:
 		return ""
 	f.store_string(token)
 	f.close()
-	print("[mcp-bridge] wrote a new bridge token to %s" % ProjectSettings.globalize_path(TOKEN_FILE))
+	var real = ProjectSettings.globalize_path(TOKEN_FILE)
+	if OS.get_name() != "Windows":
+		# Godot's File cannot set permissions; keep other accounts out from the start.
+		OS.execute("chmod", ["600", real], true)
+	print("[mcp-bridge] wrote a new bridge token to %s" % real)
 	return token
 
 
@@ -1253,7 +1259,11 @@ func _is_colorable(prop) -> bool:
 	var tex = prop.get("Texture")
 	if tex == null or not (tex is Texture):
 		return false
-	var path = tex.resource_path
+	return _tex_colorable(tex)
+
+
+func _tex_colorable(tex) -> bool:
+	var path = str(tex.resource_path)
 	return path.find("colorable") != -1 or _colorable_paths().has(path)
 
 
@@ -2914,6 +2924,7 @@ func _save_map() -> Dictionary:
 # Refuses while a save is running: switching would cut the save off and lose
 # the user's work.
 func _open_map(req : Dictionary) -> Dictionary:
+	_asset_sets = {}   # the next map may include other packs
 	var path = req.get("path")
 	if typeof(path) != TYPE_STRING or path == "":
 		return _err("missing 'path'")
@@ -3364,8 +3375,10 @@ func _native_object(path : String):
 		return null   # the bridge's own panel is the user's, not the assistant's
 	var obj = _native_target(path)
 	if typeof(obj) == TYPE_OBJECT and is_instance_valid(obj):
-		if _inside_panel(obj):
+		if obj == self or _inside_panel(obj):
 			return null
+		if obj.has_method("get_ScriptInstance") and obj.get_ScriptInstance() == self:
+			return null   # the ModBaseTool that wraps this script
 		return obj
 	return null
 
@@ -4181,10 +4194,23 @@ func _texture_path(node, kind : int) -> String:
 func _asset_tex(category : String, asset):
 	if typeof(asset) != TYPE_STRING or asset == "":
 		return null
-	var all = Script.GetAssetList(category)
-	if all == null or not (asset in all):
+	if not _asset_known(category, asset):
 		return null
 	return Script.GetAssetTexture(category, asset)
+
+
+# The category's asset paths as a set, built once per category and dropped
+# when the map changes: GetAssetList copies the whole manifest each call.
+func _asset_known(category : String, asset : String) -> bool:
+	if not _asset_sets.has(category):
+		var all = Script.GetAssetList(category)
+		if all == null:
+			return false
+		var known := {}
+		for path in all:
+			known[str(path)] = true
+		_asset_sets[category] = known
+	return _asset_sets[category].has(asset)
 
 
 func _xy(req : Dictionary, fallback : Vector2) -> Vector2:
@@ -4486,8 +4512,7 @@ func _preview_assets(req : Dictionary) -> Dictionary:
 			continue
 		# A Colorable asset is drawn as the red mask the sheet shows; it takes
 		# a colour when placed.
-		var path = str(tex.resource_path)
-		colorable.append(path.find("colorable") != -1 or _colorable_paths().has(path))
+		colorable.append(_tex_colorable(tex))
 		img = img.duplicate()
 		if img.is_compressed():
 			img.decompress()
@@ -4541,48 +4566,77 @@ func _snap_mod():
 	return instance
 
 
+# Commands whose geometry Dungeondraft's own tools snap to whole tiles unless
+# the "half grid snap" preference is on (Wall, Floor, Pattern and Roof tools);
+# objects, paths, portals, lights and texts always snap to half tiles.
+const FULL_TILE_SNAP_CMDS := ["draw_wall", "modify_wall", "build_room", "place_pattern", "add_roof"]
+
+# Dungeondraft's own grid step for a command: half a cell, or a whole cell for
+# the wall-and-floor family when the user has not turned half-grid snap on.
+func _vanilla_snap_step(cmd : String) -> Vector2:
+	var cell = Vector2(256, 256)
+	if Global.WorldUI != null and typeof(Global.WorldUI.get("CellSize")) == TYPE_VECTOR2:
+		cell = Global.WorldUI.get("CellSize")
+	if cmd in FULL_TILE_SNAP_CMDS and not _half_grid_snap():
+		return cell
+	return cell * 0.5
+
+
+func _half_grid_snap() -> bool:
+	var prefs = Global.get("Preferences")
+	if prefs != null and prefs.get("HalfGridSnap") != null:
+		return bool(prefs.get("HalfGridSnap"))
+	return false
+
+
 # Where the user's cursor would snap: the Custom Snap Mod's grid when the mod
 # is loaded (it falls back to Dungeondraft's own when its snapping is off),
-# else Dungeondraft's half-tile grid. The editor's snap toggle is for the
-# mouse; a request that asks to snap always does.
-func _snap_point(p : Vector2) -> Vector2:
+# else Dungeondraft's grid at the step its own tool for that kind would use.
+# The editor's snap toggle is for the mouse; a request that asks to snap does.
+func _snap_point(p : Vector2, cmd : String = "") -> Vector2:
 	var mod = _snap_mod()
 	if mod != null:
 		var snapped = mod.get_snapped_position(p)
 		if typeof(snapped) == TYPE_VECTOR2:
 			return snapped
-	if Global.WorldUI != null and Global.WorldUI.has_method("GetSnappedPosition"):
-		return Global.WorldUI.GetSnappedPosition(p)
-	return Vector2(stepify(p.x, 128.0), stepify(p.y, 128.0))
+	var step = _vanilla_snap_step(cmd)
+	return Vector2(stepify(p.x, step.x), stepify(p.y, step.y))
 
 
-# Snap a request's x/y, every point and a rect's two corners in place, so
-# every handler (and the ones build_room dispatches inside) sees grid points.
+# Snap a request's x/y, every point and a rect in place, so every handler
+# (and the ones build_room dispatches inside) sees grid points. A rect keeps
+# its size when snapping both corners would collapse it.
 func _snap_request(req : Dictionary) -> void:
+	var cmd = str(req.get("cmd", ""))
 	if req.has("x") and req.has("y"):
-		var p = _snap_point(Vector2(float(req["x"]), float(req["y"])))
+		var p = _snap_point(Vector2(float(req["x"]), float(req["y"])), cmd)
 		req["x"] = p.x
 		req["y"] = p.y
 	if typeof(req.get("points")) == TYPE_ARRAY:
 		var out := []
 		for raw in req["points"]:
 			if typeof(raw) == TYPE_ARRAY and raw.size() >= 2:
-				var p2 = _snap_point(Vector2(float(raw[0]), float(raw[1])))
+				var p2 = _snap_point(Vector2(float(raw[0]), float(raw[1])), cmd)
 				out.append([p2.x, p2.y])
 			else:
 				out.append(raw)
 		req["points"] = out
 	if typeof(req.get("rect")) == TYPE_ARRAY and req["rect"].size() >= 4:
 		var r = req["rect"]
-		var a = _snap_point(Vector2(float(r[0]), float(r[1])))
-		var b = _snap_point(Vector2(float(r[0]) + float(r[2]), float(r[1]) + float(r[3])))
-		req["rect"] = [a.x, a.y, b.x - a.x, b.y - a.y]
+		var a = _snap_point(Vector2(float(r[0]), float(r[1])), cmd)
+		var b = _snap_point(Vector2(float(r[0]) + float(r[2]), float(r[1]) + float(r[3])), cmd)
+		var w = b.x - a.x if b.x - a.x > 0.0 else float(r[2])
+		var h = b.y - a.y if b.y - a.y > 0.0 else float(r[3])
+		req["rect"] = [a.x, a.y, w, h]
 
 
 func _get_snap_settings(req : Dictionary) -> Dictionary:
-	var out := { "vanilla_snapping": bool(Global.Editor.IsSnapping), "mod_loaded": false }
+	var out := { "vanilla_snapping": bool(Global.Editor.IsSnapping), "mod_loaded": false,
+		"half_grid_snap": _half_grid_snap(),
+		"note": ("Dungeondraft snaps objects, paths, portals, lights and texts to half tiles; walls, " +
+			"floors, patterns and roofs to whole tiles unless half_grid_snap is on. The mod's grid, " +
+			"when loaded, applies to everything.") }
 	if Global.WorldUI != null:
-		out["half_snap"] = bool(Global.WorldUI.get("UseHalfSnap"))
 		var cell = Global.WorldUI.get("CellSize")
 		if typeof(cell) == TYPE_VECTOR2:
 			out["cell_size"] = [cell.x, cell.y]
@@ -4606,9 +4660,10 @@ func _get_snap_settings(req : Dictionary) -> Dictionary:
 	if typeof(points) == TYPE_ARRAY and not points.empty():
 		if points.size() > 200:
 			return _err("'points' is capped at 200")
+		var kind = str(req.get("for", ""))   # a command name, to snap as that tool would
 		var snapped := []
 		for p in _points(points):
-			snapped.append(_vec(_snap_point(p)))
+			snapped.append(_vec(_snap_point(p, kind)))
 		out["snapped"] = snapped
 	return _ok(out)
 
@@ -4690,6 +4745,9 @@ func _set_map_size(req : Dictionary) -> Dictionary:
 		right -= dr
 		bottom -= db
 		steps += 1
+	# Dungeondraft has resized and cleared its own history by now, whatever the
+	# outcome: terrain and cave snapshots in ours have the old size.
+	_forget_history()
 	var now_w = int(Global.World.Width)
 	var now_h = int(Global.World.Height)
 	if now_w != w or now_h != h:
@@ -4705,9 +4763,6 @@ func _set_map_size(req : Dictionary) -> Dictionary:
 	if not stale.empty():
 		return _err(("the map is %dx%d but the terrain of level(s) %s was not resized with it; " +
 			"do not save this map: reopen it") % [w, h, str(stale)])
-	# Terrain and cave snapshots in history have the old size; Dungeondraft
-	# cleared its own history too. Forget ours rather than restore wrongly.
-	_forget_history()
 	return _ok({
 		"width_tiles": w, "height_tiles": h, "previous_tiles": [old_w, old_h], "changed": true,
 		"map_size_woxels": [Global.World.WoxelDimensions.x, Global.World.WoxelDimensions.y],
@@ -5046,8 +5101,8 @@ func _register_tool():
 	if regen != null:
 		regen.connect("pressed", self, "_on_panel_new_token")
 	panel.CreateNote("Pause and the token are yours: the assistant can read them but cannot " +
-		"change them. The MCP server reads the token from Dungeondraft's user folder; " +
-		"after a new token, reconnect it.")
+		"change them. The MCP server reads the token from Dungeondraft's user folder on " +
+		"every request, so a new token takes effect at once.")
 	_refresh_panel()
 
 
