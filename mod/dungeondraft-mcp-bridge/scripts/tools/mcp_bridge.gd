@@ -4706,10 +4706,13 @@ func _map_size_side(win, side : String, value : int) -> void:
 	win.call("_on_%sSpinBox_value_changed" % side, float(value))
 
 
-# Grow or trim the map on its right and bottom edges, in tiles. The top-left
-# corner stays, so nothing placed moves. The top and left edges are not
-# offered: Dungeondraft's own trim there loses terrain paint near the far
-# edges and leaves cave borders behind their floor.
+# Resize the map, in tiles. `left` and `top` are tiles added (positive) or
+# trimmed (negative) on those edges; the rest of the change goes to the right
+# and bottom. Dungeondraft shifts every element by the left/top offset
+# itself. Its own terrain and cave handling of that shift is wrong (paint lost
+# near the far edges, cave borders left behind their floor), so every level's
+# splat is snapshotted first and a correctly offset copy restored afterwards,
+# and every cave mesh is finalised.
 func _set_map_size(req : Dictionary) -> Dictionary:
 	if not req.has("width") or not req.has("height"):
 		return _err("'width' and 'height' are required, in tiles")
@@ -4725,28 +4728,42 @@ func _set_map_size(req : Dictionary) -> Dictionary:
 			"create the map at the size you need from the New Map dialog")
 	var old_w = int(Global.World.Width)
 	var old_h = int(Global.World.Height)
-	var right = w - old_w
-	var bottom = h - old_h
-	if right == 0 and bottom == 0:
+	var left = int(req.get("left", 0))
+	var top = int(req.get("top", 0))
+	var right = w - old_w - left
+	var bottom = h - old_h - top
+	if left == 0 and top == 0 and right == 0 and bottom == 0:
 		return _ok({ "width_tiles": w, "height_tiles": h, "changed": false })
 	# The spin boxes cap each step; a bigger change takes several.
 	var limit := 64
 	var probe = win.find_node("RightSpinBox", true, false)
 	if probe != null and probe.get("max_value") != null:
 		limit = int(max(1, min(abs(probe.min_value), probe.max_value)))
+	var shifted := false
 	var steps := 0
-	while (right != 0 or bottom != 0) and steps < 32:
+	while (left != 0 or top != 0 or right != 0 or bottom != 0) and steps < 32:
+		var dl = int(clamp(left, -limit, limit))
+		var dt = int(clamp(top, -limit, limit))
 		var dr = int(clamp(right, -limit, limit))
 		var db = int(clamp(bottom, -limit, limit))
+		var before = _resize_snapshot() if (dl != 0 or dt != 0) else null
 		win.call("_on_ChangeMapSizeWindow_about_to_show")
+		_map_size_side(win, "Left", dl)
+		_map_size_side(win, "Top", dt)
 		_map_size_side(win, "Right", dr)
 		_map_size_side(win, "Bottom", db)
 		win.call("_on_OkayButton_pressed")
+		if before != null:
+			_resize_repair(before, dl, dt)
+			shifted = true
+		left -= dl
+		top -= dt
 		right -= dr
 		bottom -= db
 		steps += 1
 	# Dungeondraft has resized and cleared its own history by now, whatever the
-	# outcome: terrain and cave snapshots in ours have the old size.
+	# outcome: terrain and cave snapshots in ours have the old size, and every
+	# element may have moved.
 	_forget_history()
 	var now_w = int(Global.World.Width)
 	var now_h = int(Global.World.Height)
@@ -4763,13 +4780,81 @@ func _set_map_size(req : Dictionary) -> Dictionary:
 	if not stale.empty():
 		return _err(("the map is %dx%d but the terrain of level(s) %s was not resized with it; " +
 			"do not save this map: reopen it") % [w, h, str(stale)])
+	var shift = [int(req.get("left", 0)) * 256, int(req.get("top", 0)) * 256]
 	return _ok({
 		"width_tiles": w, "height_tiles": h, "previous_tiles": [old_w, old_h], "changed": true,
 		"map_size_woxels": [Global.World.WoxelDimensions.x, Global.World.WoxelDimensions.y],
-		"steps": steps, "history_cleared": true,
-		"note": "the map grew or shrank on the right and bottom; nothing placed moved, and " +
-			"shrinking does not delete what now lies outside the map",
+		"content_shift_woxels": shift, "steps": steps, "history_cleared": true,
+		"note": ("Dungeondraft moved everything by content_shift_woxels; shrinking does not delete " +
+			"what now lies outside the map") if shifted else
+			("the map grew or shrank on the right and bottom; nothing placed moved, and shrinking " +
+			"does not delete what now lies outside the map"),
 	})
+
+
+# Every level's splat image(s) and the trace image's position, before a
+# resize that shifts content.
+func _resize_snapshot() -> Dictionary:
+	var splats := []
+	for lvl in Global.World.levels:
+		if lvl == null or lvl.Terrain == null:
+			continue
+		splats.append({ "level": lvl, "splat": lvl.Terrain.CloneSplatImage(),
+			"splat2": lvl.Terrain.CloneSplatImage2() if lvl.Terrain.ExpandedSlots else null })
+	var trace = Global.World.get("TraceImage")
+	var trace_at = null
+	if trace != null and is_instance_valid(trace) and trace.get("texture") != null:
+		trace_at = trace.position
+	return { "splats": splats, "trace_at": trace_at }
+
+
+# The old splat copied into an image of the new size, moved by the offset
+# (tiles, either sign); what falls outside is dropped, what is uncovered is
+# the unpainted base.
+func _resize_splat(img, left : int, top : int, size : Vector2):
+	if not (img is Image):
+		return null
+	var out = Image.new()
+	out.create(int(size.x), int(size.y), false, img.get_format())
+	out.fill(Color(1, 0, 0, 0))
+	var dx = left * SPLAT_PX_PER_TILE
+	var dy = top * SPLAT_PX_PER_TILE
+	var src_x = int(max(0, -dx))
+	var src_y = int(max(0, -dy))
+	var dst_x = int(max(0, dx))
+	var dst_y = int(max(0, dy))
+	var cw = int(min(img.get_width() - src_x, size.x - dst_x))
+	var ch = int(min(img.get_height() - src_y, size.y - dst_y))
+	if cw > 0 and ch > 0:
+		out.blit_rect(img, Rect2(src_x, src_y, cw, ch), Vector2(dst_x, dst_y))
+	return out
+
+
+func _resize_repair(snap : Dictionary, left : int, top : int) -> void:
+	for entry in snap["splats"]:
+		var lvl = entry["level"]
+		if not is_instance_valid(lvl) or lvl.Terrain == null:
+			continue
+		var now = lvl.Terrain.CloneSplatImage()
+		if now == null:
+			continue
+		var img = _resize_splat(entry["splat"], left, top, now.get_size())
+		if img == null:
+			continue
+		var img2 = _resize_splat(entry["splat2"], left, top, now.get_size())
+		if img2 != null and lvl.Terrain.ExpandedSlots:
+			lvl.Terrain.RestoreSplat2(img, img2)
+		else:
+			lvl.Terrain.RestoreSplat(img)
+		lvl.Terrain.UpdateSplat()
+	for lvl in Global.World.levels:
+		var cave = lvl.get("CaveMesh") if lvl != null else null
+		if cave != null and is_instance_valid(cave) and cave.has_method("FinalizeMeshAndBorders"):
+			cave.FinalizeMeshAndBorders()
+	var trace = Global.World.get("TraceImage")
+	if snap["trace_at"] != null and trace != null and is_instance_valid(trace) \
+			and trace.position.distance_to(snap["trace_at"]) < 0.5:
+		trace.position = snap["trace_at"] + Vector2(left, top) * 256
 
 
 func _forget_history() -> void:
