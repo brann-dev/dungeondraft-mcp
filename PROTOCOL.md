@@ -36,6 +36,11 @@ unreachable through `native_*` and `ui_action`.
 
 ## Request
 
+Any request may carry `"snap": true`: the mod then snaps its `x`/`y`, every
+entry of `points` and both corners of `rect` to the user's grid before the
+handler runs (`_snap_request`): the Custom Snap Mod's `get_snapped_position`
+when that mod is loaded, else `WorldUI.GetSnappedPosition` (half tiles).
+
 ```json
 { "cmd": "place_object", "id": 7, "asset": "objects/chair.png", "x": 100, "y": 200 }
 ```
@@ -176,10 +181,13 @@ polygon, >= 3 points, with some area).
 | `reorder_levels` | `ids[]` (every level id once, top floor first) → level list |
 | `compare_levels` | `index=-1` (-1 = off), `reference_opacity=0.35`, `current_opacity=1` → `{ comparing, ... }` |
 | `delete_level` | `index` → level list + `{ deleted_id, deleted_label }`; refuses the last level; **not** undoable |
+| `set_map_size` | `width`, `height` (tiles, 8–128) → `{ width_tiles, height_tiles, previous_tiles, changed, map_size_woxels, steps, history_cleared }`. Drives the Change Map Size window (`Master.ChangeMapSize`): right and bottom edges only, every level's splat read back, the bridge's history cleared. **Not** undoable. |
 | `add_layer` | `layer` (z, -4096..4096), `label?` → layer list |
 | `configure_level` | `ambient_light?`, `lighting?`, `terrain_visible?`, `smooth_terrain?`, `water_shoreline?` → `{ level_id, ambient_light, lighting, terrain_visible, smooth_terrain, water_shoreline }` (no params = just read) |
 | `set_trace_image` | `path` (empty = remove), `x?`, `y?`, `scale=1`, `opacity=0.5` → `{ trace_image, path?, position?, scale?, opacity?, image_size? }` |
 | `get_map_style` | — → `{ building_wear, building_wear_texture, building_wear_options: [{index, name, texture}], grid_style, grid_texture, grid_style_options }` (the Map Settings tool's wear list and `MapSettings.GRID_TEXTURES`) |
+| `get_snap_settings` | `points?[[x,y]...]` (≤200) → `{ vanilla_snapping, half_snap, cell_size, mod_loaded, mod?: { enabled, geometry, interval, offset, radius_to_corner, preset? }, snapped? }` (the Custom Snap Mod's `snappy_mod` tool instance when loaded) |
+| `preview_assets` | `assets[]` (≤32), `category="Objects"`, `columns=4` (1–8), `cell_px=192` (64–512), `true_scale=false` → `{ path, columns, rows, cell_px, count, sizes[], missing[], largest_px, true_scale }`. Renders a contact sheet with Godot's Image (each texture's `get_data()`, resized and blended into a cell) to `user://mcp_bridge_preview.png`; `path` is that file's absolute path. |
 | `set_map_style` | `building_wear?` (option name or index), `grid_style?` (dashes / dotted / narrow_line / thick_line) → as `get_map_style`; applied through `MapSettings.SetBuildingWear` / `SetGridStyle`, undoable (`map_style` op snapshots `World.BuildingWear` and the grid texture) |
 | `list_prefabs` | `set?` → `{ sets, set, prefabs }` (the Prefab tool's Set dropdown and List; the tool is enabled for the read and disabled again unless it was active) |
 | `place_prefab` | `name`, `set?`, `x?`, `y?` → `{ prefab, ids, count, centre, unmoved?, note? }`. Selects the list item (`PrefabTool.OnSelectPrefab` deserialises the prefab into the level), shifts the movable pieces (props, lights, free portals, texts) so their centre lands on x,y, then `Confirm()`. One `group` undo op of the created nodes. |

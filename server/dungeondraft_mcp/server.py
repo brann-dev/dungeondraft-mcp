@@ -84,6 +84,8 @@ def _model_text(result: Any) -> Any:
     costs several times the tokens it needs to. Same serialiser, same
     fallbacks, no indentation. Images and strings pass through untouched.
     """
+    if isinstance(result, list) and any(isinstance(item, Image) for item in result):
+        return result   # an image with its caption: content blocks, not a JSON string
     if isinstance(result, (dict, list)):
         return pydantic_core.to_json(result, fallback=str).decode()
     return result
@@ -2108,6 +2110,34 @@ def arrange_objects(
                          for i, r in enumerate(run["results"]) if not r["ok"]]
     result["placed"] = len(result["ids"])
     return result
+
+
+@_tool()
+def preview_assets(
+    assets: list[str],
+    category: str = "Objects",
+    columns: int = 4,
+    cell_px: int = 192,
+    true_scale: bool = False,
+) -> list:
+    """LOOK at candidate assets before committing to one: one contact sheet of up to 32 assets. Read-only.
+
+    Asset names are not reliable descriptions: bench_01 may be a stone bench,
+    and that is easy to miss until it stands in a timber tavern. Cells are
+    laid out row-major in the order you passed them, so cell 1 is assets[0].
+    category: as in list_assets. columns 1-8, cell_px 64-512. true_scale=True
+    draws every asset at one scale, so a stool shows small beside a table.
+    Returns the sheet and a caption with each asset's pixel size and any
+    asset that could not be loaded.
+    """
+    if not 1 <= len(assets) <= 32:
+        raise ValueError("give 1 to 32 assets")
+    res = bridge.request("preview_assets", assets=assets, category=category, columns=columns,
+                         cell_px=cell_px, true_scale=true_scale)
+    caption = {"cells": [{"cell": i + 1, "asset": a, "size_px": res["sizes"][i]} for i, a in enumerate(assets)],
+               "columns": res["columns"], "rows": res["rows"], "true_scale": res["true_scale"],
+               "missing": res["missing"]}
+    return [Image(path=res["path"]), json.dumps(caption)]
 
 
 @_tool()

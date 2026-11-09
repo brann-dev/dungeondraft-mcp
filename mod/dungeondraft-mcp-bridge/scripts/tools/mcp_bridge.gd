@@ -52,7 +52,7 @@ const READ_ONLY_CMDS := [
 	"native_targets", "native_describe", "native_get", "ui_tree",
 	"spatial_snapshot", "asset_footprint", "list_spatial_regions", "list_checkpoints",
 	"get_map_style", "list_prefabs", "generator_options", "select_elements", "clear_selection",
-	"get_snap_settings",
+	"get_snap_settings", "preview_assets",
 ]
 # Neutral opaque tint for pattern floors when no color is given. PatternShapeTool
 # has no per-texture default (and its .Color leaks across calls), so we apply a
@@ -859,6 +859,7 @@ func _safe_dispatch(req : Dictionary) -> Dictionary:
 		"configure_level": return _configure_level(req)
 		"get_map_style": return _get_map_style()
 		"get_snap_settings": return _get_snap_settings(req)
+		"preview_assets": return _preview_assets(req)
 		"list_prefabs": return _list_prefabs(req)
 		"place_prefab": return _place_prefab(req)
 		"generator_options": return _generator_options()
@@ -4173,8 +4174,15 @@ func _texture_path(node, kind : int) -> String:
 	return ""
 
 
+# A category's texture by asset path, or null. Script.GetAssetTexture throws
+# a C# KeyNotFoundException for a path the library does not have, and every
+# Dungeondraft call later in the same handler then fails too, so the path is
+# checked against the category's list first.
 func _asset_tex(category : String, asset):
 	if typeof(asset) != TYPE_STRING or asset == "":
+		return null
+	var all = Script.GetAssetList(category)
+	if all == null or not (asset in all):
 		return null
 	return Script.GetAssetTexture(category, asset)
 
@@ -4441,6 +4449,71 @@ func _restore_map_style(snap : Dictionary) -> void:
 # ---------------------------------------------------------------------------
 # Prefabs (groups saved with the Prefab settings) and the Map Wizard generator
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Asset preview sheets
+# ---------------------------------------------------------------------------
+
+const PREVIEW_MAX_ASSETS := 32
+const PREVIEW_PATH := "user://mcp_bridge_preview.png"
+
+# One contact sheet of candidate assets, so comparing N of them costs one
+# image. Cells are row-major in the order given. Each asset is scaled to fit
+# its cell, or, with true_scale, every asset shares one scale so sizes compare.
+func _preview_assets(req : Dictionary) -> Dictionary:
+	var assets = req.get("assets", [])
+	if typeof(assets) != TYPE_ARRAY or assets.empty():
+		return _err("'assets' must be a non-empty array of asset paths")
+	if assets.size() > PREVIEW_MAX_ASSETS:
+		return _err("'assets' is capped at %d per sheet" % PREVIEW_MAX_ASSETS)
+	var category = str(req.get("category", "Objects"))
+	var cell = int(clamp(int(req.get("cell_px", 192)), 64, 512))
+	var columns = int(clamp(int(req.get("columns", 4)), 1, 8))
+	var true_scale = bool(req.get("true_scale", false))
+	var images := []
+	var sizes := []
+	var missing := []
+	var largest := 1.0
+	for a in assets:
+		var tex = _asset_tex(category, str(a))
+		var img = tex.get_data() if tex != null else null
+		if img == null:
+			missing.append(str(a))
+			images.append(null)
+			sizes.append(null)
+			continue
+		img = img.duplicate()
+		if img.is_compressed():
+			img.decompress()
+		img.convert(Image.FORMAT_RGBA8)
+		images.append(img)
+		sizes.append([img.get_width(), img.get_height()])
+		largest = max(largest, float(max(img.get_width(), img.get_height())))
+	var rows = int(ceil(float(assets.size()) / float(columns)))
+	var sheet = Image.new()
+	sheet.create(columns * cell, rows * cell, false, Image.FORMAT_RGBA8)
+	sheet.fill(Color(0.34, 0.34, 0.36, 1.0))
+	var pad := 8
+	for i in range(images.size()):
+		var img = images[i]
+		if img == null:
+			continue
+		var w = float(img.get_width())
+		var h = float(img.get_height())
+		var fit = float(cell - pad) / (largest if true_scale else max(w, h))
+		var tw = int(max(1.0, round(w * fit)))
+		var th = int(max(1.0, round(h * fit)))
+		img.resize(tw, th, Image.INTERPOLATE_BILINEAR)
+		var ox = (i % columns) * cell + (cell - tw) / 2
+		var oy = (i / columns) * cell + (cell - th) / 2
+		sheet.blend_rect(img, Rect2(0, 0, tw, th), Vector2(ox, oy))
+	var err = sheet.save_png(PREVIEW_PATH)
+	if err != OK:
+		return _err("could not write the preview sheet (error %d)" % err)
+	return _ok({ "path": ProjectSettings.globalize_path(PREVIEW_PATH), "columns": columns, "rows": rows,
+		"cell_px": cell, "count": assets.size(), "sizes": sizes, "missing": missing,
+		"largest_px": largest, "true_scale": true_scale })
+
 
 # ---------------------------------------------------------------------------
 # Snapping to the user's grid
