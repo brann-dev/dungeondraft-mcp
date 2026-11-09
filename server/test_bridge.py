@@ -128,6 +128,55 @@ def main() -> int:
         print("  SKIP  draw_material      -> no Materials assets")
 
     check("list_levels", lambda: bridge.request("list_levels"))
+
+    # --- layers ---
+    layers = check("list_layers", lambda: bridge.request("list_layers"))
+    if obj and layers:
+        def relayer():
+            res = bridge.request("set_element_layer", id=obj["id"], layer=100)
+            now = bridge.request("get_element", id=obj["id"])["layer"]
+            if now != 100:
+                raise BridgeError(f"object is on layer {now}, expected 100")
+            return res
+
+        check("set_element_layer", relayer)
+
+    # --- layout facts: footprints, one snapshot, a region set and removed again ---
+    check("asset_footprint", lambda: bridge.request("asset_footprint", asset=obj_asset))
+
+    def snapshot():
+        snap = bridge.request("spatial_snapshot", asset=obj_asset)
+        if obj and not any(o["id"] == obj["id"] for o in snap["objects"]):
+            raise BridgeError("the placed object is missing from the snapshot")
+        return {k: (len(v) if isinstance(v, list) else v) for k, v in snap.items() if k != "footprint"}
+
+    check("spatial_snapshot", snapshot)
+
+    def region_round_trip():
+        name = "test_bridge region"
+        bridge.request("set_spatial_region", name=name, kind="clearance", rect=[cx - 100, cy - 100, 200, 200])
+        listed = [r["name"] for r in bridge.request("list_spatial_regions")["regions"]]
+        left = [r["name"] for r in bridge.request("remove_spatial_region", name=name)["regions"]]
+        if name not in listed or name in left:
+            raise BridgeError(f"region not set and removed cleanly: listed={listed} left={left}")
+        return f"set, listed and removed ({len(left)} other region(s) untouched)"
+
+    check("spatial regions", region_round_trip)
+
+    # --- native access: read-only probes of DD's own objects and UI ---
+    check("native_targets", lambda: f"{len(bridge.request('native_targets')['targets'])} targets")
+
+    def describe_terrain():
+        res = bridge.request("native_describe", target="Level.Terrain", search="splat")
+        names = [m["name"] for m in res["methods"]]
+        if "RestoreSplat" not in names:
+            raise BridgeError(f"Terrain.RestoreSplat not found in {names}")
+        return f"{res['class']}: {names}"
+
+    check("native_describe", describe_terrain)
+    check("native_get", lambda: bridge.request(
+        "native_get", target="Level.Terrain", properties=["ExpandedSlots", "SmoothBlending", "visible"]))
+    check("ui_tree", lambda: f"{bridge.request('ui_tree', target='Tool:TerrainBrush')['matched']} controls in the Terrain Brush panel")
     if created_ids:
         check("select_elements", lambda: bridge.request("select_elements", ids=created_ids))
         check("clear_selection", lambda: bridge.request("clear_selection"))
@@ -158,8 +207,8 @@ def main() -> int:
             pass
     print(f"\nCleaned up {deleted}/{len(created_ids)} created elements.")
     print(f"\n{passed} passed, {failed} failed.")
-    print("(Terrain / image import / roof / text commands aren't auto-tested here to avoid "
-          "messing up your map — try them by hand once the basics pass.)")
+    print("(Terrain / image import / roof / text / level commands and the native write calls "
+          "aren't auto-tested here to avoid messing up your map — try them by hand once the basics pass.)")
     return 0 if failed == 0 else 1
 
 

@@ -32,6 +32,20 @@ blindly.
   inspect what you built and iterate. Use them.
 - The bridge keeps its **own** `undo` / `redo` stacks (independent of DD's
   Ctrl+Z). `delete_element` is **not** undoable.
+- **Furnishing a room:** read `get_asset_footprint` before choosing a scale
+  (sprites vary wildly in size), place with `check=True` so an object that
+  would cross a wall, block a door or overlap another is refused with the
+  reason, and run `validate_layout` when done. A refusal means nothing changed:
+  move, turn or shrink the object rather than dropping the check. Overlaps that
+  are intended (chairs under a table, canopies) take `allow_overlap=True`, or a
+  different `layer` (rugs lower, tabletop items higher). Footprints are
+  rectangles, so still look at a `screenshot`.
+- Levels are listed **top floor first**; a level's `index` shifts when levels
+  are added or cloned (new ones land at index 0). Its `id` holds while the map
+  is open but is reassigned on load.
+- `native_*` and `ui_*` reach Dungeondraft's own API and controls. They are a
+  last resort for what has no dedicated tool: nothing they do is undoable, so
+  `save_map` first, and check the effect, since a failed call just returns null.
 
 ## Editing the bridge itself
 
@@ -56,3 +70,11 @@ If you change code (not just drive the map), the two halves reload differently:
 - GDScript on Godot 3.4.2 has **no try/catch**: an unhandled runtime error in a
   handler crashes the mod and kills the bridge (full DD restart). Validate
   inputs before calling DD API methods.
+- A **C# exception inside a DD method** is different: the call returns `null`,
+  DD logs *Unhandled Exception* to stdout and carries on. So does a call with
+  the wrong number of arguments (C# defaults are not filled in): it silently
+  does nothing. Check results; see PROTOCOL.md "Calling DD's C# from the mod".
+- `open_map` reuses the already-compiled mod script. Only Reload Mods or a DD
+  restart loads an edited `.gd`.
+- The layout checks live in `server/dungeondraft_mcp/spatial.py` and are unit
+  tested offline: `.venv/bin/python -m unittest discover -s server/tests`.

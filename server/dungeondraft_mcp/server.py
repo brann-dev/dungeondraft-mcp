@@ -15,10 +15,11 @@ import json
 import os
 import tempfile
 import time
-from typing import Optional
+from typing import Any, Optional
 
 from mcp.server.fastmcp import FastMCP, Image
 
+from . import spatial
 from .bridge_client import BridgeClient, BridgeError
 
 HOST = os.environ.get("DD_BRIDGE_HOST", "127.0.0.1")
@@ -69,6 +70,47 @@ def _run_export(fmt: str, path: str, ppi: int, grid: Optional[bool],
         # run that died inside DD (which also leaves its IsExporting flag stuck).
         bridge.request("export_finish")
     return res
+
+
+def _shape_polygon(rect: Optional[list[float]], points: Optional[list[list[float]]]) -> list:
+    return spatial.rect_polygon(rect) if rect is not None else [tuple(p[:2]) for p in points or []]
+
+
+def _refuse_if_blocked(cmd: str, params: dict, allow_overlap: bool, region: str) -> None:
+    """The opt-in placement check behind `check=True` / `region=`: raise instead of
+    letting an object edit cross a wall, block a door, leave the map, enter a
+    clear zone, leave its room or (unless allow_overlap) overlap another object.
+    """
+    query = {}
+    if cmd == "place_object":
+        query["asset"] = params["asset"]
+    elif cmd == "import_image":
+        query["path"] = params["path"]
+    scene = bridge.request("spatial_snapshot", **query)
+    proposal = spatial.proposed_footprint(scene, cmd, params)
+    if proposal is None:
+        return   # a light, a text, a wall: nothing with a footprint to check
+    conflicts = spatial.check_footprint(
+        scene, proposal.polygon, layer=proposal.layer, ignore_id=proposal.ignore_id,
+        allow_overlap=allow_overlap, region=region)
+    if conflicts:
+        raise BridgeError("refused, nothing changed: it " + spatial.describe(conflicts))
+
+
+def _refuse_if_protected(what: str, **shape) -> None:
+    """Raise if an area edit (see spatial.protected_hits for `shape`) would reach
+    one of the level's 'protected' regions. Costs one extra bridge call."""
+    try:
+        regions = bridge.request("list_spatial_regions")["regions"]
+    except BridgeError as exc:
+        if "unknown cmd" in str(exc):
+            return   # an older mod without regions: nothing can be protected
+        raise
+    hits = spatial.protected_hits(regions, **shape)
+    if hits:
+        raise BridgeError(
+            f"refused, nothing changed: {what} would reach protected region(s) {', '.join(hits)}. "
+            "Use remove_spatial_region first if that is intended.")
 
 
 # --------------------------------------------------------------------------
@@ -129,8 +171,26 @@ def get_element(id: int) -> dict:
 
 @mcp.tool()
 def list_levels() -> dict:
-    """List the map's levels (floors) with their index, id and label, plus the current index."""
+    """List the map's levels (floors) with their index, id and label, plus the current index and id.
+
+    Levels are listed top floor first. A level's index changes when levels are
+    added, cloned or reordered; its id stays the same while the map is open
+    (ids are handed out afresh when a map is loaded).
+    """
     return bridge.request("list_levels")
+
+
+@mcp.tool()
+def list_layers() -> dict:
+    """List the current level's draw layers, bottom to top: {layer, label, locked}.
+
+    A layer is a z-order band. Locked layers are Dungeondraft's own (terrain,
+    caves, floor, water, portals, walls, roofs). The others are where objects,
+    paths, pattern floors and materials can go: by default -400 'Below Ground',
+    -100 'Below Water', 100-400 'User Layer 1-4', 700 'Above Walls', 900 'Above
+    Roofs'. The bridge creates objects and paths on 0 unless told otherwise.
+    """
+    return bridge.request("list_layers")
 
 
 # --------------------------------------------------------------------------
@@ -146,15 +206,30 @@ def place_object(
     rotation: float = 0.0,
     sorting: int = 0,
     color: str = "",
+    layer: int = 0,
+    check: bool = False,
+    allow_overlap: bool = False,
+    region: str = "",
 ) -> dict:
     """Place an object (prop) on the current map. Returns the new element id.
 
     asset: an Objects asset path from list_assets(category='Objects').
     x, y: woxel coordinates; defaults to map center. rotation: degrees.
-    sorting: 0=over, 1=under.
+    sorting: 0=over, 1=under the other objects on the same layer.
+    layer: draw layer (see list_layers); a higher layer always draws on top.
+    Objects placed by hand in Dungeondraft go on 100 by default.
     color: '#rrggbb' custom color. Only 'Colorable' assets (red-mask areas) take
     one; with no color they get DD's default '#6b3834'. On other assets color is
     ignored and the result carries a 'warning'. The result reports the applied color.
+
+    check=True refuses the placement (changing nothing) if the object's
+    footprint would cross a wall, block a doorway, leave the map, sit in a
+    'clearance' region or overlap another object on the same layer; the error
+    says which. allow_overlap=True drops only the object-overlap part (chairs
+    tucked under a table, a tree canopy). region: name of a 'room' region the
+    whole footprint must stay inside (implies check). get_asset_footprint tells
+    you an asset's size first; check_object_placement tries a spot without
+    placing anything.
     """
     params = {"asset": asset, "scale": scale, "rotation": rotation, "sorting": sorting}
     if x is not None:
@@ -163,6 +238,10 @@ def place_object(
         params["y"] = y
     if color:
         params["color"] = color
+    if layer:
+        params["layer"] = layer
+    if check or region:
+        _refuse_if_blocked("place_object", params, allow_overlap, region)
     return bridge.request("place_object", **params)
 
 
@@ -220,7 +299,11 @@ def add_light(
 ) -> dict:
     """Add a light at a woxel position. Returns the new element id.
 
-    color: '#rrggbb' (default warm). energy: brightness. range: radius scale.
+    color: '#rrggbb' (default warm). energy: brightness.
+    range: size of the light as a multiple of its texture, not a distance in
+    woxels: with Dungeondraft's built-in lights, 1.0 fades out about 2 tiles
+    from the center and 2.0 about 4. Dungeondraft's own Range slider shows
+    twice this number.
     asset: optional Lights gradient/cookie texture path.
     """
     params = {"color": color, "energy": energy, "range": range, "shadows": shadows, "asset": asset}
@@ -396,6 +479,8 @@ def build_room(
         params["floor_asset"] = floor_asset
     if floor_color:
         params["floor_color"] = floor_color
+    if floor == "terrain":
+        _refuse_if_protected("the room's terrain floor", polygon=_shape_polygon(rect, points), radius=64)
     return bridge.request("build_room", **params)
 
 
@@ -436,6 +521,10 @@ def import_image(
     rotation: float = 0.0,
     sorting: int = 0,
     shadow: bool = True,
+    layer: int = 0,
+    check: bool = False,
+    allow_overlap: bool = False,
+    region: str = "",
 ) -> dict:
     """Embed an image file from disk into the map as an object. Returns the new element id.
 
@@ -448,21 +537,28 @@ def import_image(
     Dungeondraft. PNG keeps transparency. x, y: woxel position of the image's
     center (defaults to map center). At scale=1, 256 image pixels cover one
     tile. rotation: degrees. sorting: 0=over, 1=under other objects.
-    shadow: drop shadow; pass False for a backdrop.
+    shadow: drop shadow; pass False for a backdrop. layer: draw layer, as in
+    place_object (-400 puts a backdrop under floors and everything else).
 
     The result is an ordinary object: move_element, modify_object,
     duplicate_object and delete_element work on it, and undo removes it.
     Importing the same path again reuses the copy already embedded (even if
     the file changed since); save an edited image under a new name.
+
+    check / allow_overlap / region: the placement check, as in place_object.
     """
     params: dict = {
         "path": os.path.abspath(os.path.expanduser(path)),
         "scale": scale, "rotation": rotation, "sorting": sorting, "shadow": shadow,
     }
+    if layer:
+        params["layer"] = layer
     if x is not None:
         params["x"] = x
     if y is not None:
         params["y"] = y
+    if check or region:
+        _refuse_if_blocked("import_image", params, allow_overlap, region)
     return bridge.request("import_image", **params)
 
 
@@ -504,6 +600,7 @@ def draw_water(
         params["shallow_color"] = shallow_color
     if blend_distance is not None:
         params["blend_distance"] = blend_distance
+    _refuse_if_protected("the water", polygon=_shape_polygon(rect, points), radius=32)
     return bridge.request("draw_water", **params)
 
 
@@ -544,6 +641,8 @@ def draw_material(
         params["points"] = points
     if smooth is not None:
         params["smooth"] = smooth
+    # A material patch can run a quarter tile past its shape, plus its border.
+    _refuse_if_protected("the material", polygon=_shape_polygon(rect, points), radius=96)
     return bridge.request("draw_material", **params)
 
 
@@ -571,6 +670,7 @@ def fill_terrain(slot: int = 0, asset: str = "") -> dict:
     params = {"slot": slot}
     if asset:
         params["asset"] = asset
+    _refuse_if_protected("a whole-level terrain fill", whole_level=True)
     return bridge.request("fill_terrain", **params)
 
 
@@ -599,6 +699,8 @@ def fill_region(
         params["points"] = points
     if asset:
         params["asset"] = asset
+    # Terrain is a 64-woxel grid of blended weights: a fill bleeds about one cell.
+    _refuse_if_protected("the terrain fill", polygon=_shape_polygon(rect, points), radius=64)
     return bridge.request("fill_region", **params)
 
 
@@ -625,6 +727,10 @@ def paint_terrain(
         params["y"] = y
     if asset:
         params["asset"] = asset
+    if x is not None and y is not None:
+        _refuse_if_protected("the terrain brush", path=[(x, y)], radius=radius + 64)
+    else:
+        _refuse_if_protected("the terrain brush (at the map center)", whole_level=True)
     return bridge.request("paint_terrain", **params)
 
 
@@ -651,6 +757,7 @@ def paint_path(
     params = {"points": points, "slot": slot, "radius": radius, "rate": rate}
     if asset:
         params["asset"] = asset
+    _refuse_if_protected("the terrain stroke", path=points, radius=radius + 64)
     return bridge.request("paint_path", **params)
 
 
@@ -683,6 +790,8 @@ def dig_cave(
         params["wall_color"] = wall_color
     if texture:
         params["texture"] = texture
+    # Caves are cut on a 64-woxel grid and grow a rocky border around the opening.
+    _refuse_if_protected("the cave", path=points, radius=radius + 128)
     return bridge.request("dig_cave", **params)
 
 
@@ -694,6 +803,7 @@ def clear_caves() -> dict:
     mesh. Undoable like dig_cave. Use this instead of filling regions back with
     dig_cave(dig=False) when you want to reset all caves.
     """
+    _refuse_if_protected("clearing the caves", whole_level=True)
     return bridge.request("clear_caves")
 
 
@@ -702,9 +812,23 @@ def clear_caves() -> dict:
 # --------------------------------------------------------------------------
 
 @mcp.tool()
-def move_element(id: int, x: float, y: float) -> dict:
-    """Move any element to a new woxel position by id."""
-    return bridge.request("move_element", id=id, x=x, y=y)
+def move_element(
+    id: int,
+    x: float,
+    y: float,
+    check: bool = False,
+    allow_overlap: bool = False,
+    region: str = "",
+) -> dict:
+    """Move any element to a new woxel position by id.
+
+    check / allow_overlap / region: for an object, the placement check as in
+    place_object, applied to where it would land (other kinds are not checked).
+    """
+    params = {"id": id, "x": x, "y": y}
+    if check or region:
+        _refuse_if_blocked("move_element", params, allow_overlap, region)
+    return bridge.request("move_element", **params)
 
 
 @mcp.tool()
@@ -714,11 +838,17 @@ def modify_object(
     rotation: Optional[float] = None,
     color: str = "",
     shadow: Optional[bool] = None,
+    check: bool = False,
+    allow_overlap: bool = False,
+    region: str = "",
 ) -> dict:
     """Modify an existing object's scale, rotation (degrees), color ('#rrggbb') and/or shadow flag by id.
 
     color applies only to 'Colorable' objects; otherwise it is ignored and the
     result has a 'warning'. The returned descriptor includes 'colorable' and 'color'.
+
+    check / allow_overlap / region: the placement check as in place_object,
+    applied to the footprint after the new scale and rotation.
     """
     params: dict = {"id": id}
     if scale is not None:
@@ -729,6 +859,8 @@ def modify_object(
         params["color"] = color
     if shadow is not None:
         params["shadow"] = shadow
+    if check or region:
+        _refuse_if_blocked("modify_object", params, allow_overlap, region)
     return bridge.request("modify_object", **params)
 
 
@@ -779,9 +911,35 @@ def modify_wall(
 
 
 @mcp.tool()
-def duplicate_object(id: int, dx: float = 64.0, dy: float = 0.0) -> dict:
-    """Duplicate an object by id, offset by (dx, dy) woxels. Returns the new element id."""
-    return bridge.request("duplicate_object", id=id, dx=dx, dy=dy)
+def set_element_layer(id: int, layer: int) -> dict:
+    """Move an object, path or pattern floor to another draw layer (see list_layers).
+
+    Layers decide what covers what regardless of creation order: a rug on 100
+    stays under a table on 200. Walls, portals, roofs, lights and texts have
+    fixed layers and are refused. Undoable via undo().
+    """
+    return bridge.request("set_element_layer", id=id, layer=layer)
+
+
+@mcp.tool()
+def duplicate_object(
+    id: int,
+    dx: float = 64.0,
+    dy: float = 0.0,
+    check: bool = False,
+    allow_overlap: bool = False,
+    region: str = "",
+) -> dict:
+    """Duplicate an object by id, offset by (dx, dy) woxels. Returns the new element id.
+
+    The copy keeps the source's scale, rotation, color and layer.
+    check / allow_overlap / region: the placement check as in place_object,
+    applied to the copy (which can then not overlap its source either).
+    """
+    params = {"id": id, "dx": dx, "dy": dy}
+    if check or region:
+        _refuse_if_blocked("duplicate_object", params, allow_overlap, region)
+    return bridge.request("duplicate_object", **params)
 
 
 @mcp.tool()
@@ -840,15 +998,86 @@ def open_map(path: str) -> dict:
 # --------------------------------------------------------------------------
 
 @mcp.tool()
-def add_level(label: str = "Level") -> dict:
-    """Add a new level (floor) to the map. Returns its id and label."""
-    return bridge.request("add_level", label=label)
+def add_level(label: str = "Level", terrain: bool = False) -> dict:
+    """Add a new, empty level (floor) to the map. Returns its id, label and index.
+
+    The new level becomes the top floor (index 0), so every other level's index
+    goes up by one. The current level stays current: call set_level(0) to work
+    on the new one.
+
+    terrain: whether the new level shows a terrain layer. Off by default, as in
+    Dungeondraft: an upper floor has no ground, only the floors you draw, and
+    compare_levels can show the level below through it. Pass True for a level
+    that needs ground of its own (a cellar, a cave). The terrain tools paint a
+    hidden terrain without showing anything; get_status reports terrain_visible.
+    """
+    return bridge.request("add_level", label=label, terrain=terrain)
 
 
 @mcp.tool()
 def set_level(index: int) -> dict:
-    """Switch the active level (floor) by its index (see list_levels)."""
+    """Switch the active level (floor) by its index (see list_levels). All edits go to the active level."""
     return bridge.request("set_level", index=index)
+
+
+@mcp.tool()
+def rename_level(index: int, label: str) -> dict:
+    """Rename a level (floor) by its index. Returns the level list."""
+    return bridge.request("rename_level", index=index, label=label)
+
+
+@mcp.tool()
+def clone_level(index: int, label: str = "") -> dict:
+    """Copy a whole level (floor) with everything on it. Returns the copy's id, label and index.
+
+    Use it to start an upper floor from the footprint of the one below. Like
+    add_level, the copy becomes the top floor (index 0) and is not switched to.
+    Its elements get new ids, and it finishes loading a moment after the reply:
+    wait for get_status counts to settle after set_level before editing it.
+    label defaults to '<source label> copy'.
+    """
+    params: dict = {"index": index}
+    if label:
+        params["label"] = label
+    return bridge.request("clone_level", **params)
+
+
+@mcp.tool()
+def reorder_levels(ids: list[int]) -> dict:
+    """Set the order of the levels (floors): every level id exactly once, top floor first. Returns the level list."""
+    return bridge.request("reorder_levels", ids=ids)
+
+
+@mcp.tool()
+def compare_levels(
+    index: int = -1,
+    reference_opacity: float = 0.35,
+    current_opacity: float = 1.0,
+) -> dict:
+    """Show another level faintly under the current one, to line floors up. index=-1 turns it off.
+
+    index: the level to show as the reference (not the current level).
+    reference_opacity / current_opacity: 0-1. The overlay is an editing aid
+    tied to the current level; it also appears in screenshot, so turn it off
+    before a final look.
+    """
+    return bridge.request(
+        "compare_levels", index=index,
+        reference_opacity=reference_opacity, current_opacity=current_opacity)
+
+
+@mcp.tool()
+def add_layer(layer: int, label: str = "") -> dict:
+    """Add a draw layer to the current level, e.g. 150 to sit between layers 100 and 200. Returns the layer list.
+
+    layer: a z value from -4096 to 4096 that is not already a layer; a higher
+    value draws on top. label: the name shown in Dungeondraft's layer menus.
+    The default layers (see list_layers) are enough for most maps.
+    """
+    params: dict = {"layer": layer}
+    if label:
+        params["label"] = label
+    return bridge.request("add_layer", **params)
 
 
 # --------------------------------------------------------------------------
@@ -1009,6 +1238,286 @@ def select_elements(ids: list[int]) -> dict:
 def clear_selection() -> dict:
     """Clear the current selection in Dungeondraft."""
     return bridge.request("clear_selection")
+
+
+# --------------------------------------------------------------------------
+# Layout checks — sizes, collisions and regions (geometry in spatial.py)
+# --------------------------------------------------------------------------
+
+def _round_points(points) -> list:
+    return [[round(x, 1), round(y, 1)] for x, y in points]
+
+
+@mcp.tool()
+def get_asset_footprint(asset: str) -> dict:
+    """How big an Objects asset really is: call this before choosing a scale or a spot for furniture.
+
+    Sprites differ wildly in size and most carry transparent padding, so the
+    footprint is the box around the asset's visible pixels. Returns, at scale 1:
+    footprint [w, h] in woxels and in tiles, the full image size, and the
+    footprint's center offset from the placement point (usually ~0). To make an
+    object N tiles wide use scale = N / footprint_tiles[0].
+    """
+    fp = bridge.request("asset_footprint", asset=asset)
+    x, y, w, h = fp["visible"]
+    return {
+        "asset": fp["asset"],
+        "image_size": fp["size"],
+        "footprint": [w, h],
+        "footprint_tiles": [round(w / 256, 2), round(h / 256, 2)],
+        "center_offset": [round(x + w / 2 - fp["size"][0] / 2, 1), round(y + h / 2 - fp["size"][1] / 2, 1)],
+    }
+
+
+@mcp.tool()
+def check_object_placement(
+    asset: str = "",
+    id: Optional[int] = None,
+    x: Optional[float] = None,
+    y: Optional[float] = None,
+    scale: Optional[float] = None,
+    rotation: Optional[float] = None,
+    layer: Optional[int] = None,
+    allow_overlap: bool = False,
+    wall_clearance: float = 0.0,
+    door_clearance: float = 128.0,
+    object_clearance: float = 0.0,
+    region: str = "",
+) -> dict:
+    """Try a spot for an object without changing the map. Returns {ok, conflicts, footprint}.
+
+    Give asset (a new object: x, y, scale, rotation, layer as for place_object)
+    OR id (an existing object: x, y to move it, scale / rotation to change it;
+    anything omitted stays as it is).
+
+    The footprint is the box around the sprite's visible pixels, turned and
+    scaled with the object. Conflicts, each with a code and the element
+    involved:
+      outside_map    sticks out of the map
+      wall           crosses a wall (its thickness included); flush is fine.
+                     wall_clearance asks for extra room, in woxels
+      door           within door_clearance woxels in front of or behind a door
+                     (windows don't count; 0 turns this off)
+      object         overlaps another object on the SAME layer, or comes
+                     within object_clearance of one. Put rugs on a lower layer
+                     and tabletop items on a higher one; allow_overlap=True
+                     skips this check
+      clearance      inside a 'clearance' region (see set_spatial_region)
+      outside_room   not fully inside the 'room' region named by region
+    A sofa is still a rectangle here and a door is told from a window by its
+    asset name: treat this as a guard against obvious mistakes, then look at a
+    screenshot.
+    """
+    if bool(asset) == (id is not None):
+        raise ValueError("give exactly one of 'asset' (a new object) or 'id' (an existing one)")
+    if asset:
+        scene = bridge.request("spatial_snapshot", asset=asset)
+        params = {"asset": asset, "x": x, "y": y, "scale": 1.0 if scale is None else scale,
+                  "rotation": rotation or 0.0, "layer": layer or 0}
+        proposal = spatial.proposed_footprint(scene, "place_object", params)
+    else:
+        scene = bridge.request("spatial_snapshot")
+        obj = spatial.find_object(scene, id)
+        if obj is None:
+            raise ValueError(f"no object with id {id} on the current level")
+        proposal = spatial.moved(obj, x=x, y=y, scale=scale, rotation=rotation)
+        if layer is not None:
+            proposal.layer = layer
+    conflicts = spatial.check_footprint(
+        scene, proposal.polygon, layer=proposal.layer, ignore_id=proposal.ignore_id,
+        allow_overlap=allow_overlap, wall_clearance=wall_clearance,
+        door_clearance=door_clearance, object_clearance=object_clearance, region=region)
+    return {"ok": not conflicts, "conflicts": conflicts,
+            "footprint": _round_points(proposal.polygon), "layer": proposal.layer}
+
+
+@mcp.tool()
+def validate_layout(region: str = "", door_clearance: float = 128.0, limit: int = 100) -> dict:
+    """Audit every object on the current level for layout mistakes. Run it after furnishing.
+
+    Returns:
+      problems: objects that stick out of the map, cross a wall, stand in a
+      doorway (within door_clearance woxels) or sit in a 'clearance' region,
+      each with the object's id and the wall / door / region involved;
+      overlaps: pairs of objects on the same layer that overlap. Often
+      intended (tree canopies, chairs under a table), so review them rather
+      than treating each as an error;
+      counts, objects_checked, and ok (true when there are no problems).
+    region: only audit objects whose center is inside this region.
+    limit caps each list; counts always cover everything.
+    """
+    scene = bridge.request("spatial_snapshot")
+    return spatial.audit(scene, door_clearance=door_clearance, region=region, limit=limit)
+
+
+@mcp.tool()
+def set_spatial_region(
+    name: str,
+    kind: str = "clearance",
+    rect: Optional[list[float]] = None,
+    points: Optional[list[list[float]]] = None,
+) -> dict:
+    """Mark an area of the current level for the layout checks. Returns the level's regions.
+
+    Provide ONE of rect: [x, y, w, h] or points: [[x,y], ...] (>= 3), in woxels.
+    kind:
+      'clearance'  keep it free of objects: a corridor, the path to a door.
+                   Checked placements (check=True) refuse it and
+                   validate_layout reports objects in it.
+      'room'       a room's interior, for the region= argument of the object
+                   tools: the object must fit entirely inside. Draw it inside
+                   the walls, not on their centerline.
+      'protected'  finished ground that must not be painted over: every
+                   terrain, cave, water and material tool refuses an edit that
+                   would reach it (whole-level fills included) until it is
+                   removed.
+    Reusing a name replaces that region. Regions are bookkeeping for these
+    checks only: nothing is drawn, and they last until the map is closed or
+    reloaded, not in the saved file.
+    """
+    if (rect is None) == (points is None):
+        raise ValueError("provide exactly one of 'rect' or 'points'")
+    params: dict = {"name": name, "kind": kind}
+    if rect is not None:
+        params["rect"] = rect
+    if points is not None:
+        params["points"] = points
+    return bridge.request("set_spatial_region", **params)
+
+
+@mcp.tool()
+def remove_spatial_region(name: str) -> dict:
+    """Remove a region set with set_spatial_region from the current level. Returns the remaining regions."""
+    return bridge.request("remove_spatial_region", name=name)
+
+
+@mcp.tool()
+def list_spatial_regions() -> dict:
+    """List the current level's regions (name, kind, points) set with set_spatial_region."""
+    return bridge.request("list_spatial_regions")
+
+
+# --------------------------------------------------------------------------
+# Native access — Dungeondraft's own API and UI, for what no tool above covers
+# --------------------------------------------------------------------------
+#
+# Shared notes for the native_* and ui_* tools:
+#   target: "World", "Editor", "Level" (the current level), "Camera",
+#   "Exporter", "Header", "Tool:<name>", "Window:<name>", "Element:<id>",
+#   "Level:<id>", or an "Object:<n>" handle returned by one of these tools,
+#   optionally followed by members: "Level.Terrain", "Tool:WaterBrush.Mesh".
+#   Values come back as plain JSON where possible; other Godot types as
+#   {"$type": "Vector2", "value": [x, y]} and objects as
+#   {"$target": "Object:<n>", "class": ...}, which you can pass back in.
+
+@mcp.tool()
+def native_targets() -> dict:
+    """List the named entry points into Dungeondraft's own objects: the roots, every tool and every window.
+
+    Start here when no dedicated tool does what you need, then native_describe
+    a target to see what it offers. See the Dungeondraft modding API reference
+    for what the members mean.
+    """
+    return bridge.request("native_targets")
+
+
+@mcp.tool()
+def native_describe(target: str = "Level", search: str = "") -> dict:
+    """List a Dungeondraft object's methods (with argument names and types) and properties.
+
+    target: see native_targets; members can be chained ("Level.Terrain").
+    search: case-insensitive substring to filter the names; listings are capped
+    at 200, so search on big objects. Read-only.
+
+    Plain C# fields (e.g. World.levels) are not listed but native_get can still
+    read them by name.
+    """
+    return bridge.request("native_describe", target=target, search=search)
+
+
+@mcp.tool()
+def native_get(target: str, properties: list[str]) -> dict:
+    """Read properties of a Dungeondraft object by name. Read-only.
+
+    A name the object does not have reads as null rather than failing.
+    Example: native_get("Level.Terrain", ["SmoothBlending", "visible"]).
+    """
+    return bridge.request("native_get", target=target, properties=properties)
+
+
+@mcp.tool()
+def native_set(target: str, property: str, value: Any) -> dict:
+    """Set a property on a Dungeondraft object. Returns the value it holds afterwards.
+
+    LAST RESORT: prefer a dedicated tool. This bypasses the bridge's undo, and a
+    raw property write can skip the bookkeeping the matching Dungeondraft method
+    does, so look for a method with native_describe first. save_map before
+    experimenting.
+
+    value: plain JSON is converted to the property's type ([x, y] for a
+    Vector2, '#rrggbb' for a Color, a whole number for an int). Check the
+    returned value: a write Dungeondraft ignored comes back unchanged.
+    """
+    return bridge.request("native_set", target=target, property=property, value=value)
+
+
+@mcp.tool()
+def native_call(target: str, method: str, args: Optional[list[Any]] = None) -> dict:
+    """Call a method of Dungeondraft's own API on a live object. Returns its result.
+
+    LAST RESORT: prefer a dedicated tool. Nothing done this way can be undone
+    with undo(), and a wrong call can leave the map in a broken state: save_map
+    first, and read the method's signature with native_describe.
+
+    args: one value per declared argument, in order. Arguments that have a
+    default in Dungeondraft must still be passed. Plain JSON is converted to
+    each declared type: [x, y] for Vector2, [[x, y], ...] for Vector2Array,
+    [x, y, w, h] for Rect2, '#rrggbb' for Color. For an object argument pass
+    {"$target": "<target>"}; for a texture
+    {"$type": "Texture", "category": "Objects", "asset": "<asset path>"}; for an
+    image file {"$type": "Image", "path": "<absolute path>"}.
+
+    Only Dungeondraft's own methods are callable, not the engine's. If the
+    method fails inside Dungeondraft the result is simply null (the error goes
+    to Dungeondraft's log), so verify the effect with native_get or a
+    screenshot rather than trusting a null.
+    """
+    return bridge.request("native_call", target=target, method=method, args=args or [])
+
+
+@mcp.tool()
+def ui_tree(target: str = "Editor", search: str = "", limit: int = 200) -> dict:
+    """List the controls in part of Dungeondraft's own UI: buttons, toggles, sliders, text fields, option lists, labels.
+
+    target: "Tool:<name>" for a tool's side panel (e.g. "Tool:TerrainBrush"),
+    "Window:<name>" for a dialog, or "Editor" for everything (use search).
+    search: case-insensitive substring over a control's text, name, class and
+    items. Each control reports its state (text, pressed, value/min/max, items,
+    color, visible) and a "target" to give ui_action; controls a tool keeps by
+    name also report it as "control". Read-only.
+    """
+    return bridge.request("ui_tree", target=target, search=search, limit=limit)
+
+
+@mcp.tool()
+def ui_action(target: str, action: str, value: Any = None) -> dict:
+    """Operate one of Dungeondraft's own controls, as if the user had: for features with no dedicated tool.
+
+    target: a control's "target" from ui_tree.
+    action: "press" clicks a button (or flips a toggle);
+    "set" gives the control a value: true/false for a toggle, a number for a
+    slider or spin box, a string for a text field, an item index or its exact
+    text for an option list, '#rrggbb' for a color picker;
+    "show" / "hide" open or close a window (target "Window:<name>").
+
+    LAST RESORT, like native_call: no undo(), so save_map first. A press takes
+    effect just after the reply; some buttons open dialogs that then need more
+    ui_tree / ui_action steps, or a person at the screen.
+    """
+    params: dict = {"target": target, "action": action}
+    if value is not None:
+        params["value"] = value
+    return bridge.request("ui_action", **params)
 
 
 # --------------------------------------------------------------------------

@@ -25,9 +25,10 @@ The mod opens a TCP server inside Dungeondraft and polls it every frame from the
 forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
 
 > **Status: working.** Confirmed end-to-end against Dungeondraft on **Godot
-> 3.4.2** — raw TCP from the modding sandbox works, no fallback needed. 49 tools
+> 3.4.2** — raw TCP from the modding sandbox works, no fallback needed. 69 tools
 > across query / create / modify / terrain / water / materials / levels /
-> selection / capture / camera / undo / map lifecycle (see below).
+> layers / layout checks / selection / capture / camera / undo / map lifecycle,
+> plus an escape hatch to Dungeondraft's own API and UI (see below).
 
 ## What the AI can do
 
@@ -54,7 +55,19 @@ forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
 - **Edit:** `move_element`, `modify_object`, `modify_wall` (reshape or restyle
   a wall; its doors and windows stay mounted and follow their segment),
   `duplicate_object`, `delete_element`, `select_elements`, `clear_selection`.
-- **Levels:** `add_level`, `set_level`.
+- **Levels:** `add_level`, `set_level`, `rename_level`, `clone_level` (copy a
+  whole floor to start the next one from), `reorder_levels`, `compare_levels`
+  (show another floor faintly beneath the current one to line things up).
+- **Layers:** `list_layers`, `set_element_layer` (decide what covers what: a
+  rug under a table, a canopy over a path), `add_layer`; `place_object` and
+  `import_image` take a `layer` too.
+- **Layout checks:** `get_asset_footprint` (how big an asset really is, before
+  picking a scale), `check_object_placement` (try a spot: does it cross a
+  wall, block a door, overlap something?), `validate_layout` (audit a furnished
+  level), and `set_spatial_region` / `remove_spatial_region` /
+  `list_spatial_regions` for rooms, keep-clear zones and protected ground. The
+  object tools take `check=True` to refuse a bad placement outright; terrain,
+  cave, water and material edits refuse to touch a `protected` region.
 - **Map lifecycle:** `get_current_map` (open map's path + whether a save is
   running), `save_map` (save to the current file, like DD's Save button), and
   `open_map` (switch to another saved map; replies before the new map loads, so
@@ -69,9 +82,14 @@ forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
   element), `fit_elements` (frame a group), `reset_camera` (recover a lost
   view) — point the view before a `screenshot` to inspect specific spots like a
   door cut into a wall.
+- **Native access:** `native_targets`, `native_describe`, `native_get`,
+  `native_set`, `native_call` reach Dungeondraft's own objects, and `ui_tree` /
+  `ui_action` read and operate its panels and dialogs, for anything without a
+  dedicated tool (smooth terrain blending, a brush's size, a biome preset).
+  A last resort: it bypasses undo, so save first.
 - **Undo:** the bridge keeps its own undo/redo stacks for create / move / modify
-  / terrain / cave / water / material edits, so `undo` / `redo` let the model
-  reliably reverse its own changes (independent of Dungeondraft's Ctrl+Z;
+  / layer / terrain / cave / water / material edits, so `undo` / `redo` let the
+  model reliably reverse its own changes (independent of Dungeondraft's Ctrl+Z;
   `delete_element` is not reversible).
 
 Every element is referenced by an integer `id`; create and list calls return
@@ -124,6 +142,13 @@ deletes or undoes what it made:
 
 If it fails to connect *and* you never saw the `listening` line in DD's log, the
 sandbox blocked `TCP_Server` — see the fallback note in PROTOCOL.md.
+
+The layout checks are plain geometry and have their own tests, which need
+neither Dungeondraft nor a map:
+
+```bash
+.venv/bin/python -m unittest discover -s server/tests
+```
 
 To *see* something get built (a small furnished room left on the map, rather
 than a self-cleaning test), run `.venv/bin/python server/demo_build.py`.
@@ -205,7 +230,9 @@ mod/dungeondraft-mcp-bridge/   the Dungeondraft mod (copy into DD's mods folder)
   scripts/tools/mcp_bridge.gd  TCP server + command handlers
 server/                        the Python MCP server
   dungeondraft_mcp/server.py   MCP tool definitions
+  dungeondraft_mcp/spatial.py  layout checks (pure geometry on a map snapshot)
   dungeondraft_mcp/bridge_client.py  TCP/JSON client
+  tests/                       offline unit tests (no Dungeondraft needed)
   test_bridge.py               standalone per-command smoke test
   demo_build.py                builds a visible sample room and leaves it
 PROTOCOL.md                    wire protocol + implementation notes
@@ -214,6 +241,11 @@ PROTOCOL.md                    wire protocol + implementation notes
 ## Credits
 
 Built against the [Dungeondraft Modding API](https://megasploot.github.io/DungeondraftModdingAPI/).
+
+Expanded terrain slots, wall editing, image import, water, materials, the
+level and layer tools, layout checks and native/UI access were first built by
+Li-Jiaquan in [dungeondraft-mcp-bridge](https://github.com/Li-Jiaquan/dungeondraft-mcp-bridge),
+a fork of this project, and were ported back from there.
 Engine is Godot 3.4.2, so the GDScript uses Godot 3 networking class names.
 
 ## License

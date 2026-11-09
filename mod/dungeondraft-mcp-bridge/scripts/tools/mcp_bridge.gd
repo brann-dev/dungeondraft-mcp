@@ -21,7 +21,7 @@ var script_class = "tool"
 
 const HOST := "127.0.0.1"
 const PORT := 8787
-const PROTOCOL_VERSION := 25
+const PROTOCOL_VERSION := 26
 
 # Commands that get wrapped in a Dungeondraft undo record (see _record_and_dispatch).
 const CREATE_CMDS := [
@@ -259,6 +259,11 @@ func _apply_op(op, undo : bool):
 				var wall = Global.World.GetNodeByID(int(op["id"]))
 				if wall != null and _is_wall(wall):
 					_apply_wall_state(wall, op["old"] if undo else op["new"])
+		"layer":
+			if Global.World.HasNodeID(int(op["id"])):
+				var node = Global.World.GetNodeByID(int(op["id"]))
+				if node != null and _element_layer(node) != null:
+					_apply_element_layer(node, int(op["old"] if undo else op["new"]))
 		"water":
 			if is_instance_valid(op["mesh"]):
 				op["mesh"].Load(op["before"] if undo else op["after"])
@@ -425,15 +430,22 @@ func _safe_dispatch(req : Dictionary) -> Dictionary:
 		"move_element": return _move_element(req)
 		"modify_object": return _modify_object(req)
 		"modify_wall": return _modify_wall(req)
+		"set_element_layer": return _set_element_layer(req)
 		"duplicate_object": return _duplicate_object(req)
 		"delete_element": return _delete_element(req)
 		# --- map lifecycle ---
 		"get_current_map": return _get_current_map()
 		"save_map": return _save_map()
 		"open_map": return _open_map(req)
-		# --- levels ---
+		# --- levels / layers ---
 		"add_level": return _add_level(req)
 		"set_level": return _set_level(req)
+		"rename_level": return _rename_level(req)
+		"clone_level": return _clone_level(req)
+		"reorder_levels": return _reorder_levels(req)
+		"compare_levels": return _compare_levels(req)
+		"list_layers": return _list_layers()
+		"add_layer": return _add_layer(req)
 		# --- capture ---
 		"screenshot": return _screenshot(req)
 		"export_map": return _export_map(req)
@@ -451,6 +463,20 @@ func _safe_dispatch(req : Dictionary) -> Dictionary:
 		# --- selection ---
 		"select_elements": return _select_elements(req)
 		"clear_selection": return _clear_selection()
+		# --- native access (Dungeondraft's own API and UI) ---
+		"native_targets": return _native_targets()
+		"native_describe": return _native_describe(req)
+		"native_get": return _native_get(req)
+		"native_set": return _native_set(req)
+		"native_call": return _native_call(req)
+		"ui_tree": return _ui_tree(req)
+		"ui_action": return _ui_action(req)
+		# --- spatial facts (the checks themselves run in the server) ---
+		"spatial_snapshot": return _spatial_snapshot(req)
+		"asset_footprint": return _asset_footprint(req)
+		"list_spatial_regions": return _list_spatial_regions()
+		"set_spatial_region": return _set_spatial_region(req)
+		"remove_spatial_region": return _remove_spatial_region(req)
 		_: return _err("unknown cmd: " + str(cmd))
 
 
@@ -474,11 +500,13 @@ func _get_status() -> Dictionary:
 		counts[kind] = _collection(level, kind).get_child_count()
 	return _ok({
 		"map_open": true,
-		"level_id": Global.World.CurrentLevelId,
+		"level_id": level.ID,
+		"level_index": Global.World.CurrentLevelId,
 		"level_count": Global.World.levels.size(),
 		"map_size_woxels": [Global.World.WoxelDimensions.x, Global.World.WoxelDimensions.y],
 		"map_center": [Global.World.WoxelDimensions.x * 0.5, Global.World.WoxelDimensions.y * 0.5],
 		"terrain_slots": 8 if level.Terrain.ExpandedSlots else 4,
+		"terrain_visible": level.Terrain.visible,
 		"counts": counts,
 		"active_tool": Global.Editor.ActiveToolName,
 	})
@@ -732,7 +760,11 @@ func _list_levels() -> Dictionary:
 	for i in range(levels.size()):
 		var lv = levels[i]
 		out.append({ "index": i, "id": lv.ID, "label": lv.Label })
-	return _ok({ "current_index": Global.World.CurrentLevelId, "levels": out })
+	return _ok({
+		"current_index": Global.World.CurrentLevelId,
+		"current_id": Global.World.GetCurrentLevel().ID,
+		"levels": out,
+	})
 
 
 # ---------------------------------------------------------------------------
@@ -744,7 +776,11 @@ func _place_object(req : Dictionary) -> Dictionary:
 	if level == null: return _err("no map open")
 	var tex = _asset_tex("Objects", req.get("asset", ""))
 	if tex == null: return _err("could not load object asset: " + str(req.get("asset")))
+	var layer = int(req.get("layer", 0))
+	var bad = _layer_error(level, layer)
+	if bad != "": return _err(bad)
 	var prop = level.Objects.CreateObject(int(req.get("sorting", 0)))
+	prop.z_index = layer
 	prop.SetTexture(tex)
 	prop.position = _xy(req, Global.World.WoxelDimensions * 0.5)
 	var s = float(req.get("scale", 1.0))
@@ -1095,7 +1131,7 @@ func _place_pattern(req : Dictionary) -> Dictionary:
 	var all = shapes.GetShapes()
 	var result := { "shape": kind, "category": category, "shape_count": all.size() }
 	if color is Color:
-		result["color"] = "#" + color.to_html(true)
+		result["color"] = _hex(color)
 	if used_default:
 		# Signal we applied the neutral default (no per-texture tint exists for
 		# patterns; pass an explicit `color` for an exact look).
@@ -1243,6 +1279,9 @@ func _import_image(req : Dictionary) -> Dictionary:
 	if not Global.Editor.Tools.has("ObjectTool"): return _err("ObjectTool unavailable")
 	var s = float(req.get("scale", 1.0))
 	if s <= 0.0: return _err("'scale' must be > 0")
+	var layer = int(req.get("layer", 0))
+	var bad = _layer_error(level, layer)
+	if bad != "": return _err(bad)
 	# EmbedObject dereferences the texture it loads without a null check, so a
 	# file that fails to decode would throw inside DD. Decode it here first.
 	var img = Image.new()
@@ -1256,11 +1295,11 @@ func _import_image(req : Dictionary) -> Dictionary:
 	var prop = level.Objects.get_child(level.Objects.get_child_count() - 1)
 	# EmbedObject leaves the prop at the cursor, on the Object tool's layer, with
 	# the tool's shadow setting, and indexed for selection under that layer. Give
-	# it place_object's layer (0) and the caller's transform, then re-index it
-	# (the search table is keyed by z_index; see _register_prop).
+	# it the caller's layer (place_object's default, 0) and transform, then
+	# re-index it (the search table is keyed by z_index; see _register_prop).
 	var sorting = int(req.get("sorting", 0))
 	level.Objects.RemoveFromSearchTable(prop)
-	prop.z_index = 0
+	prop.z_index = layer
 	if sorting == 1:
 		level.Objects.move_child(prop, 0)
 	prop.position = _xy(req, Global.World.WoxelDimensions * 0.5)
@@ -1905,6 +1944,7 @@ func _duplicate_object(req : Dictionary) -> Dictionary:
 	if src == null: return _err("no element with id " + str(req.get("id")))
 	if src.get("Texture") == null: return _err("element has no Texture to duplicate")
 	var prop = level.Objects.CreateObject(0)
+	prop.z_index = src.z_index
 	prop.SetTexture(src.Texture)
 	prop.position = src.position + Vector2(float(req.get("dx", 64.0)), float(req.get("dy", 0.0)))
 	prop.scale = src.scale
@@ -1926,17 +1966,213 @@ func _delete_element(req : Dictionary) -> Dictionary:
 # Levels
 # ---------------------------------------------------------------------------
 
+# World.CreateLevel puts the new level FIRST in the list (index 0 is the top
+# floor) and leaves the current level current, so every index below shifts by 1.
+# Like DD's own New Level (LevelSettings.CreateLevel), the new level's terrain
+# is hidden unless asked for: an upper floor has no ground, and an opaque
+# terrain would hide the level shown beneath it by compare_levels.
 func _add_level(req : Dictionary) -> Dictionary:
 	var lv = Global.World.CreateLevel(str(req.get("label", "Level")))
-	return _ok({ "id": lv.ID, "label": lv.Label })
+	lv.Terrain.visible = bool(req.get("terrain", false))
+	Global.Editor.UpdateLevelOptions()   # the level dropdown
+	return _ok({
+		"id": lv.ID, "label": lv.Label, "index": 0,
+		"current_index": Global.World.CurrentLevelId, "terrain_visible": lv.Terrain.visible,
+	})
 
 
+# World.SetLevel is (int level, bool loading = false), and a C# default is not
+# filled in for a call from GDScript: the one-argument call found no method and
+# did nothing, with no error. Pass both, then confirm the switch.
 func _set_level(req : Dictionary) -> Dictionary:
 	var idx = int(req.get("index", 0))
 	if idx < 0 or idx >= Global.World.levels.size():
 		return _err("level index out of range: " + str(idx))
-	Global.World.SetLevel(idx)
-	return _ok({ "current_index": idx })
+	Global.World.SetLevel(idx, false)
+	if Global.World.CurrentLevelId != idx:
+		return _err("Dungeondraft did not switch to level " + str(idx))
+	return _ok({ "current_index": idx, "current_id": Global.World.GetCurrentLevel().ID })
+
+
+func _rename_level(req : Dictionary) -> Dictionary:
+	var level = Global.World.TryGetLevel(int(req.get("index", -1)))
+	if level == null: return _err("level index out of range: " + str(req.get("index")))
+	var label = str(req.get("label", "")).strip_edges()
+	if label == "": return _err("missing 'label'")
+	level.Label = label
+	Global.Editor.UpdateLevelOptions()
+	return _list_levels()
+
+
+# Copy a whole level (World.CloneLevel, as the New Level window's "clone" option
+# does). Like add_level, the copy lands at index 0 and is not switched to; its
+# elements get fresh ids, and it fills in over the next frames.
+func _clone_level(req : Dictionary) -> Dictionary:
+	var src = Global.World.TryGetLevel(int(req.get("index", -1)))
+	if src == null: return _err("level index out of range: " + str(req.get("index")))
+	var label = str(req.get("label", "")).strip_edges()
+	if label == "":
+		label = str(src.Label) + " copy"
+	var clone = Global.World.CloneLevel(src, label)
+	if clone == null: return _err("CloneLevel returned null")
+	Global.Editor.UpdateLevelOptions()
+	return _ok({ "id": clone.ID, "label": clone.Label, "index": 0, "current_index": Global.World.CurrentLevelId })
+
+
+# Reorder the levels: `ids` lists every level id once, top floor first.
+func _reorder_levels(req : Dictionary) -> Dictionary:
+	var ids = req.get("ids")
+	var levels = Global.World.levels
+	if typeof(ids) != TYPE_ARRAY or ids.size() != levels.size():
+		return _err("'ids' must list each of the %d level ids exactly once" % levels.size())
+	var by_id := {}
+	for lv in levels:
+		by_id[int(lv.ID)] = lv
+	var order := []
+	for id in ids:
+		if not by_id.has(int(id)):
+			return _err("unknown or repeated level id: " + str(id))
+		order.append(by_id[int(id)])
+		by_id.erase(int(id))
+	Global.World.SetNewLevelOrder(order)
+	return _list_levels()
+
+
+# Show another level faintly beneath the current one, for lining floors up
+# (the Compare Levels window). `index` -1 turns it off. The setting belongs to
+# the current level and DD re-applies it whenever that level is shown.
+func _compare_levels(req : Dictionary) -> Dictionary:
+	var idx = int(req.get("index", -1))
+	var toggle = Global.Editor.get("CompareToggle")
+	if idx == -1:
+		Global.World.DisableCompareLevels()
+		_set_toggle_quietly(toggle, false)
+		return _ok({ "comparing": false })
+	var ref = Global.World.TryGetLevel(idx)
+	if ref == null: return _err("level index out of range: " + str(idx))
+	if ref == Global.World.GetCurrentLevel(): return _err("pick a level other than the current one")
+	var ref_opacity = clamp(float(req.get("reference_opacity", 0.35)), 0.0, 1.0)
+	var cur_opacity = clamp(float(req.get("current_opacity", 1.0)), 0.0, 1.0)
+	Global.World.SetCompareLevels(ref, ref_opacity, cur_opacity, true)
+	_set_toggle_quietly(toggle, true)
+	return _ok({
+		"comparing": true, "reference_index": idx, "reference_id": ref.ID,
+		"reference_opacity": ref_opacity, "current_opacity": cur_opacity,
+	})
+
+
+# Tick a toggle button without firing its handler (which would act a second time).
+func _set_toggle_quietly(button, pressed : bool) -> void:
+	if button != null and button is BaseButton:
+		button.set_pressed_no_signal(pressed)
+
+
+# ---------------------------------------------------------------------------
+# Layers
+# ---------------------------------------------------------------------------
+
+# DD's built-in layers (Level.CreateDefaultLockedLayers). They are what the
+# level's own nodes draw on; the editor never lets an element be put on one.
+const LOCKED_LAYERS := {
+	-500: "Terrain", -300: "Caves", -200: "Floor", 0: "Water",
+	500: "Portals", 600: "Walls", 800: "Roofs",
+}
+const LAYER_MIN := -4096   # CanvasItem z-index range
+const LAYER_MAX := 4096
+
+
+# The level's drawing layers { z: label } without the locked ones. Level.Layers
+# itself (a SortedDictionary) can't cross into GDScript; SaveLayers() can.
+func _user_layers(level) -> Dictionary:
+	return level.SaveLayers()
+
+
+# Layers an element may be put on: the level's drawing layers, plus 0, where the
+# bridge has always created objects and paths. Returns "" or the error.
+func _layer_error(level, layer : int) -> String:
+	var layers = _user_layers(level)
+	if layer == 0 or layers.has(layer):
+		return ""
+	var keys = layers.keys()
+	keys.sort()
+	return "no layer %d on this level (layers: %s)" % [layer, str(keys)]
+
+
+func _list_layers() -> Dictionary:
+	var level = Global.World.GetCurrentLevel()
+	if level == null: return _err("no map open")
+	var labels = LOCKED_LAYERS.duplicate()
+	var user = _user_layers(level)
+	for z in user:
+		labels[int(z)] = str(user[z])
+	var keys = labels.keys()
+	keys.sort()
+	var out := []
+	for z in keys:
+		out.append({ "layer": z, "label": labels[z], "locked": not user.has(z) })
+	return _ok({ "level_id": level.ID, "layers": out })
+
+
+# Add a drawing layer to the current level. DD keeps layers as a { z: label }
+# table per level (saved with the map; the layer menus list it) but ships no
+# way to add to it, so this goes through the loader the map file uses.
+func _add_layer(req : Dictionary) -> Dictionary:
+	var level = Global.World.GetCurrentLevel()
+	if level == null: return _err("no map open")
+	if not req.has("layer"): return _err("missing 'layer'")
+	var layer = int(req["layer"])
+	if layer < LAYER_MIN or layer > LAYER_MAX:
+		return _err("'layer' must be %d..%d" % [LAYER_MIN, LAYER_MAX])
+	if LOCKED_LAYERS.has(layer) or _user_layers(level).has(layer):
+		return _err("layer %d already exists" % layer)
+	var label = str(req.get("label", "")).strip_edges()
+	if label == "":
+		label = "Layer %d" % layer
+	level.LoadLayers({ layer: label })
+	return _list_layers()
+
+
+# The layer an element is on, or null for kinds that have none (walls, portals,
+# roofs, lights and texts draw on fixed layers).
+func _element_layer(node):
+	if node.has_method("GetLayer") and node.has_method("SetLayer"):
+		return int(node.GetLayer())                    # pattern floor
+	if node is Node2D and (node.has_method("SetCustomColor") or node.has_method("SetEditPoints")):
+		return int(node.z_index)                       # object / path
+	return null
+
+
+# Move an element to a layer the way SelectTool's layer menu does: a pattern
+# floor is re-parented (SetLayer), an object or path takes the layer as its
+# z_index, and an object is re-filed in the selection index, keyed by z_index.
+func _apply_element_layer(node, layer : int) -> void:
+	if node.has_method("SetLayer"):
+		node.SetLayer(layer)
+		return
+	var objects = node.get_parent()
+	var indexed = objects != null and objects.has_method("RemoveFromSearchTable") and node.has_method("SetCustomColor")
+	if indexed:
+		objects.RemoveFromSearchTable(node)
+	node.z_index = layer
+	if indexed:
+		objects.AddToSearchTable(node, false)
+
+
+func _set_element_layer(req : Dictionary) -> Dictionary:
+	var level = Global.World.GetCurrentLevel()
+	if level == null: return _err("no map open")
+	var node = _resolve(req)
+	if node == null: return _err("no element with id " + str(req.get("id")))
+	if not req.has("layer"): return _err("missing 'layer'")
+	var old = _element_layer(node)
+	if old == null: return _err("element has no layer: only objects, paths and pattern floors do")
+	var layer = int(req["layer"])
+	var bad = _layer_error(level, layer)
+	if bad != "": return _err(bad)
+	_apply_element_layer(node, layer)
+	return _ok_op(
+		{ "id": _id(node), "layer": _element_layer(node), "previous": old },
+		{ "kind": "layer", "id": _id(node), "old": old, "new": layer })
 
 
 # ---------------------------------------------------------------------------
@@ -2341,6 +2577,795 @@ func _clear_selection() -> Dictionary:
 
 
 # ---------------------------------------------------------------------------
+# Native access: Dungeondraft's own API and UI, for what no command covers
+# ---------------------------------------------------------------------------
+#
+# A `target` names a live object: a root (World, Editor, Level = the current
+# level, Camera, Exporter, Header), "Tool:<name>", "Window:<name>",
+# "Element:<id>", "Level:<id>" or "Object:<instance id>" (how objects are
+# handed back by these commands), optionally followed by ".Member" steps
+# ("Level.Terrain", "Tool:TerrainBrush.Controls.SmoothBlending").
+#
+# Only DD's own members are reachable for calls: its C# methods are PascalCase
+# and Godot's are snake_case, so the name test in _native_callable keeps
+# engine methods (free, call, set_script, ...) out. Nothing here can be undone.
+# A DD method that throws is logged by DD as an unhandled exception and returns
+# null to the script; there is no way to see the failure from here.
+
+const NATIVE_ROOTS := ["World", "Editor", "Level", "Camera", "Exporter", "Header"]
+const NATIVE_MAX_ITEMS := 200    # per array / dictionary / listing in a reply
+const NATIVE_MAX_DEPTH := 4
+
+const TYPE_NAMES := {
+	TYPE_NIL: "Variant", TYPE_BOOL: "bool", TYPE_INT: "int", TYPE_REAL: "float",
+	TYPE_STRING: "String", TYPE_VECTOR2: "Vector2", TYPE_RECT2: "Rect2",
+	TYPE_VECTOR3: "Vector3", TYPE_TRANSFORM2D: "Transform2D", TYPE_COLOR: "Color",
+	TYPE_NODE_PATH: "NodePath", TYPE_OBJECT: "Object", TYPE_DICTIONARY: "Dictionary",
+	TYPE_ARRAY: "Array", TYPE_RAW_ARRAY: "bytes", TYPE_INT_ARRAY: "IntArray",
+	TYPE_REAL_ARRAY: "FloatArray", TYPE_STRING_ARRAY: "StringArray",
+	TYPE_VECTOR2_ARRAY: "Vector2Array", TYPE_COLOR_ARRAY: "ColorArray",
+}
+
+
+func _type_name(t : int) -> String:
+	return TYPE_NAMES.get(t, "type %d" % t)
+
+
+func _native_root(name : String):
+	match name:
+		"World": return Global.World
+		"Editor": return Global.Editor
+		"Level": return Global.World.GetCurrentLevel()
+		"Camera": return Global.Camera
+		"Exporter": return Global.Exporter
+		"Header": return Global.Header
+	var colon = name.find(":")
+	if colon == -1:
+		return null
+	var key = name.substr(colon + 1)
+	match name.substr(0, colon):
+		"Tool":
+			return Global.Editor.Tools[key] if Global.Editor.Tools.has(key) else null
+		"Window":
+			return Global.Editor.Windows[key] if Global.Editor.Windows.has(key) else null
+		"Element":
+			if key.is_valid_integer() and Global.World.HasNodeID(int(key)):
+				return Global.World.GetNodeByID(int(key))
+		"Level":
+			for lv in Global.World.levels:
+				if str(lv.ID) == key:
+					return lv
+		"Object":
+			if key.is_valid_integer():
+				return instance_from_id(int(key))
+	return null
+
+
+# One ".Member" step: a dictionary key, an array index, or an object's member
+# (a C# property through its get_X accessor, else a field / Godot property).
+func _native_member(obj, name : String):
+	if name == "" or name.begins_with("_") or name == "script":
+		return null
+	match typeof(obj):
+		TYPE_DICTIONARY:
+			if obj.has(name):
+				return obj[name]
+			return obj.get(int(name)) if name.is_valid_integer() else null
+		TYPE_ARRAY:
+			if name.is_valid_integer() and int(name) >= 0 and int(name) < obj.size():
+				return obj[int(name)]
+		TYPE_OBJECT:
+			if is_instance_valid(obj):
+				return _native_read(obj, name)
+	return null
+
+
+func _native_read(obj, name : String):
+	if obj.has_method("get_" + name):
+		return obj.call("get_" + name)
+	return obj.get(name)
+
+
+func _native_target(path : String):
+	var parts = path.split(".")
+	var obj = _native_root(parts[0])
+	for i in range(1, parts.size()):
+		if obj == null:
+			return null
+		obj = _native_member(obj, parts[i])
+	return obj
+
+
+# _native_target, but only a live object will do. Returns null otherwise.
+func _native_object(path : String):
+	var obj = _native_target(path)
+	if typeof(obj) == TYPE_OBJECT and is_instance_valid(obj):
+		return obj
+	return null
+
+
+# DD's own members: PascalCase methods, and the get_X / set_X accessors C#
+# gives its properties. Compiler-generated names carry "<" or ".".
+func _native_callable(name : String) -> bool:
+	if name == "" or name.find("<") != -1 or name.find(".") != -1:
+		return false
+	var first = name.substr(4, 1) if (name.begins_with("get_") or name.begins_with("set_")) else name.substr(0, 1)
+	return first != "" and first != "_" and first == first.to_upper() and first != first.to_lower()
+
+
+func _native_class(obj) -> String:
+	var script = obj.get_script()
+	if script != null and str(script.resource_path) != "":
+		return str(script.resource_path).get_file().get_basename()
+	return obj.get_class()
+
+
+# A value as JSON. Godot types become { "$type", "value" }, objects a
+# { "$target": "Object:<id>" } that can be passed back as a target or argument.
+func _native_pack(v, depth : int = 0):
+	match typeof(v):
+		TYPE_NIL, TYPE_BOOL, TYPE_INT, TYPE_REAL, TYPE_STRING:
+			return v
+		TYPE_VECTOR2:
+			return { "$type": "Vector2", "value": [v.x, v.y] }
+		TYPE_VECTOR3:
+			return { "$type": "Vector3", "value": [v.x, v.y, v.z] }
+		TYPE_RECT2:
+			return { "$type": "Rect2", "value": [v.position.x, v.position.y, v.size.x, v.size.y] }
+		TYPE_COLOR:
+			return { "$type": "Color", "value": _hex(v) }
+		TYPE_TRANSFORM2D:
+			return { "$type": "Transform2D", "value": [_vec(v.x), _vec(v.y), _vec(v.origin)] }
+		TYPE_NODE_PATH:
+			return str(v)
+		TYPE_RAW_ARRAY:
+			return { "$type": "bytes", "size": v.size() }
+		TYPE_OBJECT:
+			if not is_instance_valid(v):
+				return null
+			var o := { "$target": "Object:%d" % v.get_instance_id(), "class": _native_class(v) }
+			if v is Node:
+				o["name"] = str(v.name)
+			elif v is Resource and v.resource_path != "":
+				o["path"] = v.resource_path
+			return o
+		TYPE_DICTIONARY:
+			if depth >= NATIVE_MAX_DEPTH:
+				return { "$type": "Dictionary", "size": v.size() }
+			var d := {}
+			for key in v:
+				if d.size() >= NATIVE_MAX_ITEMS:
+					d["$truncated"] = v.size() - NATIVE_MAX_ITEMS
+					break
+				d[str(key)] = _native_pack(v[key], depth + 1)
+			return d
+		TYPE_ARRAY, TYPE_INT_ARRAY, TYPE_REAL_ARRAY, TYPE_STRING_ARRAY, TYPE_VECTOR2_ARRAY, TYPE_COLOR_ARRAY:
+			if depth >= NATIVE_MAX_DEPTH:
+				return { "$type": _type_name(typeof(v)), "size": v.size() }
+			var a := []
+			for item in v:
+				if a.size() >= NATIVE_MAX_ITEMS:
+					a.append({ "$truncated": v.size() - NATIVE_MAX_ITEMS })
+					break
+				a.append(_native_pack(item, depth + 1))
+			return a
+	return str(v)
+
+
+# JSON back to a value (the reverse of _native_pack, plus two ways to make a
+# resource argument). Returns _ok(value) / _err(why).
+func _native_unpack(v) -> Dictionary:
+	if typeof(v) == TYPE_ARRAY:
+		var a := []
+		for item in v:
+			var u = _native_unpack(item)
+			if not u.ok: return u
+			a.append(u.result)
+		return _ok(a)
+	if typeof(v) != TYPE_DICTIONARY:
+		return _ok(v)
+	if v.has("$target"):
+		var obj = _native_object(str(v["$target"]))
+		if obj == null: return _err("no live object at " + str(v["$target"]))
+		return _ok(obj)
+	if not v.has("$type"):
+		var d := {}
+		for key in v:
+			var u = _native_unpack(v[key])
+			if not u.ok: return u
+			d[key] = u.result
+		return _ok(d)
+	var val = v.get("value")
+	match str(v["$type"]):
+		"Texture":
+			var tex = _asset_tex(str(v.get("category", "Objects")), v.get("asset", ""))
+			if tex == null: return _err("no such %s asset: %s" % [str(v.get("category", "Objects")), str(v.get("asset"))])
+			return _ok(tex)
+		"Image":
+			var img = Image.new()
+			if not File.new().file_exists(str(v.get("path", ""))) or img.load(str(v["path"])) != OK:
+				return _err("could not read image: " + str(v.get("path")))
+			return _ok(img)
+		"Vector2":
+			return _native_coerce(val, TYPE_VECTOR2)
+		"Vector3":
+			if _is_numbers(val, 3): return _ok(Vector3(val[0], val[1], val[2]))
+		"Rect2":
+			return _native_coerce(val, TYPE_RECT2)
+		"Color":
+			return _native_coerce(val, TYPE_COLOR)
+		"Vector2Array":
+			return _native_coerce(val, TYPE_VECTOR2_ARRAY)
+		"StringArray":
+			return _native_coerce(val, TYPE_STRING_ARRAY)
+		"IntArray":
+			return _native_coerce(val, TYPE_INT_ARRAY)
+		"FloatArray":
+			return _native_coerce(val, TYPE_REAL_ARRAY)
+	return _err("bad or unsupported tagged value: " + JSON.print(v))
+
+
+func _is_numbers(v, count : int) -> bool:
+	if typeof(v) != TYPE_ARRAY or v.size() != count:
+		return false
+	for n in v:
+		if not (typeof(n) in [TYPE_INT, TYPE_REAL]):
+			return false
+	return true
+
+
+# Fit a decoded value to the type DD declares for a parameter or property, so
+# plain JSON is enough wherever the type is known: every JSON number arrives as
+# a float, [x, y] can be a Vector2, "#rrggbb" a Color, a list of pairs a
+# Vector2Array. Returns _ok(value) / _err(why).
+func _native_coerce(val, want : int) -> Dictionary:
+	var have = typeof(val)
+	if want == TYPE_NIL or have == want:
+		return _ok(val)
+	match want:
+		TYPE_INT:
+			if have == TYPE_REAL and val == floor(val): return _ok(int(val))
+		TYPE_REAL:
+			if have == TYPE_INT: return _ok(float(val))
+		TYPE_OBJECT:
+			if have == TYPE_NIL: return _ok(null)
+		TYPE_VECTOR2:
+			if _is_numbers(val, 2): return _ok(Vector2(val[0], val[1]))
+		TYPE_RECT2:
+			if _is_numbers(val, 4): return _ok(Rect2(val[0], val[1], val[2], val[3]))
+		TYPE_COLOR:
+			if have == TYPE_STRING and val.trim_prefix("#").is_valid_hex_number(false) and val.trim_prefix("#").length() in [6, 8]:
+				return _ok(_color(val, Color()))
+			if (_is_numbers(val, 3) or _is_numbers(val, 4)): return _ok(_color(val, Color()))
+		TYPE_VECTOR2_ARRAY:
+			if have == TYPE_ARRAY:
+				var pts = _points(val)
+				if pts.size() == val.size(): return _ok(pts)
+		TYPE_STRING_ARRAY:
+			if have == TYPE_ARRAY:
+				for item in val:
+					if typeof(item) != TYPE_STRING: return _err("expected a list of strings")
+				return _ok(PoolStringArray(val))
+		TYPE_INT_ARRAY:
+			if _is_numbers(val, val.size() if have == TYPE_ARRAY else -1): return _ok(PoolIntArray(val))
+		TYPE_REAL_ARRAY:
+			if _is_numbers(val, val.size() if have == TYPE_ARRAY else -1): return _ok(PoolRealArray(val))
+	return _err("expected %s, got %s" % [_type_name(want), _type_name(have)])
+
+
+func _native_targets() -> Dictionary:
+	var out := []
+	for name in NATIVE_ROOTS:
+		out.append(name)
+	for key in Global.Editor.Tools:
+		out.append("Tool:" + str(key))
+	for key in Global.Editor.Windows:
+		out.append("Window:" + str(key))
+	return _ok({ "targets": out })
+
+
+# List an object's DD methods (name, typed args, return type) and properties.
+# C# properties show up through their get_X / set_X accessors; plain C# fields
+# (World.levels, Terrain.width) are not listed anywhere but can still be read.
+func _native_describe(req : Dictionary) -> Dictionary:
+	var target = str(req.get("target", "Level"))
+	var obj = _native_object(target)
+	if obj == null: return _err("no live object at target: " + target)
+	var search = str(req.get("search", "")).to_lower()
+	var methods := []
+	var props := {}     # name -> { name, type, settable }
+	for m in obj.get_method_list():
+		var name = str(m.name)
+		if not _native_callable(name):
+			continue
+		if name.begins_with("get_") or name.begins_with("set_"):
+			var p = props.get(name.substr(4), { "name": name.substr(4), "type": "Variant", "settable": false })
+			if name.begins_with("get_"):
+				p["type"] = _type_name(int(m["return"].type))
+			else:
+				p["settable"] = true
+				if p["type"] == "Variant" and m.args.size() == 1:
+					p["type"] = _type_name(int(m.args[0].type))
+			props[p["name"]] = p
+			continue
+		if search != "" and name.to_lower().find(search) == -1:
+			continue
+		var args := []
+		for a in m.args:
+			args.append({ "name": str(a.name), "type": _type_name(int(a.type)) })
+		var entry := { "name": name, "args": args }
+		if int(m["return"].type) != TYPE_NIL:
+			entry["returns"] = _type_name(int(m["return"].type))
+		methods.append(entry)
+	for info in obj.get_property_list():
+		var name = str(info.name)
+		# Skip category / group headers and anything already found as a C# property.
+		if name.begins_with("_") or name.find("<") != -1 or name == "script" or props.has(name) \
+				or (int(info.usage) & (PROPERTY_USAGE_CATEGORY | PROPERTY_USAGE_GROUP)) != 0:
+			continue
+		props[name] = { "name": name, "type": _type_name(int(info.type)), "settable": true }
+	var properties := []
+	for name in props:
+		if search == "" or name.to_lower().find(search) != -1:
+			properties.append(props[name])
+	return _ok({
+		"target": target, "class": _native_class(obj),
+		"method_count": methods.size(), "methods": methods.slice(0, NATIVE_MAX_ITEMS - 1),
+		"property_count": properties.size(), "properties": properties.slice(0, NATIVE_MAX_ITEMS - 1),
+	})
+
+
+func _native_get(req : Dictionary) -> Dictionary:
+	var target = str(req.get("target", "Level"))
+	var obj = _native_object(target)
+	if obj == null: return _err("no live object at target: " + target)
+	var names = req.get("properties", [])
+	if typeof(names) != TYPE_ARRAY or names.empty(): return _err("'properties' must be a list of names")
+	var out := {}
+	for name in names:
+		if typeof(name) != TYPE_STRING or name == "" or name.begins_with("_") or name == "script":
+			return _err("bad property name: " + str(name))
+		out[name] = _native_pack(_native_read(obj, name))
+	return _ok({ "target": target, "values": out })
+
+
+# The Variant type a property takes: from its C# setter, else Godot's property
+# list, else whatever it currently holds (TYPE_NIL = unknown, pass as given).
+func _native_property_type(obj, prop : String) -> int:
+	for m in obj.get_method_list():
+		if str(m.name) == "set_" + prop and m.args.size() == 1:
+			return int(m.args[0].type)
+	for info in obj.get_property_list():
+		if str(info.name) == prop:
+			return int(info.type)
+	return typeof(_native_read(obj, prop))
+
+
+func _native_set(req : Dictionary) -> Dictionary:
+	var target = str(req.get("target", "Level"))
+	var obj = _native_object(target)
+	if obj == null: return _err("no live object at target: " + target)
+	var prop = str(req.get("property", ""))
+	if prop == "" or prop.begins_with("_") or prop == "script" or prop.find("<") != -1:
+		return _err("bad property name: " + prop)
+	if obj.has_method("get_" + prop) and not obj.has_method("set_" + prop):
+		return _err("property '%s' is read-only (it has no setter)" % prop)
+	var u = _native_unpack(req.get("value"))
+	if not u.ok: return u
+	var c = _native_coerce(u.result, _native_property_type(obj, prop))
+	if not c.ok: return _err("'%s': %s" % [prop, c.error])
+	if obj.has_method("set_" + prop):
+		obj.call("set_" + prop, c.result)
+	else:
+		obj.set(prop, c.result)
+	return _ok({ "target": target, "property": prop, "value": _native_pack(_native_read(obj, prop)) })
+
+
+func _native_call(req : Dictionary) -> Dictionary:
+	var target = str(req.get("target", "Level"))
+	var obj = _native_object(target)
+	if obj == null: return _err("no live object at target: " + target)
+	var method = str(req.get("method", ""))
+	if not _native_callable(method):
+		return _err("only Dungeondraft's own methods (PascalCase) can be called: " + method)
+	var args = req.get("args", [])
+	if typeof(args) != TYPE_ARRAY: return _err("'args' must be a list")
+	# A C# default argument is NOT filled in for a call from here, and a call
+	# with the wrong count silently does nothing, so match the count exactly.
+	var info = null
+	var counts := []
+	for m in obj.get_method_list():
+		if str(m.name) == method:
+			counts.append(m.args.size())
+			if m.args.size() == args.size():
+				info = m
+	if counts.empty(): return _err("%s has no method %s" % [_native_class(obj), method])
+	if info == null:
+		return _err("%s takes %s argument(s), got %d (pass every argument, including ones with defaults)" % [method, str(counts), args.size()])
+	var values := []
+	for i in range(args.size()):
+		var u = _native_unpack(args[i])
+		if u.ok:
+			u = _native_coerce(u.result, int(info.args[i].type))
+		if not u.ok:
+			return _err("argument %d (%s): %s" % [i, str(info.args[i].name), u.error])
+		values.append(u.result)
+	return _ok({ "target": target, "method": method, "value": _native_pack(obj.callv(method, values)) })
+
+
+# The controls under a target, flattened: buttons, toggles, sliders, text
+# fields, option lists, color pickers and labels, each with its state and an
+# "Object:<id>" target for ui_action. A tool ("Tool:<name>") is not a node; its
+# controls are in its side panel, and the ones it keeps by name report it as
+# `control`.
+func _ui_tree(req : Dictionary) -> Dictionary:
+	var target = str(req.get("target", "Editor"))
+	var root = _native_object(target)
+	if root == null: return _err("no live object at target: " + target)
+	var named := {}
+	if not (root is Node):
+		var controls = root.get("Controls")
+		if not target.begins_with("Tool:") or target.find(".") != -1 or typeof(controls) != TYPE_DICTIONARY:
+			return _err("target has no UI: use Editor, a Tool:<name>, a Window:<name> or a control")
+		for key in controls:
+			if typeof(controls[key]) == TYPE_OBJECT and is_instance_valid(controls[key]):
+				named[controls[key].get_instance_id()] = str(key)
+		root = Global.Editor.Toolset.GetToolPanel(target.substr(5))
+		if root == null: return _err("tool has no panel: " + target)
+	var search = str(req.get("search", "")).to_lower()
+	var limit = int(clamp(int(req.get("limit", NATIVE_MAX_ITEMS)), 1, 1000))
+	var out := []
+	var matched := 0
+	var stack := [root]
+	while not stack.empty():
+		var node = stack.pop_back()
+		var kids = node.get_children()
+		for i in range(kids.size() - 1, -1, -1):    # reversed, so they pop in tree order
+			stack.append(kids[i])
+		if not (node is Control) or not (named.has(node.get_instance_id()) or _ui_is_widget(node)):
+			continue
+		var entry = _ui_entry(node, named)
+		if search != "" and JSON.print(entry).to_lower().find(search) == -1:
+			continue
+		matched += 1
+		if out.size() < limit:
+			out.append(entry)
+	return _ok({ "target": target, "matched": matched, "returned": out.size(), "controls": out })
+
+
+func _ui_is_widget(node) -> bool:
+	if node is ScrollBar or node.get_parent() is SpinBox:
+		return false     # a list's own scrollbar; a spin box's inner text field
+	return node is BaseButton or node is Range or node is LineEdit or node is TextEdit \
+			or node is ItemList or (node is Label and node.text != "")
+
+
+func _ui_entry(node, named : Dictionary) -> Dictionary:
+	var e := {
+		"target": "Object:%d" % node.get_instance_id(), "class": node.get_class(),
+		"visible": node.is_visible_in_tree(),
+	}
+	if named.has(node.get_instance_id()):
+		e["control"] = named[node.get_instance_id()]
+	if node.hint_tooltip != "":
+		e["tooltip"] = node.hint_tooltip
+	if node is Label or node is Button:
+		e["text"] = node.tr(node.text)    # captions are translation keys until drawn
+	elif node is LineEdit or node is TextEdit:
+		e["text"] = node.text
+	if node is BaseButton:
+		e["disabled"] = node.disabled
+		if node.toggle_mode:
+			e["pressed"] = node.pressed
+	if node is OptionButton:
+		e["selected"] = node.selected
+		var items := []
+		for i in range(node.get_item_count()):
+			items.append(node.get_item_text(i))
+		e["items"] = items
+	if node is ColorPickerButton:
+		e["color"] = _hex(node.color)
+	if node is Range:
+		e["value"] = node.value
+		e["min"] = node.min_value
+		e["max"] = node.max_value
+		e["step"] = node.step
+	if node is ItemList:
+		var items := []
+		for i in range(node.get_item_count()):
+			items.append(node.get_item_text(i))
+		e["items"] = items
+		e["selected_items"] = Array(node.get_selected_items())
+	return e
+
+
+# Operate a control found with ui_tree. `press` clicks a button; `set` gives a
+# toggle, slider, text field, option list or color picker a value and fires the
+# signal DD listens to, so its own handler runs as if the user had done it.
+func _ui_action(req : Dictionary) -> Dictionary:
+	var target = str(req.get("target", ""))
+	var node = _native_object(target)
+	if node == null or not (node is Control):
+		return _err("target is not a live UI control: use a 'target' from ui_tree")
+	match str(req.get("action", "")):
+		"press":
+			if not (node is BaseButton): return _err("only buttons can be pressed")
+			if node.disabled: return _err("button is disabled")
+			# Deferred: the handler (which may open a dialog or swap the map)
+			# then runs after this reply is out, not inside the mod's update.
+			if node.toggle_mode:
+				node.call_deferred("set_pressed", not node.pressed)
+			node.call_deferred("emit_signal", "pressed")
+			return _ok({ "target": target, "pressed": true })
+		"set":
+			var bad = _ui_set(node, req.get("value"))
+			if bad != "": return _err(bad)
+			return _ok(_ui_entry(node, {}))
+		"show":
+			if node is Popup:
+				node.call_deferred("popup_centered")
+			else:
+				node.show()
+			return _ok({ "target": target, "shown": true })
+		"hide":
+			node.hide()
+			return _ok({ "target": target, "shown": false })
+	return _err("'action' must be press, set, show or hide")
+
+
+# Returns "" or why the value doesn't fit the control.
+func _ui_set(node, value) -> String:
+	var is_number = typeof(value) in [TYPE_INT, TYPE_REAL]
+	if node is ColorPickerButton:
+		var c = _native_coerce(value, TYPE_COLOR)
+		if not c.ok: return "a color picker takes '#rrggbb' or [r,g,b]"
+		node.color = c.result
+		node.emit_signal("color_changed", node.color)
+	elif node is OptionButton or node is ItemList:
+		var index = int(value) if is_number else -1
+		if typeof(value) == TYPE_STRING:
+			for i in range(node.get_item_count()):
+				if node.get_item_text(i).to_lower() == value.to_lower():
+					index = i
+		if index < 0 or index >= node.get_item_count() or node.is_item_disabled(index):
+			return "not an available item (give its index or exact text)"
+		node.select(index)
+		node.emit_signal("item_selected", index)
+	elif node is BaseButton:
+		if not node.toggle_mode or typeof(value) != TYPE_BOOL: return "only a toggle can be set, to true or false; use 'press' for a button"
+		if node.disabled: return "control is disabled"
+		node.pressed = value
+	elif node is Range:
+		if not is_number or value < node.min_value or value > node.max_value:
+			return "expected a number from %s to %s" % [str(node.min_value), str(node.max_value)]
+		node.value = float(value)
+	elif node is LineEdit:
+		if typeof(value) != TYPE_STRING: return "a text field takes a string"
+		node.text = value
+		node.emit_signal("text_changed", value)
+		node.emit_signal("text_entered", value)
+	elif node is TextEdit:
+		if typeof(value) != TYPE_STRING: return "a text field takes a string"
+		node.text = value
+		node.emit_signal("text_changed")
+	else:
+		return "this kind of control (%s) can't be set" % node.get_class()
+	return ""
+
+
+# ---------------------------------------------------------------------------
+# Spatial facts: footprints, walls, doors and regions for the layout checks
+# ---------------------------------------------------------------------------
+#
+# The mod only reports geometry; the checks (does this table cross a wall,
+# block a door, overlap the bed?) are done by the server's spatial.py from one
+# snapshot. A footprint is the box around a sprite's opaque pixels, carried
+# through the object's own rotation and scale: four corners, in woxels.
+
+const META_USED_RECT := "mcp_bridge_used_rect"
+const META_REGIONS := "mcp_bridge_regions"
+const REGION_KINDS := ["room", "clearance", "protected"]
+const DEFAULT_WALL_HALF_WIDTH := 32.0
+
+
+# The part of a texture that isn't fully transparent, in its own pixels. Read
+# back once per texture and kept on the texture itself (DD's asset textures are
+# shared, cached instances). The whole image when the pixels can't be read.
+func _texture_used_rect(tex) -> Rect2:
+	if tex.has_meta(META_USED_RECT):
+		return tex.get_meta(META_USED_RECT)
+	var rect = Rect2(Vector2(), tex.get_size())
+	var img = tex.get_data()
+	if img != null and not img.is_empty() and (not img.is_compressed() or img.decompress() == OK):
+		var used = img.get_used_rect()
+		if used.size.x > 0 and used.size.y > 0:
+			rect = used
+	tex.set_meta(META_USED_RECT, rect)
+	return rect
+
+
+func _rect_corners(r : Rect2) -> Array:
+	return [r.position, Vector2(r.end.x, r.position.y), r.end, Vector2(r.position.x, r.end.y)]
+
+
+func _vecs(points : Array) -> Array:
+	var out := []
+	for p in points:
+		out.append(_vec(p))
+	return out
+
+
+# An object's footprint, or null when it has no readable sprite. `local` is in
+# the object's own space (before its position / rotation / scale), so the
+# server can work out where it would land after a move, turn or resize;
+# `polygon` is where it is now.
+func _object_footprint(prop):
+	var sprite = prop.get("Sprite")
+	var tex = prop.get("Texture")
+	if sprite == null or not (sprite is Sprite) or tex == null or not (tex is Texture):
+		return null
+	var size = tex.get_size()
+	if size.x <= 0 or size.y <= 0:
+		return null
+	var used = _texture_used_rect(tex)
+	if sprite.flip_h: used.position.x = size.x - used.end.x
+	if sprite.flip_v: used.position.y = size.y - used.end.y
+	var rect = sprite.get_rect()
+	var local := []
+	var world := []
+	for corner in _rect_corners(Rect2(rect.position + used.position * rect.size / size, used.size * rect.size / size)):
+		var p = sprite.transform.xform(corner)
+		local.append(_vec(p))
+		world.append(_vec(prop.global_transform.xform(p)))
+	return {
+		"id": _id(prop), "asset": tex.resource_path, "layer": prop.z_index,
+		"position": _vec(prop.position), "scale": _vec(prop.scale),
+		"rotation": rad2deg(prop.rotation), "local": local, "polygon": world,
+	}
+
+
+# The footprint an asset (or an image file about to be imported) would have as
+# a new object at scale 1: its size, its opaque box, and that box's corners
+# around the sprite's center. Returns _ok({...}) / _err(why).
+func _footprint_of(req : Dictionary) -> Dictionary:
+	var size : Vector2
+	var used : Rect2
+	var name = str(req.get("asset", ""))
+	if req.has("path"):
+		name = str(req["path"])
+		var img = Image.new()
+		if not File.new().file_exists(name) or img.load(name) != OK:
+			return _err("could not read image: " + name)
+		size = img.get_size()
+		used = img.get_used_rect()
+		if used.size.x <= 0 or used.size.y <= 0:
+			used = Rect2(Vector2(), size)
+	else:
+		var category = str(req.get("category", "Objects"))
+		var tex = _asset_tex(category, name)
+		if tex == null: return _err("could not load %s asset: %s" % [category, name])
+		size = tex.get_size()
+		used = _texture_used_rect(tex)
+	return _ok({
+		"asset": name, "size": _vec(size),
+		"visible": [used.position.x, used.position.y, used.size.x, used.size.y],
+		"local": _vecs(_rect_corners(Rect2(used.position - size * 0.5, used.size))),
+	})
+
+
+func _asset_footprint(req : Dictionary) -> Dictionary:
+	return _footprint_of(req)
+
+
+# Everything the layout checks need about the current level, in one reply.
+# With `asset` (+ `category`) or `path`, also the `footprint` of that candidate.
+func _spatial_snapshot(req : Dictionary) -> Dictionary:
+	var level = Global.World.GetCurrentLevel()
+	if level == null: return _err("no map open")
+	var result := {
+		"level_id": level.ID,
+		"map_size": _vec(Global.World.WoxelDimensions),
+		"regions": _regions(level),
+	}
+	if req.has("asset") or req.has("path"):
+		var f = _footprint_of(req)
+		if not f.ok: return f
+		result["footprint"] = f.result
+
+	var objects := []
+	var unreadable := []
+	for prop in level.Objects.get_children():
+		if prop.has_meta("preview") and prop.get_meta("preview"):
+			continue     # the Object tool's ghost under the cursor
+		var f = _object_footprint(prop)
+		if f == null:
+			unreadable.append(_id(prop))
+		else:
+			objects.append(f)
+	result["objects"] = objects
+	result["unreadable"] = unreadable
+
+	var walls := []
+	var portals := []
+	for wall in level.Walls.get_children():
+		var pts = wall.get("Points")
+		if pts == null or pts.size() < 2:
+			continue
+		var route := []
+		for p in pts:
+			route.append(_vec(wall.global_transform.xform(p)))
+		var tex = wall.get("Texture")
+		var half = DEFAULT_WALL_HALF_WIDTH
+		if tex != null and tex is Texture:
+			half = tex.get_height() * 0.5     # a wall is a Line2D as wide as its texture is tall
+		walls.append({
+			"id": _id(wall), "points": route, "loop": bool(wall.get("Loop")),
+			"half_width": half * max(abs(wall.scale.x), abs(wall.scale.y)),
+		})
+		for portal in wall.Portals:
+			var along = portal.Direction
+			along = along.normalized() if along.length() > 0.001 else Vector2(1, 0)
+			var asset = portal.Texture.resource_path if portal.Texture != null else ""
+			portals.append({
+				"id": _id(portal), "wall_id": _id(wall), "asset": asset,
+				"position": _vec(portal.global_position), "direction": _vec(along),
+				"radius": float(portal.Radius),
+				# The only thing telling a window from a door is its asset's name.
+				"window": asset.get_file().to_lower().find("window") != -1,
+			})
+	result["walls"] = walls
+	result["portals"] = portals
+	return _ok(result)
+
+
+# Regions are named polygons the layout checks treat specially (see the
+# server's set_spatial_region). They live on the level node for the session:
+# DD's map format has nowhere to keep them, so they are gone after a reload.
+func _regions(level) -> Array:
+	return level.get_meta(META_REGIONS) if level.has_meta(META_REGIONS) else []
+
+
+func _list_spatial_regions() -> Dictionary:
+	var level = Global.World.GetCurrentLevel()
+	if level == null: return _err("no map open")
+	return _ok({ "level_id": level.ID, "regions": _regions(level) })
+
+
+func _set_spatial_region(req : Dictionary) -> Dictionary:
+	var level = Global.World.GetCurrentLevel()
+	if level == null: return _err("no map open")
+	var name = str(req.get("name", "")).strip_edges()
+	if name == "" or name.length() > 100: return _err("'name' must be 1-100 characters")
+	var kind = str(req.get("kind", "clearance"))
+	if not (kind in REGION_KINDS): return _err("'kind' must be one of " + str(REGION_KINDS))
+	var pts = _shape_points(req)
+	if pts.size() < 3: return _err("provide 'rect':[x,y,w,h] or 'points':[[x,y]...] (>= 3 points, with some area)")
+	var regions := []
+	for r in _regions(level):
+		if r["name"] != name:
+			regions.append(r)
+	regions.append({ "name": name, "kind": kind, "points": _vecs(Array(pts)) })
+	level.set_meta(META_REGIONS, regions)
+	return _ok({ "level_id": level.ID, "regions": regions })
+
+
+func _remove_spatial_region(req : Dictionary) -> Dictionary:
+	var level = Global.World.GetCurrentLevel()
+	if level == null: return _err("no map open")
+	var name = str(req.get("name", "")).strip_edges()
+	var regions := []
+	var removed := false
+	for r in _regions(level):
+		if r["name"] == name:
+			removed = true
+		else:
+			regions.append(r)
+	if not removed: return _err("no region named '%s' on this level" % name)
+	level.set_meta(META_REGIONS, regions)
+	return _ok({ "level_id": level.ID, "regions": regions })
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -2409,6 +3434,9 @@ func _describe(node) -> Dictionary:
 	var tex_path = _texture_path(node, t)
 	if tex_path != "":
 		d["asset"] = tex_path
+	var layer = _element_layer(node)
+	if layer != null:
+		d["layer"] = layer
 	if t == 4 and node.has_method("HasCustomColor"):
 		d["colorable"] = _is_colorable(node)
 		if node.HasCustomColor():
@@ -2502,9 +3530,15 @@ func _shape_points(req : Dictionary) -> PoolVector2Array:
 	return pts
 
 
-# Accepts "#rrggbb" / "rrggbb" string, or [r,g,b] / [r,g,b,a] floats 0..1.
+# Accepts "#rrggbb" / "#rrggbbaa" (the "#" is optional), or [r,g,b] / [r,g,b,a]
+# floats 0..1. Godot 3's Color(String) reads eight digits as AARRGGBB, so the
+# alpha pair is moved to the front first: "ff000080" is half-transparent red
+# here, not opaque blue.
 func _color(v, fallback : Color) -> Color:
 	if typeof(v) == TYPE_STRING and v != "":
+		var hex = v.trim_prefix("#")
+		if hex.length() == 8 and hex.is_valid_hex_number(false):
+			return Color(hex.substr(6, 2) + hex.substr(0, 6))
 		return Color(v)
 	if typeof(v) == TYPE_ARRAY and v.size() >= 3:
 		var a = 1.0
@@ -2512,6 +3546,15 @@ func _color(v, fallback : Color) -> Color:
 			a = float(v[3])
 		return Color(float(v[0]), float(v[1]), float(v[2]), a)
 	return fallback
+
+
+# A color as the bridge reports it: "#rrggbb", or "#rrggbbaa" when it is not
+# opaque (Color.to_html(true) would put the alpha first; see _color).
+func _hex(c : Color) -> String:
+	var hex = "#" + c.to_html(false)
+	if c.a < 1.0:
+		hex += "%02x" % int(round(c.a * 255.0))
+	return hex
 
 
 func _ok(result) -> Dictionary:

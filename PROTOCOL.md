@@ -44,15 +44,21 @@ Coordinates are **woxel** (world pixel) space; map center is in
 | cmd | params | result |
 | --- | --- | --- |
 | `ping` | — | `{ pong, protocol, engine }` |
-| `get_status` | — | `{ map_open, level_id, level_count, map_size_woxels, map_center, terrain_slots (4 or 8), counts{}, active_tool }` |
+| `get_status` | — | `{ map_open, level_id, level_index, level_count, map_size_woxels, map_center, terrain_slots (4 or 8), terrain_visible, counts{}, active_tool }` |
 | `list_asset_categories` | — | `{ categories[] }` |
 | `list_assets` | `category="Objects"`, `search=""`, `limit=100` | `{ category, total, matched, returned, assets[] }` |
 | `list_elements` | `kind="objects"`, `limit=200` | `{ kind, count, elements[] }` |
 | `get_element` | `id` | element descriptor |
-| `list_levels` | — | `{ current_index, levels[] }` |
+| `list_levels` | — | `{ current_index, current_id, levels[{ index, id, label }] }`, top floor first |
+| `list_layers` | — | `{ level_id, layers[{ layer, label, locked }] }`, bottom to top |
 
 `kind` ∈ `objects, walls, lights, paths, portals, roofs, texts`. An element
-descriptor is `{ id, kind, position[x,y], rotation(deg), scale, asset? }`.
+descriptor is `{ id, kind, position[x,y], rotation(deg), scale, asset?, layer? }`
+(`layer` for objects, paths and pattern floors, the kinds that have one).
+A level's `index` is its place in the list and changes when levels are added,
+cloned or reordered; its `id` stays put while the map is open (DD hands ids out
+afresh on load). `get_status.level_id` is the id (it used to report the index
+under that name; `level_index` is the index).
 `get_element` on a wall (and `modify_wall`) adds its geometry: `points[[x,y]...]`,
 `loop`, `type`, `joint`, `portal_count`. `list_elements` leaves these out.
 
@@ -74,7 +80,7 @@ node; default color is black.
 
 | cmd | params |
 | --- | --- |
-| `place_object` | `asset`, `x?`, `y?`, `scale=1`, `rotation=0`, `sorting=0`, `color?` → `{ id, position, color?, warning? }` |
+| `place_object` | `asset`, `x?`, `y?`, `scale=1`, `rotation=0`, `sorting=0`, `color?`, `layer=0` → `{ id, position, color?, warning? }` |
 | `draw_wall` | `points[[x,y]...]`, `asset?`, `loop=false`, `shadow=true`, `type=0`, `joint=1`, `color?` |
 | `draw_path` | `points[[x,y]...]`, `asset`, `layer=0`, `sorting=0`, `smoothness?`, `width?` |
 | `add_light` | `x?`, `y?`, `color?`, `energy=1`, `range=1`, `shadows=true`, `asset?` |
@@ -83,7 +89,7 @@ node; default color is black.
 | `add_text` | `text`, `x?`, `y?`, `size?`, `color?`, `font?` |
 | `place_pattern` | `asset`, `rect=[x,y,w,h]` **or** `points=[[x,y]...]`, `category="Patterns"`, `color?`, `rotation?` |
 | `build_room` | `rect=[x,y,w,h]` **or** `points=[[x,y]...]`, `wall_asset?`, `floor="pattern"\|"terrain"\|"none"`, `floor_asset?`, `floor_category="Simple Tiles"`, `floor_color?`, `floor_slot=1`, `wall_type=0`, `wall_joint=1` → `{ wall_id, floor_id?, points }` |
-| `import_image` | `path` (absolute; `.png` / `.jpg` / `.jpeg` / `.webp`), `x?`, `y?`, `scale=1`, `rotation=0`, `sorting=0`, `shadow=true` → `{ id, position, image_size[w,h], asset }`. The new element is an ordinary object whose `asset` is `embedded://<path>` |
+| `import_image` | `path` (absolute; `.png` / `.jpg` / `.jpeg` / `.webp`), `x?`, `y?`, `scale=1`, `rotation=0`, `sorting=0`, `shadow=true`, `layer=0` → `{ id, position, image_size[w,h], asset }`. The new element is an ordinary object whose `asset` is `embedded://<path>` |
 
 ### Terrain
 
@@ -125,10 +131,16 @@ polygon, >= 3 points, with some area).
 | `move_element` | `id`, `x`, `y` |
 | `modify_object` | `id`, `scale?`, `rotation?`, `color?`, `shadow?` → descriptor (+ `warning?`) |
 | `modify_wall` | `id`, `points?[[x,y]...]`, `loop?`, `type?`, `joint?`, `asset?`, `color?`, `shadow?` → wall descriptor with geometry |
+| `set_element_layer` | `id`, `layer` → `{ id, layer, previous }` (objects, paths and pattern floors) |
 | `duplicate_object` | `id`, `dx=64`, `dy=0` → `{ id }` |
 | `delete_element` | `id` → `{ deleted }` |
-| `add_level` | `label="Level"` → `{ id, label }` |
-| `set_level` | `index` |
+| `add_level` | `label="Level"`, `terrain=false` → `{ id, label, index: 0, current_index, terrain_visible }` |
+| `set_level` | `index` → `{ current_index, current_id }` |
+| `rename_level` | `index`, `label` → level list |
+| `clone_level` | `index`, `label?` → `{ id, label, index: 0, current_index }` |
+| `reorder_levels` | `ids[]` (every level id once, top floor first) → level list |
+| `compare_levels` | `index=-1` (-1 = off), `reference_opacity=0.35`, `current_opacity=1` → `{ comparing, ... }` |
+| `add_layer` | `layer` (z, -4096..4096), `label?` → layer list |
 | `select_elements` | `ids[]` |
 | `clear_selection` | — |
 
@@ -170,6 +182,63 @@ polygon, >= 3 points, with some area).
   without a prompt.** Call `save_map` first to keep them. The bridge's undo/redo
   stacks reset with the new map.
 
+### Layout facts
+
+The layout checks (does this table cross a wall, block a door, overlap the
+bed?) run in the **server** (`dungeondraft_mcp/spatial.py`); the mod only
+reports geometry and keeps the regions.
+
+| cmd | params | result |
+| --- | --- | --- |
+| `spatial_snapshot` | `asset?` + `category="Objects"`, or `path?` (an image file) | `{ level_id, map_size[w,h], objects[], unreadable[ids], walls[], portals[], regions[], footprint? }` |
+| `asset_footprint` | `asset` + `category="Objects"`, or `path` | `{ asset, size[w,h], visible[x,y,w,h], local[4 x [x,y]] }` |
+| `list_spatial_regions` | — | `{ level_id, regions[{ name, kind, points }] }` |
+| `set_spatial_region` | `name`, `kind="clearance"` (`room` / `clearance` / `protected`), `rect` **or** `points` | region list |
+| `remove_spatial_region` | `name` | region list |
+
+A snapshot object is `{ id, asset, layer, position, scale[sx,sy], rotation(deg),
+local[4], polygon[4] }`: `polygon` is its footprint now, in woxels, and `local`
+the same four corners in the object's own space (world = position +
+rotate(scale * local)), so the server can work out the footprint after a move,
+turn or resize. A wall is `{ id, points (woxels), loop, half_width }`, a portal
+`{ id, wall_id, asset, position, direction (unit, along the wall), radius,
+window }`. `footprint` / `asset_footprint` describe a new object at scale 1:
+`visible` is the box around its opaque pixels in image pixels, `local` that
+box's corners around the sprite's center.
+
+### Native access
+
+An escape hatch to Dungeondraft's own objects and UI, for what no command
+covers. `target` is a root (`World`, `Editor`, `Level` = the current level,
+`Camera`, `Exporter`, `Header`), `Tool:<name>`, `Window:<name>`, `Element:<id>`,
+`Level:<id>` or `Object:<instance id>`, optionally followed by `.Member` steps
+(`Level.Terrain`, `Tool:TerrainBrush.Controls.SmoothBlending`). Values are
+plain JSON where possible; other Godot types are `{ "$type", "value" }`
+(`Vector2`, `Rect2`, `Color`, ...) and objects `{ "$target": "Object:<id>",
+"class" }`, which can be passed back as a target or an argument. None of
+this is undoable.
+
+| cmd | params | result |
+| --- | --- | --- |
+| `native_targets` | — | `{ targets[] }`: the roots, every tool, every window |
+| `native_describe` | `target="Level"`, `search?` | `{ target, class, method_count, methods[{ name, args[{ name, type }], returns? }], property_count, properties[{ name, type, settable }] }` (lists capped at 200) |
+| `native_get` | `target`, `properties[]` | `{ target, values{} }`; an unknown name reads as `null` |
+| `native_set` | `target`, `property`, `value` | `{ target, property, value }` with the value held afterwards |
+| `native_call` | `target`, `method`, `args=[]` | `{ target, method, value }` |
+| `ui_tree` | `target="Editor"`, `search?`, `limit=200` | `{ target, matched, returned, controls[] }` |
+| `ui_action` | `target` (a control), `action` (`press` / `set` / `show` / `hide`), `value?` | the control's new state |
+
+`native_call` / `native_set` convert plain JSON to the declared type (`[x, y]`
+→ Vector2, `[[x,y]...]` → Vector2Array, `[x,y,w,h]` → Rect2, `"#rrggbb"` →
+Color, whole numbers → int). Other arguments: `{ "$target": "<target>" }` for
+an object, `{ "$type": "Texture", "category", "asset" }` for an asset texture,
+`{ "$type": "Image", "path" }` for an image file. A `ui_tree` control is
+`{ target, class, visible, control?, text?, tooltip?, disabled?, pressed?,
+value/min/max/step?, selected?, items?, selected_items?, color? }`.
+`ui_action` `set` takes `true`/`false` for a toggle, a number for a slider or
+spin box, a string for a text field, an item index or its exact text for an
+option or item list, a color for a color picker.
+
 ### Capture
 
 The caller passes the absolute `path` the mod should write the PNG to (the MCP
@@ -209,7 +278,7 @@ the rect's midpoint; `fit_elements` frames the union of all rects.
 The bridge keeps its **own** undo/redo stacks (it does not use Dungeondraft's
 `History.CreateCustomRecord`, which is unreliable on 3.4.2 — see notes). Every
 reversible edit (creates including `import_image`, `move_element`,
-`modify_object`, `modify_wall`, `fill_terrain`, `fill_region`, `paint_terrain`,
+`modify_object`, `modify_wall`, `set_element_layer`, `fill_terrain`, `fill_region`, `paint_terrain`,
 `paint_path`, `dig_cave`, `clear_caves`, `draw_water`, `draw_material`) pushes an
 op; a fresh edit clears the redo stack. Terrain ops snapshot the splat images
 before/after; `dig_cave` and `draw_material` snapshot their `BitMap` the same
@@ -225,7 +294,9 @@ texture, tint and flags.
 and capture commands are not recorded. This stack is independent of the user's
 Ctrl+Z in Dungeondraft.
 
-`color` accepts `"#rrggbb"` / `"rrggbb"` or `[r,g,b]` / `[r,g,b,a]` floats 0..1.
+`color` accepts `"#rrggbb"` / `"#rrggbbaa"` (the `#` is optional) or `[r,g,b]`
+/ `[r,g,b,a]` floats 0..1. Colors in results use the same form, with the alpha
+pair only when the color is not opaque.
 `type` for walls: 0=auto,1=manual,2=cave; for roofs: 0=gable,1=hip,2=dormer.
 
 ## Implementation notes
@@ -512,6 +583,110 @@ Ctrl+Z in Dungeondraft.
     `OS.get_ticks_msec()`). A save that throws leaves `IsSaving` stuck (see the
     note on registering created nodes), so in that case `open_map` refuses or
     abandons the switch instead of discarding the map.
+- **Calling DD's C# from the mod** — three things hold for every call, found
+  with `SaveMap`, `SetLevel` and a deliberately failing call:
+  - **C# default arguments are not filled in.** A call must pass every
+    declared parameter; with fewer, no method matches, nothing runs and GDScript
+    sees no error. `World.SetLevel(int level, bool loading = false)` called with
+    one argument was a silent no-op, so `set_level` never switched levels until
+    it passed both.
+  - **A C# exception does not reach GDScript.** The call returns `null`, the
+    handler carries on and replies, and DD prints *Unhandled Exception* with the
+    stack to its log (stdout). DD and the bridge keep running (checked on
+    1.2.0.1 Linux), but the rest of that frame's `Editor._Process` is skipped
+    and whatever the method was doing is left half done. So validate before
+    calling: a `null` from a call that should return something is the only
+    sign from inside.
+  - **Private members are reachable** (methods, fields, property setters), and
+    `get_method_list()` lists them like public ones. Generic containers cross
+    only when Godot can marshal them: `List<T>` and `Dictionary<K,V>` do,
+    `SortedDictionary` and `HashSet` read as `null`.
+  - One more trap of the same kind: `Script.GetAssetTexture` throws (and so
+    returns `null`) for an asset path it does not know. The bridge's "could not
+    load ... asset" errors rely on that `null`; each one also leaves an
+    exception in DD's log.
+- **Colors** — Godot 3 parses an eight-digit color string as **AARRGGBB**
+  (`Color("ff000080")` is opaque half-blue) and `Color.to_html(true)` writes the
+  same order. The bridge's `_color` moves a trailing alpha pair to the front
+  before parsing and `_hex` writes `#rrggbbaa`, so alpha is last on the wire in
+  both directions.
+- **Levels** — `World.levels` is ordered top floor first, and
+  `World.CurrentLevelId` is an **index** into it despite the name; a level's
+  identity is `Level.ID`, assigned when the level is created or the map loaded
+  (so stable for a session, not across a reload). `World.CreateLevel(label)` and
+  `CloneLevel(level, label)` insert at index 0 and keep the current level
+  current, so the current index goes up by one. The bridge then does what
+  `LevelSettings` does: `Editor.UpdateLevelOptions()` (the level dropdown) and,
+  for a new level, hides its terrain (`Terrain.Visible = false`). A visible
+  terrain is an opaque sheet, which would hide the level `compare_levels` shows
+  beneath; `add_level` takes `terrain: true` for a level that wants ground. A
+  clone is built from `Level.Save()` and fills in over the following frames,
+  with fresh node ids. `reorder_levels` passes a GDScript array to
+  `SetNewLevelOrder(List<Level>)`. `compare_levels` is
+  `SetCompareLevels(reference, referenceOpacity, currentOpacity, true)` /
+  `DisableCompareLevels()`; the setting is stored per current level and DD
+  re-applies it in `SetLevel`. The bridge ticks `Editor.CompareToggle` with
+  `set_pressed_no_signal` so the checkbox agrees without firing its handler.
+- **Layers** — a layer is a z value. `Level.Layers` maps z to a label: seven
+  locked ones DD's own nodes draw on (-500 Terrain, -300 Caves, -200 Floor,
+  0 Water, 500 Portals, 600 Walls, 800 Roofs) and the user layers (-400, -100,
+  100-400, 700, 900 by default). The table itself is a `SortedDictionary` and
+  can't be read; `Level.SaveLayers()` returns the user layers and
+  `LoadLayers({ z: label })` adds to them, which is how `add_layer` works (this
+  DD version has no layer editor of its own; the table is saved with the map
+  and the layer menus list it). An object's or path's layer is its `z_index`,
+  a pattern floor's is its parent layer node (`SetLayer`). `set_element_layer`
+  follows `SelectTool`: for an object, `Objects.RemoveFromSearchTable`, set
+  `z_index`, `AddToSearchTable`, because the selection index is keyed by z.
+  Within one z, the level's node order decides: Water, Patterns, Materials,
+  Paths, Objects. The bridge creates objects and paths on **0** (DD's own tools
+  default to 100), so 0 is accepted as a layer although it is the locked Water
+  layer. A light's `range` is its `texture_scale`; DD's Range slider is
+  `texture_scale * texture width / 512`, twice that for the built-in 1024-px
+  light textures.
+- **Native access** — built on Godot's reflection of DD's C# objects.
+  `get_method_list()` gives every C# method with argument names and Variant
+  types (object arguments carry no class, and nothing marks a method private),
+  including the `get_X` / `set_X` accessors of C# properties, from which
+  `native_describe` derives the property list; plain C# fields are not listed
+  anywhere but `get()` reads them. DD's methods are PascalCase and Godot's
+  snake_case, and `native_call` only accepts the former, which keeps
+  `free`, `call`, `set_script` and the rest of the engine out of reach.
+  Argument counts are matched exactly (see above) and each argument is fitted
+  to its declared type. Objects are handed out as `Object:<instance id>` and
+  looked up again with `instance_from_id`, so nothing is stored in the mod; an
+  object nothing else holds (a freshly cloned `Image`) is gone by the next
+  call. `get_class()` returns the Godot base class, so the class name comes
+  from the C# script's path when it has one. Tools (`Editor.Tools`) are plain
+  objects, not nodes: each keeps its named controls in a `Controls` dictionary
+  and its panel is `Editor.Toolset.GetToolPanel(name)`, which is what `ui_tree`
+  walks for a `Tool:<name>` target. Control captions are translation keys until
+  drawn, so `ui_tree` reports `tr(text)`. `ui_action` sets a control and emits
+  the signal DD's handler is connected to (`toggled` comes from setting
+  `pressed`; `item_selected`, `color_changed`, `text_changed` + `text_entered`
+  are emitted by hand); a button's `pressed` is emitted deferred, so a handler
+  that opens a dialog or swaps the map runs after the reply. Many tool
+  handlers only act while their tool is the active one.
+- **Layout checks** — a footprint is the rectangle around a sprite's opaque
+  pixels (`Texture.get_data().get_used_rect()`, read once per texture and kept
+  as meta on the shared texture object), mapped through `Sprite.get_rect()` and
+  the prop's transform. DD's own object art is cropped tight, so trimming
+  mostly matters for imported images. A wall's thickness is its texture's
+  height (it is a `Line2D` of that width). A door is told from a window only by
+  "window" in the asset's file name. Regions are stored as meta on the level
+  node: DD's map format has no place for them, so they last for the session.
+  Everything else is in the server: `spatial.py` clips each footprint against
+  walls, door zones, other footprints and regions, and counts contact (within
+  half a woxel, or an overlap under 16 square woxels) as touching, not as a
+  conflict, so furniture can sit flush against a wall. Objects only collide
+  with objects on the same layer. The placement check is opt-in per call
+  (`check` / `region` on the server's object tools) because rectangles are
+  conservative: a tree's box reaches well past its round canopy, and a chair
+  tucked under a table overlaps it. `protected` regions are enforced without a
+  flag, by the server's terrain, cave, water and material tools, with a margin
+  for how far each bleeds past its shape (one terrain cell, the cave border,
+  the material's quarter-tile overshoot). A client talking to the mod directly
+  gets the facts but none of the checks.
 - **Mod compile errors crash Dungeondraft** — DD compiles mod scripts when a
   map opens, and a GDScript **parse error** makes it crash natively, with no
   console output (only a Windows `.dmp`), instead of reporting the error. A
