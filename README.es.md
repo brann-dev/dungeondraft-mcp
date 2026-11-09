@@ -134,6 +134,8 @@ Una capacidad que solo es cálculo sobre lo que el mod ya informa vive únicamen
 
 Buenos siguientes objetivos: borrar un nivel, agrupar un lote de ediciones en un único paso de deshacer y huellas que sigan el contorno de un sprite en lugar de su rectángulo envolvente.
 
+Los pull requests son bienvenidos. Lee antes [CONTRIBUTING.md](CONTRIBUTING.md) (en inglés): explica qué debe incluir un cambio completo y cómo probarlo.
+
 ### Ciclo de desarrollo (léelo antes de iterar sobre el mod)
 
 Hay algunas cosas que te darán problemas si no las conoces de antemano:

@@ -134,6 +134,8 @@ claude mcp add dungeondraft -s user -- "$PWD/.venv/bin/dungeondraft-mcp"
 
 值得下一步实现的方向：删除楼层、把一批编辑合并为一步撤销，以及让占地范围贴合精灵图的轮廓，而不是它的外接矩形。
 
+欢迎提交 PR。请先阅读 [CONTRIBUTING.md](CONTRIBUTING.md)（英文）：其中列出了一个完整的改动应包含哪些内容，以及如何测试。
+
 ### 开发循环（改模组之前请先读这一节）
 
 有几件事如果事先不知道，会让你吃亏：

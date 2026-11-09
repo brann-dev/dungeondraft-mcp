@@ -134,6 +134,8 @@ Um recurso que é apenas cálculo sobre o que o mod já informa vive somente no 
 
 Bons próximos alvos: excluir um nível, agrupar um lote de edições em um único passo de desfazer e áreas ocupadas que sigam o contorno de um sprite em vez do seu retângulo envolvente.
 
+Pull requests são bem-vindos. Leia antes o [CONTRIBUTING.md](CONTRIBUTING.md) (em inglês): ele lista o que uma mudança completa deve incluir e como testá-la.
+
 ### Ciclo de desenvolvimento (leia antes de iterar no mod)
 
 Algumas coisas vão te atrapalhar se você não souber delas de antemão:

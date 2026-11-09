@@ -221,6 +221,9 @@ Good next targets: deleting a level, grouping a batch of edits into a single
 undo step, and footprints that follow a sprite's outline instead of its
 bounding box.
 
+Pull requests are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) first: it
+lists what a complete change includes and how to test it.
+
 ### Dev loop (read this before iterating on the mod)
 
 A few things will bite you if you don't know them up front:

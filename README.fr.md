@@ -134,6 +134,8 @@ Une capacité qui n'est qu'un calcul sur ce que le mod rapporte déjà vit uniqu
 
 Prochaines cibles intéressantes : supprimer un niveau, regrouper un lot de modifications en une seule étape d'annulation, et des emprises qui suivent le contour d'un sprite plutôt que son rectangle englobant.
 
+Les pull requests sont les bienvenues. Lisez d'abord [CONTRIBUTING.md](CONTRIBUTING.md) (en anglais) : il indique ce qu'une modification complète doit contenir et comment la tester.
+
 ### Boucle de développement (à lire avant d'itérer sur le mod)
 
 Quelques points vous joueront des tours si vous ne les connaissez pas d'avance :
