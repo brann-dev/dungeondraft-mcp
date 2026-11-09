@@ -29,7 +29,9 @@ so and make no edits until they resume.
 - Every element has an integer `id`; create calls return it, `list_elements` /
   `get_element` report it. Feed ids back into move/modify/delete.
 - Discover assets with `list_assets` (it takes a `category` and a substring
-  `search`); list categories with `list_asset_categories`. A map only sees
+  `search`); list categories with `list_asset_categories`. `preview_assets`
+  shows up to 32 candidates on one sheet (`true_scale=True` compares sizes;
+  a colourable asset shows its red mask until given a colour). A map only sees
   the asset packs it includes: `list_asset_packs` says which, and a map made
   without packs silently sees just the core assets. `search_pack_contents`
   looks inside every installed pack; `prepare_map_with_packs` gives a copy of
@@ -40,7 +42,9 @@ so and make no edits until they resume.
 - The bridge keeps its **own** `undo` / `redo` stacks (independent of DD's
   Ctrl+Z). Deletes are undoable; `batch`, `scatter_objects`, `build_room`,
   `place_objects`, `move_elements` and `delete_elements` are each ONE undo
-  step. `checkpoint(label)` before a multi-step change lets
+  step. The placement tools take `snap=True` to land on the user's grid
+  (`get_snap_settings` shows it); `set_map_size` resizes the map and clears
+  the undo history. `checkpoint(label)` before a multi-step change lets
   `rollback_checkpoint(label)` take all of it back. `delete_level` is not
   undoable.
 - **Furnishing a room:** run `validate_floorplan` first (is every room

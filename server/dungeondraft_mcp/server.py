@@ -2127,16 +2127,22 @@ def preview_assets(
     laid out row-major in the order you passed them, so cell 1 is assets[0].
     category: as in list_assets. columns 1-8, cell_px 64-512. true_scale=True
     draws every asset at one scale, so a stool shows small beside a table.
-    Returns the sheet and a caption with each asset's pixel size and any
-    asset that could not be loaded.
+    Returns the sheet and a caption with each asset's pixel size, whether it
+    is colorable (then the sheet shows its red mask, not how it will look),
+    and any asset that could not be loaded.
     """
     if not 1 <= len(assets) <= 32:
         raise ValueError("give 1 to 32 assets")
     res = bridge.request("preview_assets", assets=assets, category=category, columns=columns,
                          cell_px=cell_px, true_scale=true_scale)
-    caption = {"cells": [{"cell": i + 1, "asset": a, "size_px": res["sizes"][i]} for i, a in enumerate(assets)],
+    colorable = res.get("colorable") or [False] * len(assets)
+    caption = {"cells": [{"cell": i + 1, "asset": a, "size_px": res["sizes"][i], "colorable": colorable[i]}
+                         for i, a in enumerate(assets)],
                "columns": res["columns"], "rows": res["rows"], "true_scale": res["true_scale"],
                "missing": res["missing"]}
+    if any(colorable):
+        caption["note"] = ("a colorable asset is drawn here as its red mask; placed, it takes the color "
+                           "you give it (or Dungeondraft's default #6b3834)")
     return [Image(path=res["path"]), json.dumps(caption)]
 
 
