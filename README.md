@@ -1,5 +1,7 @@
 # dungeondraft-mcp
 
+English · [简体中文](README.zh-CN.md)
+
 An MCP server that lets an LLM (Claude Code, Claude Desktop, etc.) drive a
 **running Dungeondraft instance** — place objects, draw walls, inspect the map —
 through Dungeondraft's GDScript modding API.
@@ -221,7 +223,7 @@ bounding box.
 
 ### Dev loop (read this before iterating on the mod)
 
-Two things will bite you if you don't know them up front:
+A few things will bite you if you don't know them up front:
 
 - **Editing the mod and the server are different reload paths.** GDScript
   changes in `mcp_bridge.gd` take effect when you **reload the mod inside
