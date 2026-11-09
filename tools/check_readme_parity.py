@@ -38,7 +38,8 @@ def shape(text: str) -> dict:
         "bullets": len(re.findall(r"^\s*- ", body, flags=re.M)),
         "numbered": len(re.findall(r"^\s*\d+\. ", body, flags=re.M)),
         "table_rows": len(re.findall(r"^\|", body, flags=re.M)),
-        "bold": len(re.findall(r"\*\*[^*\n]+\*\*", body)),
+        # A bold span may wrap onto the next line in the English README.
+        "bold": len(re.findall(r"\*\*[^*]+?\*\*", body, flags=re.S)),
         "code": set(re.findall(r"`([^`\n]+)`", body)),
         "links": set(re.findall(r"\]\((https?://[^)\s]+)\)", body)),
     }
