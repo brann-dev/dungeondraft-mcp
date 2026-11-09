@@ -13,11 +13,13 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import datetime
 import functools
 import inspect
 import json
 import os
 import random
+import shutil
 import tempfile
 import time
 import uuid
@@ -27,7 +29,7 @@ from typing import Any, Callable, Optional
 import pydantic_core
 from mcp.server.fastmcp import FastMCP, Image
 
-from . import floorplan, layout, mapfile, packs, spatial, uvtt_import
+from . import cropping, floorplan, layout, mapfile, packs, spatial, uvtt_import
 from . import scene as scene_checks
 from .bridge_client import BridgeClient, BridgeError
 
@@ -2215,21 +2217,96 @@ def set_map_style(building_wear: str = "", grid_style: str = "") -> dict:
 
 
 @_tool()
-def set_map_size(width: int, height: int) -> dict:
+def set_map_size(width: int, height: int, left: int = 0, top: int = 0) -> dict:
     """Resize the map, in TILES (8 to 128 a side), as Dungeondraft's own Change Map Size does. NOT undoable.
 
-    The map grows or shrinks on its right and bottom edges; the top-left
-    corner stays, so nothing placed moves. Shrinking does not delete what now
-    lies outside the map. Trimming from the top or left is not offered, since
-    Dungeondraft's own trim there loses terrain paint. Every level's terrain,
-    cave and floor layers are resized together and read back; the bridge's
-    undo history is cleared afterwards, as Dungeondraft clears its own.
-    save_map first if in doubt. Returns the new size and the previous one.
+    left / top: tiles added (positive) or trimmed (negative) on the left and
+    top edges; the rest of the change goes to the right and bottom. With both
+    at 0 the top-left corner stays and nothing placed moves. Otherwise
+    Dungeondraft moves everything by the offset, and the bridge repairs what
+    Dungeondraft's own shift gets wrong: the terrain paint, the cave borders
+    and the trace image. Shrinking does not delete what then lies outside the
+    map (crop_map does). Every level is resized together and read back; the
+    bridge's undo history is cleared, as Dungeondraft clears its own.
+    save_map first if in doubt. Returns the new size, the previous one and
+    content_shift_woxels.
     """
     if not (8 <= width <= 128 and 8 <= height <= 128):
         raise ValueError("width and height must each be 8 to 128 tiles")
-    return bridge.request("set_map_size", width=width, height=height)
+    params: dict = {"width": width, "height": height}
+    if left:
+        params["left"] = left
+    if top:
+        params["top"] = top
+    return bridge.request("set_map_size", **params)
 
+
+@_tool()
+def crop_map(rect: list[int], confirm: bool = False) -> dict:
+    """Crop the map to a window of TILES, rect=[x, y, w, h], from any side.
+
+    The tile at (x, y) becomes the new top-left and everything moves with it.
+    Choose the window with the user first: keep the focal area, routes and
+    whole rooms (fit_elements or a screenshot shows what is where).
+
+    Without confirm this only previews: the new size, and per kind the ids of
+    what lies wholly outside (`outside`, deleted on confirm) and what crosses
+    the edge (`crossing`, kept as it is: a wall or path running off the map
+    is not cut, so say so, and delete or redraw it if the user wants).
+    Pattern floors cannot be listed, so one outside stays, off the map.
+
+    confirm=True saves the map and copies the file beside it (`backup`),
+    since a crop cannot be undone, then crops through Dungeondraft's own
+    resize and deletes what was outside as one undo step per 100 elements.
+    The bridge's earlier undo history is cleared, because every element
+    moved. Every level is cropped; only the current level is cleaned of what
+    lies outside.
+    """
+    if len(rect) != 4 or any(isinstance(v, bool) for v in rect):
+        raise ValueError("rect is [x, y, w, h] in whole tiles")
+    x, y, w, h = (int(v) for v in rect)
+    status = bridge.request("get_status")
+    size = status.get("map_size_woxels") or [0, 0]
+    width, height = int(size[0] // cropping.WOXELS_PER_TILE), int(size[1] // cropping.WOXELS_PER_TILE)
+    if x < 0 or y < 0 or w <= 0 or h <= 0 or x + w > width or y + h > height:
+        raise ValueError(f"rect {rect} must lie inside the {width}x{height}-tile map, with w and h above 0")
+    if not (8 <= w <= 128 and 8 <= h <= 128):
+        raise ValueError("the cropped map must be 8 to 128 tiles on each side")
+    window = cropping.window_woxels((x, y, w, h))
+    snapshot = bridge.request("spatial_snapshot")
+    positioned = {kind: bridge.request("list_elements", kind=kind, limit=5000)["elements"]
+                  for kind in ("lights", "texts", "roofs", "paths")}
+    found = cropping.classify(snapshot, positioned, window)
+    outside = [i for ids in found["outside"].values() for i in ids]
+    preview: dict = {
+        "changed": False, "size_tiles": [w, h], "previous_tiles": [width, height],
+        "content_shift_woxels": [-x * cropping.WOXELS_PER_TILE, -y * cropping.WOXELS_PER_TILE],
+        **found,
+    }
+    if status.get("level_count", 1) > 1:
+        preview["levels_note"] = "every level is cropped; only the current level is cleaned of what lies outside"
+    if not confirm:
+        preview["next"] = "show the user this window; with their agreement, call again with confirm=True"
+        return preview
+    src = bridge.request("get_current_map").get("path") or ""
+    if not src:
+        raise ValueError("the map has never been saved; save it in Dungeondraft first")
+    _save_and_wait(src)
+    source = Path(src)
+    stamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
+    backup = source.with_name(f"{source.stem}.before-crop-{stamp}{source.suffix}")
+    shutil.copy2(source, backup)
+    resized = bridge.request("set_map_size", width=w, height=h, left=-x, top=-y)
+    deleted = 0
+    for start in range(0, len(outside), 100):
+        chunk = outside[start:start + 100]
+        bridge.request("delete_elements", ids=chunk)
+        deleted += len(chunk)
+    result = dict(preview)
+    result.update(changed=True, backup=str(backup), resize=resized, deleted=deleted,
+                  deleted_ids=found["outside"], undo_steps=-(-len(outside) // 100))
+    result.pop("outside", None)
+    return result
 
 @_tool()
 def list_prefabs(set: str = "") -> dict:
@@ -2606,7 +2683,7 @@ def delete_level(index: int) -> dict:
 # the map out from under the rest of the batch, and itself.
 _NOT_BATCHABLE = {"batch", "screenshot", "export_map", "export_uvtt", "open_map", "preview_assets",
                   # these close or wipe the batch's own undo group
-                  "undo", "redo", "checkpoint", "rollback_checkpoint", "list_checkpoints", "set_map_size"}
+                  "undo", "redo", "checkpoint", "rollback_checkpoint", "list_checkpoints", "set_map_size", "crop_map"}
 
 
 @_tool()
