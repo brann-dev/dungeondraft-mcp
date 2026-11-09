@@ -1,6 +1,6 @@
 # dungeondraft-mcp
 
-English · [简体中文](README.zh-CN.md)
+English · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md)
 
 An MCP server that lets an LLM (Claude Code, Claude Desktop, etc.) drive a
 **running Dungeondraft instance** — place objects, draw walls, inspect the map —

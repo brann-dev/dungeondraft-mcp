@@ -1,6 +1,6 @@
 # dungeondraft-mcp
 
-[English](README.md) · 简体中文
+[English](README.md) · 简体中文 · [日本語](README.ja.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md)
 
 > 本文译自英文版 [README.md](README.md)，内容以英文版为准。如发现翻译问题，欢迎提 issue 或 PR。
 
@@ -127,7 +127,7 @@ claude mcp add dungeondraft -s user -- "$PWD/.venv/bin/dungeondraft-mcp"
 
 新增一项能力的方式是对称的：两端各写一个处理函数。
 
-1. **模组**（`mod/.../scripts/tools/mcp_bridge.gd`）：在 `_safe_dispatch()` 的 `match` 中加一个分支，并添加一个返回 `_ok(...)` / `_err(...)` 的 `_my_command(req)` 函数。
+1. **模组**（`mod/.../scripts/tools/mcp_bridge.gd`）：在 `_safe_dispatch()` 的 `match` 中加一个 `case` 分支，并添加一个返回 `_ok(...)` / `_err(...)` 的 `_my_command(req)` 函数。
 2. **服务器**（`server/dungeondraft_mcp/server.py`）：添加一个 `@mcp.tool()`，在其中调用 `bridge.request("my_command", ...)`。
 
 如果一项能力只是对模组已有数据的计算，那它只存在于服务器端：布局检查（`spatial.py`）、`scatter_objects` 和 `batch` 在模组里没有对应的处理函数。
