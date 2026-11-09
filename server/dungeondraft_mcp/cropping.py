@@ -85,6 +85,17 @@ def place_points(points: Sequence[Sequence[float]], loop: bool, window: Window) 
     return "outside"
 
 
+def place_box(box: Sequence[float], window: Window) -> str:
+    """'inside', 'outside' or 'crossing' for an axis-aligned box [x0, y0, x1, y1]."""
+    bx0, by0, bx1, by1 = box
+    x0, y0, x1, y1 = window
+    if bx0 >= x0 and by0 >= y0 and bx1 <= x1 and by1 <= y1:
+        return "inside"
+    if bx1 < x0 or bx0 > x1 or by1 < y0 or by0 > y1:
+        return "outside"
+    return "crossing"
+
+
 def place_polygon(polygon: Sequence[Sequence[float]], window: Window) -> str:
     """'inside', 'outside' or 'crossing' for an object's footprint quad."""
     return place_points(polygon, True, window)
@@ -99,16 +110,16 @@ def classify(snapshot: dict, positioned: dict[str, Iterable[dict]], window: Wind
     """Ids of what lies wholly outside the window and what crosses its edge, per kind.
 
     snapshot: the spatial_snapshot result (objects with polygon, walls with
-    points and loop, portals with position and wall_id). positioned: other
-    list_elements results by kind ({id, position}): lights, texts, roofs,
-    paths. A wall's doors go with the wall: a door is listed on its own only
-    when its wall stays.
+    points, loop and asset, portals with position and wall_id). positioned:
+    other list_elements results by kind: lights, texts and free-standing
+    portals by position, paths by their points, roofs by their bounds. A wall's doors go
+    with the wall: a door is listed on its own only when its wall stays.
     """
     outside: dict[str, list[int]] = {}
     crossing: dict[str, list[int]] = {}
     dropped_walls: set[int] = set()
     for obj in snapshot.get("objects", []):
-        where = place_polygon(obj.get("polygon") or [], window) if obj.get("polygon") else "inside"
+        where = place_polygon(obj["polygon"], window) if obj.get("polygon") else "inside"
         if where == "outside":
             outside.setdefault("objects", []).append(int(obj["id"]))
         elif where == "crossing":
@@ -129,6 +140,21 @@ def classify(snapshot: dict, positioned: dict[str, Iterable[dict]], window: Wind
             outside.setdefault("portals", []).append(int(portal["id"]))
     for kind, entries in positioned.items():
         for element in entries:
-            if not _inside(element.get("position") or [0, 0], window):
+            if element.get("points"):
+                # Paths and roofs keep their geometry in points and leave their
+                # position at the origin.
+                where = place_points(element["points"], bool(element.get("loop")), window)
+                if where == "outside":
+                    outside.setdefault(kind, []).append(int(element["id"]))
+                elif where == "crossing":
+                    crossing.setdefault(kind, []).append(int(element["id"]))
+            elif element.get("bounds") and len(element["bounds"]) == 4:
+                # Roofs report their world-space rectangle.
+                where = place_box(element["bounds"], window)
+                if where == "outside":
+                    outside.setdefault(kind, []).append(int(element["id"]))
+                elif where == "crossing":
+                    crossing.setdefault(kind, []).append(int(element["id"]))
+            elif not _inside(element.get("position") or [0, 0], window):
                 outside.setdefault(kind, []).append(int(element["id"]))
     return {"outside": outside, "crossing": crossing}

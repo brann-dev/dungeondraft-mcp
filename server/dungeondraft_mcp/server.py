@@ -2233,6 +2233,8 @@ def set_map_size(width: int, height: int, left: int = 0, top: int = 0) -> dict:
     """
     if not (8 <= width <= 128 and 8 <= height <= 128):
         raise ValueError("width and height must each be 8 to 128 tiles")
+    if abs(left) > 128 or abs(top) > 128:
+        raise ValueError("left and top must be within 128 tiles either way")
     params: dict = {"width": width, "height": height}
     if left:
         params["left"] = left
@@ -2253,7 +2255,8 @@ def crop_map(rect: list[int], confirm: bool = False) -> dict:
     what lies wholly outside (`outside`, deleted on confirm) and what crosses
     the edge (`crossing`, kept as it is: a wall or path running off the map
     is not cut, so say so, and delete or redraw it if the user wants).
-    Pattern floors cannot be listed, so one outside stays, off the map.
+    Pattern floors cannot be listed, so one outside stays, off the map;
+    `unremovable` lists elements the bridge cannot address by id.
 
     confirm=True saves the map and copies the file beside it (`backup`),
     since a crop cannot be undone, then crops through Dungeondraft's own
@@ -2266,6 +2269,8 @@ def crop_map(rect: list[int], confirm: bool = False) -> dict:
         raise ValueError("rect is [x, y, w, h] in whole tiles")
     x, y, w, h = (int(v) for v in rect)
     status = bridge.request("get_status")
+    if not status.get("map_open"):
+        raise ValueError("no map open")
     size = status.get("map_size_woxels") or [0, 0]
     width, height = int(size[0] // cropping.WOXELS_PER_TILE), int(size[1] // cropping.WOXELS_PER_TILE)
     if x < 0 or y < 0 or w <= 0 or h <= 0 or x + w > width or y + h > height:
@@ -2276,13 +2281,21 @@ def crop_map(rect: list[int], confirm: bool = False) -> dict:
     snapshot = bridge.request("spatial_snapshot")
     positioned = {kind: bridge.request("list_elements", kind=kind, limit=5000)["elements"]
                   for kind in ("lights", "texts", "roofs", "paths")}
+    # Doors on walls are in the snapshot with their wall; free-standing portals are not.
+    positioned["portals"] = [e for e in bridge.request("list_elements", kind="portals", limit=5000)["elements"]
+                             if e.get("kind") == "portal"]
     found = cropping.classify(snapshot, positioned, window)
+    unremovable = sorted({i for ids in found["outside"].values() for i in ids if i < 0})
+    found["outside"] = {k: [i for i in ids if i >= 0] for k, ids in found["outside"].items()}
+    found["outside"] = {k: v for k, v in found["outside"].items() if v}
     outside = [i for ids in found["outside"].values() for i in ids]
     preview: dict = {
         "changed": False, "size_tiles": [w, h], "previous_tiles": [width, height],
         "content_shift_woxels": [-x * cropping.WOXELS_PER_TILE, -y * cropping.WOXELS_PER_TILE],
         **found,
     }
+    if unremovable:
+        preview["unremovable"] = unremovable   # elements the bridge cannot address by id
     if status.get("level_count", 1) > 1:
         preview["levels_note"] = "every level is cropped; only the current level is cleaned of what lies outside"
     if not confirm:
@@ -2297,6 +2310,10 @@ def crop_map(rect: list[int], confirm: bool = False) -> dict:
     backup = source.with_name(f"{source.stem}.before-crop-{stamp}{source.suffix}")
     shutil.copy2(source, backup)
     resized = bridge.request("set_map_size", width=w, height=h, left=-x, top=-y)
+    if not resized.get("changed") or resized.get("content_shift_woxels") != preview["content_shift_woxels"]:
+        raise ValueError("the resize did not shift the map as planned (an older mod ignores left/top?); "
+                         f"nothing was deleted, the map is {resized.get('width_tiles')}x{resized.get('height_tiles')} "
+                         f"tiles and the backup is at {backup}")
     deleted = 0
     for start in range(0, len(outside), 100):
         chunk = outside[start:start + 100]

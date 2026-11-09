@@ -57,6 +57,18 @@ class Classify(unittest.TestCase):
         self.assertEqual(found["outside"], {"objects": [2], "walls": [10], "portals": [22], "lights": [30]})
         self.assertEqual(found["crossing"], {"objects": [3], "walls": [11]})
 
+    def test_paths_and_roofs_go_by_their_points_not_their_origin(self):
+        positioned = {"paths": [
+            {"id": 40, "position": [0, 0], "points": [[1000, 1000], [2000, 1000]]},   # inside, origin outside
+            {"id": 41, "position": [0, 0], "points": [[0, 0], [100, 0]]},             # outside
+            {"id": 42, "position": [0, 0], "points": [[0, 2000], [5000, 2000]]},      # crossing
+        ], "roofs": [{"id": 50, "position": [0, 0], "bounds": [600, 800, 700, 900]},        # inside
+                     {"id": 51, "position": [0, 0], "bounds": [0, 0, 100, 100]},            # outside
+                     {"id": 52, "position": [0, 0], "bounds": [400, 700, 600, 900]}]}       # crossing
+        found = cropping.classify({"objects": [], "walls": [], "portals": []}, positioned, W)
+        self.assertEqual(found["outside"], {"paths": [41], "roofs": [51]})
+        self.assertEqual(found["crossing"], {"paths": [42], "roofs": [52]})
+
     def test_a_door_on_a_dropped_wall_is_not_listed_twice(self):
         found = cropping.classify(self.snapshot(), {}, W)
         self.assertNotIn(20, found["outside"].get("portals", []))
