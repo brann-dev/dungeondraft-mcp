@@ -44,7 +44,7 @@ Coordinates are **woxel** (world pixel) space; map center is in
 | cmd | params | result |
 | --- | --- | --- |
 | `ping` | — | `{ pong, protocol, engine }` |
-| `get_status` | — | `{ map_open, level_id, level_count, map_size_woxels, map_center, counts{}, active_tool }` |
+| `get_status` | — | `{ map_open, level_id, level_count, map_size_woxels, map_center, terrain_slots (4 or 8), counts{}, active_tool }` |
 | `list_asset_categories` | — | `{ categories[] }` |
 | `list_assets` | `category="Objects"`, `search=""`, `limit=100` | `{ category, total, matched, returned, assets[] }` |
 | `list_elements` | `kind="objects"`, `limit=200` | `{ kind, count, elements[] }` |
@@ -53,6 +53,8 @@ Coordinates are **woxel** (world pixel) space; map center is in
 
 `kind` ∈ `objects, walls, lights, paths, portals, roofs, texts`. An element
 descriptor is `{ id, kind, position[x,y], rotation(deg), scale, asset? }`.
+`get_element` on a wall (and `modify_wall`) adds its geometry: `points[[x,y]...]`,
+`loop`, `type`, `joint`, `portal_count`. `list_elements` leaves these out.
 
 `portals` includes **wall-mounted** portals (doors/windows), which live inside
 each wall's `Portals` array rather than `level.Portals` — `list_elements` walks
@@ -81,6 +83,7 @@ node; default color is black.
 | `add_text` | `text`, `x?`, `y?`, `size?`, `color?`, `font?` |
 | `place_pattern` | `asset`, `rect=[x,y,w,h]` **or** `points=[[x,y]...]`, `category="Patterns"`, `color?`, `rotation?` |
 | `build_room` | `rect=[x,y,w,h]` **or** `points=[[x,y]...]`, `wall_asset?`, `floor="pattern"\|"terrain"\|"none"`, `floor_asset?`, `floor_category="Simple Tiles"`, `floor_color?`, `floor_slot=1`, `wall_type=0`, `wall_joint=1` → `{ wall_id, floor_id?, points }` |
+| `import_image` | `path` (absolute; `.png` / `.jpg` / `.jpeg` / `.webp`), `x?`, `y?`, `scale=1`, `rotation=0`, `sorting=0`, `shadow=true` → `{ id, position, image_size[w,h], asset }`. The new element is an ordinary object whose `asset` is `embedded://<path>` |
 
 ### Terrain
 
@@ -91,7 +94,7 @@ It is undo-recorded like the other terrain ops.
 
 | cmd | params |
 | --- | --- |
-| `set_terrain_slot` | `asset`, `slot=0` |
+| `set_terrain_slot` | `asset`, `slot=0`, `expand=false` → `{ slot, terrain_slots }` |
 | `fill_terrain` | `slot=0`, `asset?` |
 | `fill_region` | `rect=[x,y,w,h]` **or** `points=[[x,y]...]`, `slot=0`, `asset?`, `rate=1` |
 | `paint_terrain` | `slot=0`, `x?`, `y?`, `radius=64`, `rate=1`, `asset?` |
@@ -99,12 +102,29 @@ It is undo-recorded like the other terrain ops.
 | `dig_cave` | `points=[[x,y]...]` **or** `x?`,`y?`, `radius=256`, `dig=true`, `ground_color?`, `wall_color?`, `texture?` |
 | `clear_caves` | — (wipes the whole cave layer back to rock) |
 
+`slot` is 0-3, or 0-7 on a level with expanded terrain slots
+(`get_status.terrain_slots` is 8). A slot of 4-7 on a 4-slot level is refused;
+`set_terrain_slot` with `expand: true` and a slot of 4-7 turns the level's
+expanded slots on first (they stay on). Painting or filling a slot of 4-7 that
+has no texture yet needs `asset`.
+
+### Water / materials
+
+Both take a shape in woxels: `rect=[x,y,w,h]` **or** `points=[[x,y]...]` (a
+polygon, >= 3 points, with some area).
+
+| cmd | params |
+| --- | --- |
+| `draw_water` | shape, `erase=false`, `deep_color?`, `shallow_color?`, `blend_distance?` (tiles, 0 < d <= 4) → `{ erase, point_count, deep_color?, shallow_color?, blend_distance? }` |
+| `draw_material` | `asset` (a `Materials` asset), shape, `layer=-400`, `smooth=true`, `erase=false` → `{ erase, layer, asset, cells, cell_size }` |
+
 ### Modify / delete / levels / selection
 
 | cmd | params |
 | --- | --- |
 | `move_element` | `id`, `x`, `y` |
 | `modify_object` | `id`, `scale?`, `rotation?`, `color?`, `shadow?` → descriptor (+ `warning?`) |
+| `modify_wall` | `id`, `points?[[x,y]...]`, `loop?`, `type?`, `joint?`, `asset?`, `color?`, `shadow?` → wall descriptor with geometry |
 | `duplicate_object` | `id`, `dx=64`, `dy=0` → `{ id }` |
 | `delete_element` | `id` → `{ deleted }` |
 | `add_level` | `label="Level"` → `{ id, label }` |
@@ -188,10 +208,13 @@ the rect's midpoint; `fit_elements` frames the union of all rects.
 
 The bridge keeps its **own** undo/redo stacks (it does not use Dungeondraft's
 `History.CreateCustomRecord`, which is unreliable on 3.4.2 — see notes). Every
-reversible edit (creates, `move_element`, `modify_object`, `fill_terrain`,
-`fill_region`, `paint_terrain`, `paint_path`, `dig_cave`) pushes an op; a fresh
-edit clears the redo stack. Terrain ops snapshot the splat image before/after;
-`dig_cave` snapshots the cave `BitMap` the same way.
+reversible edit (creates including `import_image`, `move_element`,
+`modify_object`, `modify_wall`, `fill_terrain`, `fill_region`, `paint_terrain`,
+`paint_path`, `dig_cave`, `clear_caves`, `draw_water`, `draw_material`) pushes an
+op; a fresh edit clears the redo stack. Terrain ops snapshot the splat images
+before/after; `dig_cave` and `draw_material` snapshot their `BitMap` the same
+way, `draw_water` the water mesh's saved state, `modify_wall` the wall's points,
+texture, tint and flags.
 
 | cmd | params | result |
 | --- | --- | --- |
@@ -290,7 +313,10 @@ Ctrl+Z in Dungeondraft.
   custom `undo()` inconsistently, and never round-trips `redo()`, so the bridge
   uses its own. Create ops detach/re-attach the node (remove_child / add_child,
   keeping a reference and a stable id); transform ops restore a property
-  snapshot; terrain ops restore a cloned splat image.
+  snapshot; terrain ops restore the cloned splat images. Handlers that know
+  their own before/after state (`modify_wall`, `draw_water`, `draw_material`)
+  return the op next to their result (`_ok_op`); `_record_and_dispatch` strips
+  it from the response and pushes it.
 - **`paint_terrain` / `fill_region` / `paint_path`** — all edit the splat weight
   image directly (`CloneSplatImage` → raise the target slot's channel per pixel →
   `RestoreSplat`) rather than `Terrain.Paint(...)`, which does not modify the
@@ -305,6 +331,20 @@ Ctrl+Z in Dungeondraft.
   **globally** (everywhere that slot is weighted), so to texture one region you
   assign the slot once, then raise that slot's weight only inside the region
   (what `fill_region` / `paint_terrain` do).
+- **Expanded terrain slots (4-7)** — `splatImage2` exists only once
+  `Terrain.ExpandSlots(true)` has run (the Terrain Brush's "Expand Slots"
+  toggle; saved as `expand_slots`). On a 4-slot level `SetTexture(tex, 4..7)` is
+  silently ignored, `Fill(4..7)` fills slot `n - 4` instead, and
+  `CloneSplatImage2()` dereferences a null image, so the bridge refuses those
+  slots up front. **`RestoreSplat2(splat, splat2)` takes both images**, as DD's
+  `PaintTerrain2` record passes them; `RestoreSplat(splat)` is the 4-slot call.
+  With expanded slots the bridge clones both images, moves the painted slot's
+  weight toward 1 while scaling the other seven down, and restores both; undo
+  snapshots both too. `set_terrain_slot(expand: true)` goes through
+  `TerrainBrush.ExpandSlots` when the brush's panel has been built (its slot
+  list grows to 8 and DD gives the new slots its default textures), otherwise
+  straight through `Terrain.ExpandSlots`, and the panel syncs when next opened.
+  The bridge never turns expanded slots off.
 - **`place_pattern`** — draws a tiled-floor shape via `PatternShapes.DrawRect` /
   `DrawPolygon`, then applies the texture with `PatternShape.SetOptions(tex,
   color, rotation)` (the draw call alone leaves the shape untextured). New shapes
@@ -370,6 +410,66 @@ Ctrl+Z in Dungeondraft.
   and after, like the terrain ops). `clear_caves` wipes the whole cave layer back
   to rock in one call (native `CaveMesh.Clear()`, or zero the BitMap as a
   fallback, then rebuild) — also undoable.
+- **`modify_wall`** — `Wall.Set(...)` is the only call that replaces a wall's
+  shape wholesale, and its `Clear()` frees every mounted portal;
+  `Wall.ModifyPoint` (the UI's vertex drag) deletes the portals on the two
+  segments next to the vertex. So a wall with doors/windows is reshaped in
+  place: the bridge assigns `Points`, then for each portal keeps its fraction
+  along its segment (`WallPointIndex`), moves it there, turns `rotation` and
+  `Direction` by the segment's change of angle, and re-keys it with
+  `Wall.MovePortal(portal, index)` (what `SelectTool` does when a door is
+  dragged along its wall), then `RemakeLines()`. `Direction` is the unflipped
+  wall tangent (`Begin`/`End` = position ∓ `Direction * Radius`, which
+  `RemakeLines` uses to cut the gap); a flipped portal only differs by π in
+  `rotation`, so turning both by the same delta keeps either kind right. That
+  path needs the same point count / loop / type / joint, and each portal must
+  still fit its segment; otherwise the command is refused before anything
+  changes. A wall without portals goes through `Set` + `RemakeLines` (`Set`
+  alone leaves the old shadow lines behind), so it can change point count, loop,
+  type and joint. A new `asset` without `color` takes the texture's default
+  tint, as `draw_wall` does.
+- **`import_image`** — calls `ObjectTool.EmbedObject(path)`, the handler behind
+  dropping an image file on DD's window. It loads the file, registers it in
+  `World.EmbeddedTextures` **keyed by the path** (saved under the map's
+  `embedded` section as a base64 PNG, whatever the source format), and creates
+  a recorded prop whose texture is `embedded://<path>`. So the same path
+  imported twice shares one stored copy, a changed file at an already-embedded
+  path is not re-read, and the map file contains the source path. `EmbedObject`
+  dereferences the loaded texture unchecked, so the bridge decodes the file
+  itself first and refuses what Godot can't read. The prop is created at the
+  cursor on the Object tool's active layer with the tool's shadow setting and is
+  indexed for selection under that layer; the bridge moves it to layer 0 (where
+  `place_object` props live), applies the transform and `shadow`, and re-indexes
+  it (`RemoveFromSearchTable` / `AddToSearchTable`). Undo/redo use the prop path
+  (`Prop.Save` / `Objects.LoadObject`), which resolves `embedded://` textures.
+- **`draw_water`** — `WaterMesh.DrawPolygon(points, invert)` is the Water
+  Brush's shape mode: it unions the polygon into the level's water (or
+  subtracts it), rebuilds the mesh and shoreline, and records DD's own history
+  entry. It is an `async void` but only waits while a user stroke is in flight,
+  so from the bridge it completes before returning. Colors are per body of
+  water: on rebuild, a polygon whose outline is unchanged keeps its colors and
+  any new or reshaped one takes the mesh's current `DeepColor` / `ShallowColor`
+  / `BlendDistance` (the Water Brush's pickers). The bridge sets those for the
+  one call and restores them, so a draw that merges into an existing lake
+  recolors the whole merged body. `BlendDistance` is in tiles; the mesh builder
+  divides by it and has gradient rings up to 4. Undo stores `WaterMesh.Save()`
+  before/after and restores with `Load()`. A level that never had water saves
+  no `tree`, and `Load` ignores a state without one, so that "before" is stored
+  as the "after" tree with its `children` emptied.
+- **`draw_material`** — materials are `MaterialMesh` nodes, one per (layer,
+  texture), from `Level.GetOrMakeMaterialMesh(layer, texture, smooth)`; the
+  Material Brush uses the same lookup, so bridge and UI edit the same mesh. Like
+  the cave layer they are marching-squares meshes over a `BitMap`, but the bits
+  are grid **corners** `CellSize` apart (128 woxels) at woxel
+  `((ix - MapEdgeBuffer) * CellSize, ...)`, and a set corner fills out to the
+  midpoint toward each unset neighbour. The bridge sets every corner inside or
+  on the shape, so the patch covers the shape and can run up to half a cell (64
+  woxels) past it, and a shape containing no corner is refused. `SetBitmap` +
+  `FinalizeMeshAndBorders` rebuild fill and border. `layer` must be one of the
+  level's own layers (`Level.SaveLayers()`: by default -400 "Below Ground", -100
+  "Below Water", 100-400 "User Layer 1-4", 700 "Above Walls", 900 "Above
+  Roofs"); -400 is the Material Brush's default and draws over the terrain,
+  under objects. `smooth` applies when the mesh is created and whenever passed.
 - **`add_portal`** — defaults to **wall-mounted** (`Wall.AddPortal`): snaps to
   the nearest wall within `snap_max` woxels, faces along that wall segment, and
   the wall remakes its lines so the portal cuts a gap (matching manual door
@@ -422,7 +522,14 @@ Ctrl+Z in Dungeondraft.
   Example: `self is Node` in this script (which has no `extends`, so it is a
   Reference) is a parse error in 3.4.2: *A value of type "self" will never be
   an instance of "Node"*. Compile-check `.gd` changes offline before
-  restarting DD. The stock Godot 3.4.2 binary can load the script in a scratch
-  project with a stub `Global` autoload (an untyped stub needs `var x := <call
-  on Global>` turned into `=`). Avoid static type assertions on `self` and on
-  values from untyped globals.
+  restarting DD, with the stock Godot 3.4.2 binary (the headless build is
+  enough). DD compiles a mod script by prepending
+  `var Global = {}\nvar Script=null\n\n` to the file and calling
+  `GDScript.reload()`; do the same from a `-s` script (`GDScript.new()`, set
+  `source_code`, `reload()` returns the error and prints the line, offset by 3).
+  The stock binary is stricter than DD's release build, which skips the static
+  type pass: `var x := <call on Global>` is reported as *the variable type
+  can't be inferred* there but compiles in DD, so turn `:=` into `=` on such
+  lines in the copy being checked. Avoid static type assertions on `self` and
+  on values from untyped globals. A map switch (`open_map`) reuses the compiled
+  script; only Reload Mods or a restart picks up an edited file.

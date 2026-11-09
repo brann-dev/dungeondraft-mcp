@@ -25,9 +25,9 @@ The mod opens a TCP server inside Dungeondraft and polls it every frame from the
 forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
 
 > **Status: working.** Confirmed end-to-end against Dungeondraft on **Godot
-> 3.4.2** — raw TCP from the modding sandbox works, no fallback needed. 45 tools
-> across query / create / modify / terrain / levels / selection / capture /
-> camera / undo / map lifecycle (see below).
+> 3.4.2** — raw TCP from the modding sandbox works, no fallback needed. 49 tools
+> across query / create / modify / terrain / water / materials / levels /
+> selection / capture / camera / undo / map lifecycle (see below).
 
 ## What the AI can do
 
@@ -36,15 +36,24 @@ forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
 - **Create:** `place_object`, `draw_wall`, `draw_path`, `add_light`,
   `add_portal`, `add_roof`, `add_text`, `place_pattern` (tiled floor shapes —
   wood planks, tile, brick — rendered below objects), `build_room` (a wall loop
-  + matching floor on one shared path, like the UI's combined trace).
+  + matching floor on one shared path, like the UI's combined trace),
+  `import_image` (embed a PNG/JPG/WEBP from disk as an object: custom props,
+  handouts or a whole battle-map backdrop; the pixels are stored in the map).
 - **Terrain:** `set_terrain_slot`, `fill_terrain` (whole level), `fill_region`
   (a rect/polygon, e.g. one room's floor), `paint_terrain` (a soft brush),
   `paint_path` (a smooth continuous stroke along a polyline — roads/trails).
+  Slots 0-3 by default; `set_terrain_slot(..., expand=True)` turns on the
+  level's slots 4-7.
+- **Water & materials:** `draw_water` (lakes, rivers and moats as a rect or
+  polygon, with shoreline and depth gradient; `erase` cuts islands) and
+  `draw_material` (lava, ice, cobblestone and other Material Brush textures
+  over a rect or polygon, on a chosen layer).
 - **Caves:** `dig_cave` carves caverns/tunnels along a path (the Cave Brush —
   dig open floor out of rock, with auto rocky walls + debris; `dig=false` fills
   back; optional ground/wall tints), `clear_caves` wipes the whole cave layer.
-- **Edit:** `move_element`, `modify_object`, `duplicate_object`,
-  `delete_element`, `select_elements`, `clear_selection`.
+- **Edit:** `move_element`, `modify_object`, `modify_wall` (reshape or restyle
+  a wall; its doors and windows stay mounted and follow their segment),
+  `duplicate_object`, `delete_element`, `select_elements`, `clear_selection`.
 - **Levels:** `add_level`, `set_level`.
 - **Map lifecycle:** `get_current_map` (open map's path + whether a save is
   running), `save_map` (save to the current file, like DD's Save button), and
@@ -61,9 +70,9 @@ forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
   view) — point the view before a `screenshot` to inspect specific spots like a
   door cut into a wall.
 - **Undo:** the bridge keeps its own undo/redo stacks for create / move / modify
-  / terrain edits, so `undo` / `redo` let the model reliably reverse its own
-  changes (independent of Dungeondraft's Ctrl+Z; `delete_element` is not
-  reversible).
+  / terrain / cave / water / material edits, so `undo` / `redo` let the model
+  reliably reverse its own changes (independent of Dungeondraft's Ctrl+Z;
+  `delete_element` is not reversible).
 
 Every element is referenced by an integer `id`; create and list calls return
 ids you feed back into edit calls. Coordinates are woxel (pixel) space — call
@@ -107,7 +116,7 @@ This installs the `dungeondraft_mcp` package and creates the
 
 With DD open and a map loaded, run the per-command validator. It builds a small
 throwaway scene near the map center, prints PASS/FAIL for each command, then
-deletes what it made:
+deletes or undoes what it made:
 
 ```bash
 .venv/bin/python server/test_bridge.py

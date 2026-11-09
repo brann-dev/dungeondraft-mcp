@@ -21,12 +21,12 @@ var script_class = "tool"
 
 const HOST := "127.0.0.1"
 const PORT := 8787
-const PROTOCOL_VERSION := 24
+const PROTOCOL_VERSION := 25
 
 # Commands that get wrapped in a Dungeondraft undo record (see _record_and_dispatch).
 const CREATE_CMDS := [
 	"place_object", "draw_wall", "draw_path", "add_light",
-	"add_portal", "add_roof", "add_text", "duplicate_object",
+	"add_portal", "add_roof", "add_text", "duplicate_object", "import_image",
 ]
 const TRANSFORM_CMDS := ["move_element", "modify_object"]
 const TERRAIN_CMDS := ["fill_terrain", "fill_region", "paint_terrain", "paint_path"]
@@ -40,6 +40,11 @@ const DEFAULT_PATTERN_TINT := Color(0.62, 0.5, 0.34)
 const DEFAULT_OBJECT_TINT := Color("6b3834")
 const CUSTOM_COLORS_MATERIAL := "res://materials/CustomColors.material"
 const TAGS_FILE := "data/default.dungeondraft_tags"
+# The formats DD's own file-drop handler embeds (Editor.OnFilesDropped).
+const IMAGE_EXTENSIONS := ["png", "jpg", "jpeg", "webp"]
+const MAX_IMAGE_SIDE := 16384
+# MaterialBrush's own default layer ("Below Ground": above terrain, under floors).
+const DEFAULT_MATERIAL_LAYER := -400
 
 # SelectTool.GetSelectableType() integer -> readable kind.
 const KIND_NAMES := {
@@ -163,7 +168,7 @@ func _record_and_dispatch(req : Dictionary) -> Dictionary:
 	if cmd in TERRAIN_CMDS:
 		var lvl = Global.World.GetCurrentLevel()
 		if lvl != null:
-			terrain_before = lvl.Terrain.CloneSplatImage()
+			terrain_before = _terrain_snapshot(lvl)
 
 	var cave_before = null
 	if cmd in CAVE_CMDS:
@@ -171,7 +176,12 @@ func _record_and_dispatch(req : Dictionary) -> Dictionary:
 
 	var result = _safe_dispatch(req)
 	if typeof(result) == TYPE_DICTIONARY and result.get("ok", false):
-		var op = _build_op(cmd, req, result, pre, terrain_before, cave_before)
+		# Handlers that know their own before/after state hand over a ready op
+		# (see _ok_op); the older commands are reconstructed from the pre-state.
+		var op = result.get("op")
+		result.erase("op")
+		if op == null:
+			op = _build_op(cmd, req, result, pre, terrain_before, cave_before)
 		if op != null:
 			_undo_stack.append(op)
 			_redo_stack = []   # a fresh edit invalidates the redo branch
@@ -200,7 +210,7 @@ func _build_op(cmd, req, result, pre, terrain_before, cave_before = null):
 	elif cmd in TERRAIN_CMDS and terrain_before != null:
 		var lvl = Global.World.GetCurrentLevel()
 		if lvl != null:
-			return { "kind": "terrain", "before": terrain_before, "after": lvl.Terrain.CloneSplatImage() }
+			return { "kind": "terrain", "before": terrain_before, "after": _terrain_snapshot(lvl) }
 	elif cmd in CAVE_CMDS and cave_before != null:
 		var after = _cave_snapshot()
 		if after != null:
@@ -244,6 +254,17 @@ func _apply_op(op, undo : bool):
 			_restore_splat(op["before"] if undo else op["after"])
 		"cave":
 			_restore_cave(op["before"] if undo else op["after"])
+		"wall":
+			if Global.World.HasNodeID(int(op["id"])):
+				var wall = Global.World.GetNodeByID(int(op["id"]))
+				if wall != null and _is_wall(wall):
+					_apply_wall_state(wall, op["old"] if undo else op["new"])
+		"water":
+			if is_instance_valid(op["mesh"]):
+				op["mesh"].Load(op["before"] if undo else op["after"])
+		"material":
+			if is_instance_valid(op["mesh"]):
+				_set_material_bitmap(op["mesh"], op["before"] if undo else op["after"])
 
 
 func _detach_node(node, id : int):
@@ -305,13 +326,25 @@ func _apply_props(node, snap):
 			node.ClearCustomColor()
 
 
-func _restore_splat(img):
-	if img == null:
+# Both splat weight images (the second only exists with expanded slots), like
+# DD's own PaintTerrain / PaintTerrain2 history records.
+func _terrain_snapshot(level) -> Dictionary:
+	return {
+		"splat": level.Terrain.CloneSplatImage(),
+		"splat2": level.Terrain.CloneSplatImage2() if level.Terrain.ExpandedSlots else null,
+	}
+
+
+func _restore_splat(snap):
+	if snap == null or snap["splat"] == null:
 		return
 	var level = Global.World.GetCurrentLevel()
 	if level == null:
 		return
-	level.Terrain.RestoreSplat(img)
+	if snap["splat2"] != null and level.Terrain.ExpandedSlots:
+		level.Terrain.RestoreSplat2(snap["splat"], snap["splat2"])
+	else:
+		level.Terrain.RestoreSplat(snap["splat"])
 	level.Terrain.UpdateSplat()
 
 
@@ -379,6 +412,9 @@ func _safe_dispatch(req : Dictionary) -> Dictionary:
 		"add_text": return _add_text(req)
 		"place_pattern": return _place_pattern(req)
 		"build_room": return _build_room(req)
+		"import_image": return _import_image(req)
+		"draw_water": return _draw_water(req)
+		"draw_material": return _draw_material(req)
 		# --- terrain ---
 		"set_terrain_slot": return _set_terrain_slot(req)
 		"fill_terrain": return _fill_terrain(req)
@@ -388,6 +424,7 @@ func _safe_dispatch(req : Dictionary) -> Dictionary:
 		# --- modify / delete ---
 		"move_element": return _move_element(req)
 		"modify_object": return _modify_object(req)
+		"modify_wall": return _modify_wall(req)
 		"duplicate_object": return _duplicate_object(req)
 		"delete_element": return _delete_element(req)
 		# --- map lifecycle ---
@@ -441,6 +478,7 @@ func _get_status() -> Dictionary:
 		"level_count": Global.World.levels.size(),
 		"map_size_woxels": [Global.World.WoxelDimensions.x, Global.World.WoxelDimensions.y],
 		"map_center": [Global.World.WoxelDimensions.x * 0.5, Global.World.WoxelDimensions.y * 0.5],
+		"terrain_slots": 8 if level.Terrain.ExpandedSlots else 4,
 		"counts": counts,
 		"active_tool": Global.Editor.ActiveToolName,
 	})
@@ -683,6 +721,8 @@ func _get_element(req : Dictionary) -> Dictionary:
 	var node = _resolve(req)
 	if node == null:
 		return _err("no element with id " + str(req.get("id")))
+	if _is_wall(node):
+		return _ok(_describe_wall(node))
 	return _ok(_describe(node))
 
 
@@ -1187,6 +1227,170 @@ func _add_text(req : Dictionary) -> Dictionary:
 	return _ok({ "id": _id(text), "size": text.fontSize, "color": "#" + text.fontColor.to_html(false) })
 
 
+# Embed an image file from disk as an object, the way dropping the file on DD's
+# window does (ObjectTool.EmbedObject): the pixels are stored inside the map
+# file, so the map no longer needs the source image. DD keys embedded images by
+# path, so importing the same path again reuses the stored copy (even if the
+# file changed since).
+func _import_image(req : Dictionary) -> Dictionary:
+	var level = Global.World.GetCurrentLevel()
+	if level == null: return _err("no map open")
+	var path = str(req.get("path", ""))
+	if path == "": return _err("missing 'path'")
+	if not (path.get_extension().to_lower() in IMAGE_EXTENSIONS):
+		return _err("unsupported image type (use png, jpg or webp): " + path)
+	if not File.new().file_exists(path): return _err("file not found: " + path)
+	if not Global.Editor.Tools.has("ObjectTool"): return _err("ObjectTool unavailable")
+	var s = float(req.get("scale", 1.0))
+	if s <= 0.0: return _err("'scale' must be > 0")
+	# EmbedObject dereferences the texture it loads without a null check, so a
+	# file that fails to decode would throw inside DD. Decode it here first.
+	var img = Image.new()
+	if img.load(path) != OK: return _err("could not read image: " + path)
+	if max(img.get_width(), img.get_height()) > MAX_IMAGE_SIDE:
+		return _err("image is larger than %d px on a side" % MAX_IMAGE_SIDE)
+
+	var count = level.Objects.get_child_count()
+	Global.Editor.Tools["ObjectTool"].EmbedObject(path)
+	if level.Objects.get_child_count() <= count: return _err("EmbedObject created no object")
+	var prop = level.Objects.get_child(level.Objects.get_child_count() - 1)
+	# EmbedObject leaves the prop at the cursor, on the Object tool's layer, with
+	# the tool's shadow setting, and indexed for selection under that layer. Give
+	# it place_object's layer (0) and the caller's transform, then re-index it
+	# (the search table is keyed by z_index; see _register_prop).
+	var sorting = int(req.get("sorting", 0))
+	level.Objects.RemoveFromSearchTable(prop)
+	prop.z_index = 0
+	if sorting == 1:
+		level.Objects.move_child(prop, 0)
+	prop.position = _xy(req, Global.World.WoxelDimensions * 0.5)
+	prop.scale = Vector2(s, s)
+	prop.rotation = deg2rad(float(req.get("rotation", 0.0)))
+	prop.set("HasShadow", bool(req.get("shadow", true)))
+	level.Objects.AddToSearchTable(prop, sorting == 1)
+	return _ok({
+		"id": _id(prop), "position": _vec(prop.position),
+		"image_size": [img.get_width(), img.get_height()],
+		"asset": prop.Texture.resource_path,
+	})
+
+
+# Draw (or `erase`) water over a rect/polygon. This is the Water Brush's shape
+# mode (WaterMesh.DrawPolygon): the shape is unioned into the level's water, or
+# cut out of it, and DD rebuilds the depth gradient and shoreline. A new or
+# reshaped body of water takes the mesh's current colors, so the optional
+# deep_color / shallow_color / blend_distance are set for this call only and
+# the Water Brush's own settings are put back afterwards.
+func _draw_water(req : Dictionary) -> Dictionary:
+	var level = Global.World.GetCurrentLevel()
+	if level == null: return _err("no map open")
+	var water = level.get("WaterMesh")
+	if water == null: return _err("water mesh unavailable")
+	var pts = _shape_points(req)
+	if pts.size() < 3: return _err("provide 'rect':[x,y,w,h] or 'points':[[x,y]...] (>= 3 points, with some area)")
+	var erase = bool(req.get("erase", false))
+	var deep = water.DeepColor
+	var shallow = water.ShallowColor
+	var blend = water.BlendDistance
+	var use_deep = _color(req.get("deep_color", ""), deep)
+	var use_shallow = _color(req.get("shallow_color", ""), shallow)
+	var use_blend = float(req.get("blend_distance", blend))
+	# The mesh builder divides by the blend distance; its gradient stops at 4 tiles.
+	if use_blend <= 0.0 or use_blend > 4.0:
+		return _err("'blend_distance' must be > 0 and <= 4 (tiles)")
+
+	var before = water.Save()
+	water.DeepColor = use_deep
+	water.ShallowColor = use_shallow
+	water.BlendDistance = use_blend
+	water.DrawPolygon(pts, erase)
+	water.DeepColor = deep
+	water.ShallowColor = shallow
+	water.BlendDistance = blend
+	var after = water.Save()
+	if not after.has("tree"): return _err("water mesh did not update")
+	if not before.has("tree"):
+		# No water before this call: the mesh had no polygon tree to save, and
+		# Load ignores a state without one. Undo to a childless root instead.
+		before = after.duplicate(true)
+		before["tree"]["children"] = []
+	var result := { "erase": erase, "point_count": pts.size() }
+	if not erase:
+		result["deep_color"] = "#" + use_deep.to_html(false)
+		result["shallow_color"] = "#" + use_shallow.to_html(false)
+		result["blend_distance"] = use_blend
+	return _ok_op(result, { "kind": "water", "mesh": water, "before": before, "after": after })
+
+
+# Paint (or `erase`) a ground material over a rect/polygon: the Material
+# Brush's textures, each with its own blended border. Like the cave layer, a
+# material is a marching-squares mesh (one per layer + texture) driven by a
+# BitMap of grid corners CellSize apart (128 woxels, half a tile); a set corner
+# fills out to halfway toward its unset neighbours. Setting every corner inside
+# the shape therefore covers it, running up to a quarter tile past its edge.
+func _draw_material(req : Dictionary) -> Dictionary:
+	var level = Global.World.GetCurrentLevel()
+	if level == null: return _err("no map open")
+	var pts = _shape_points(req)
+	if pts.size() < 3: return _err("provide 'rect':[x,y,w,h] or 'points':[[x,y]...] (>= 3 points, with some area)")
+	var tex = _asset_tex("Materials", req.get("asset", ""))
+	if tex == null: return _err("could not load material asset: " + str(req.get("asset")))
+	# Only the level's own drawing layers: GetOrMakeMaterialMesh would happily
+	# create one the editor's layer menus know nothing about.
+	if not level.has_method("SaveLayers"): return _err("level layers unavailable")
+	var layer = int(req.get("layer", DEFAULT_MATERIAL_LAYER))
+	var layers = level.SaveLayers()
+	if not layers.has(layer):
+		return _err("no layer %d on this level (layers: %s)" % [layer, str(layers.keys())])
+	var erase = bool(req.get("erase", false))
+	if erase and level.IsMeshEmpty(layer, tex):
+		return _ok({ "erase": true, "layer": layer, "asset": tex.resource_path, "cells": 0 })
+	var smooth = bool(req.get("smooth", true))
+	var mesh = level.GetOrMakeMaterialMesh(layer, tex, smooth)
+	if mesh == null or not mesh.has_method("get_Bitmap") or not mesh.has_method("SetBitmap"):
+		return _err("material mesh missing BitMap API")
+	if req.has("smooth"):
+		mesh.set("Smooth", smooth)
+
+	var before = mesh.call("get_Bitmap").duplicate(true)
+	var bm = before.duplicate(true)
+	var cs = float(mesh.call("get_CellSize"))
+	var buf = int(mesh.get("MapEdgeBuffer"))
+	var size = bm.get_size()
+	var poly := []
+	var mn = pts[0]
+	var mx = pts[0]
+	for p in pts:
+		poly.append(p)
+		mn.x = min(mn.x, p.x); mn.y = min(mn.y, p.y)
+		mx.x = max(mx.x, p.x); mx.y = max(mx.y, p.y)
+	# Corner (ix, iy) sits at woxel ((ix - buf) * cs, (iy - buf) * cs).
+	var x0 = max(int(ceil(mn.x / cs - 0.001)) + buf, 0)
+	var y0 = max(int(ceil(mn.y / cs - 0.001)) + buf, 0)
+	var x1 = min(int(floor(mx.x / cs + 0.001)) + buf, int(size.x) - 1)
+	var y1 = min(int(floor(mx.y / cs + 0.001)) + buf, int(size.y) - 1)
+	var cells := 0
+	for iy in range(y0, y1 + 1):
+		for ix in range(x0, x1 + 1):
+			if _point_in_or_on_poly(Vector2((ix - buf) * cs, (iy - buf) * cs), poly):
+				bm.set_bit(Vector2(ix, iy), not erase)
+				cells += 1
+	if cells == 0:
+		return _err("shape is too small: no material grid corner (%d woxels apart) falls inside it" % int(cs))
+	_set_material_bitmap(mesh, bm)
+	return _ok_op(
+		{ "erase": erase, "layer": layer, "asset": tex.resource_path, "cells": cells, "cell_size": cs },
+		{ "kind": "material", "mesh": mesh, "before": before, "after": bm })
+
+
+# Push a BitMap into a material mesh and rebuild its fill and border (shared by
+# draw_material and its undo). SetBitmap takes a copy, so `bm` stays the caller's.
+func _set_material_bitmap(mesh, bm) -> void:
+	mesh.call("SetBitmap", bm)
+	if mesh.has_method("FinalizeMeshAndBorders"):
+		mesh.call("FinalizeMeshAndBorders")
+
+
 # ---------------------------------------------------------------------------
 # Terrain
 # ---------------------------------------------------------------------------
@@ -1197,19 +1401,63 @@ func _set_terrain_slot(req : Dictionary) -> Dictionary:
 	var tex = _asset_tex("Terrain", req.get("asset", ""))
 	if tex == null: return _err("could not load terrain asset: " + str(req.get("asset")))
 	var slot = int(req.get("slot", 0))
+	if slot >= 4 and slot <= 7 and bool(req.get("expand", false)):
+		_expand_terrain_slots(level)
+	var bad = _terrain_slot_error(level, slot)
+	if bad != "": return _err(bad)
 	level.Terrain.SetTexture(tex, slot)
 	level.Terrain.UpdateSplat()
-	return _ok({ "slot": slot })
+	return _ok({ "slot": slot, "terrain_slots": 8 if level.Terrain.ExpandedSlots else 4 })
+
+
+# Slots 0-3 are weighted in the first splat image; 4-7 in a second one that
+# only exists once the level's "Expand Slots" option is on. Without it
+# SetTexture ignores them, Fill paints the wrong slot and CloneSplatImage2
+# throws inside DD, so refuse those slots here. Returns "" when `slot` is usable.
+func _terrain_slot_error(level, slot : int) -> String:
+	if slot < 0 or slot > 7:
+		return "terrain slot must be 0-7, got " + str(slot)
+	if slot >= 4 and not level.Terrain.ExpandedSlots:
+		return "terrain slot %d needs expanded slots: call set_terrain_slot with 'expand': true (or turn on Expand Slots in the Terrain Brush)" % slot
+	return ""
+
+
+# Turn on the level's 8-slot terrain mode. While the Terrain Brush panel is
+# built, go through the brush so its slot list follows (it also gives the new
+# slots DD's default textures); otherwise the panel syncs when next opened.
+func _expand_terrain_slots(level) -> void:
+	if level.Terrain.ExpandedSlots:
+		return
+	if Global.Editor.Tools.has("TerrainBrush"):
+		var brush = Global.Editor.Tools["TerrainBrush"]
+		if brush.get("terrainList") != null:
+			brush.ExpandSlots(true)
+			return
+	level.Terrain.ExpandSlots(true)
+
+
+# Shared front half of the paint/fill commands: check `slot`, then assign the
+# optional `asset` to it. Returns "" or the error.
+func _prepare_terrain_slot(level, req : Dictionary, slot : int) -> String:
+	var bad = _terrain_slot_error(level, slot)
+	if bad != "":
+		return bad
+	if req.has("asset"):
+		var tex = _asset_tex("Terrain", req["asset"])
+		if tex == null:
+			return "could not load terrain asset: " + str(req["asset"])
+		level.Terrain.SetTexture(tex, slot)
+	elif slot >= 4 and level.Terrain.GetTexture(slot) == null:
+		return "terrain slot %d has no texture yet: pass 'asset' or call set_terrain_slot first" % slot
+	return ""
 
 
 func _fill_terrain(req : Dictionary) -> Dictionary:
 	var level = Global.World.GetCurrentLevel()
 	if level == null: return _err("no map open")
 	var slot = int(req.get("slot", 0))
-	if req.has("asset"):
-		var tex = _asset_tex("Terrain", req["asset"])
-		if tex == null: return _err("could not load terrain asset: " + str(req["asset"]))
-		level.Terrain.SetTexture(tex, slot)
+	var bad = _prepare_terrain_slot(level, req, slot)
+	if bad != "": return _err(bad)
 	level.Terrain.Fill(slot)
 	level.Terrain.UpdateSplat()
 	return _ok({ "filled_slot": slot })
@@ -1225,10 +1473,8 @@ func _paint_terrain(req : Dictionary) -> Dictionary:
 	var slot = int(req.get("slot", 0))
 	var radius = float(req.get("radius", 64.0))
 	var rate = clamp(float(req.get("rate", 1.0)), 0.0, 1.0)
-	if req.has("asset"):
-		var tex = _asset_tex("Terrain", req["asset"])
-		if tex == null: return _err("could not load terrain asset: " + str(req["asset"]))
-		level.Terrain.SetTexture(tex, slot)
+	var bad = _prepare_terrain_slot(level, req, slot)
+	if bad != "": return _err(bad)
 	var world = _xy(req, Global.World.WoxelDimensions * 0.5)
 	# Convert the brush center and radius into texture space (radius scales by
 	# the woxel->texture ratio along x).
@@ -1238,16 +1484,13 @@ func _paint_terrain(req : Dictionary) -> Dictionary:
 
 	var sp = _open_splat(level, slot)
 	if sp == null: return _err("could not read splat image for slot " + str(slot))
-	var img = sp.img
-	var ch = sp.ch
-	var iw = img.get_width()
-	var ih = img.get_height()
+	var iw = sp.img.get_width()
+	var ih = sp.img.get_height()
 	var x0 = int(floor(center.x - trad))
 	var y0 = int(floor(center.y - trad))
 	var x1 = int(ceil(center.x + trad))
 	var y1 = int(ceil(center.y + trad))
 	var painted := 0
-	img.lock()
 	for iy in range(max(y0, 0), min(y1 + 1, ih)):
 		for ix in range(max(x0, 0), min(x1 + 1, iw)):
 			var d = Vector2(ix + 0.5, iy + 0.5).distance_to(center)
@@ -1259,10 +1502,9 @@ func _paint_terrain(req : Dictionary) -> Dictionary:
 			var w = rate * falloff
 			if w <= 0.0:
 				continue
-			img.set_pixel(ix, iy, _splat_set_channel(img.get_pixel(ix, iy), ch, w))
+			_splat_paint_pixel(sp, ix, iy, w)
 			painted += 1
-	img.unlock()
-	_close_splat(level, sp.which, img)
+	_close_splat(level, sp)
 	return _ok({ "painted_slot": slot, "pixels": painted })
 
 
@@ -1283,10 +1525,8 @@ func _paint_path(req : Dictionary) -> Dictionary:
 	var pts = req["points"]
 	if typeof(pts) != TYPE_ARRAY or pts.size() < 2:
 		return _err("'points' needs >= 2 [x,y] pairs for a path")
-	if req.has("asset"):
-		var tex = _asset_tex("Terrain", req["asset"])
-		if tex == null: return _err("could not load terrain asset: " + str(req["asset"]))
-		level.Terrain.SetTexture(tex, slot)
+	var bad = _prepare_terrain_slot(level, req, slot)
+	if bad != "": return _err(bad)
 
 	# Map the polyline into texture space; radius scales by the woxel->texture
 	# ratio (same conversion paint_terrain uses for a single dab).
@@ -1303,17 +1543,14 @@ func _paint_path(req : Dictionary) -> Dictionary:
 
 	var sp = _open_splat(level, slot)
 	if sp == null: return _err("could not read splat image for slot " + str(slot))
-	var img = sp.img
-	var ch = sp.ch
-	var iw = img.get_width()
-	var ih = img.get_height()
+	var iw = sp.img.get_width()
+	var ih = sp.img.get_height()
 	# Bounding box of the whole stroke, padded by the brush radius.
 	var x0 = max(int(floor(mn.x - trad)), 0)
 	var y0 = max(int(floor(mn.y - trad)), 0)
 	var x1 = min(int(ceil(mx.x + trad)), iw - 1)
 	var y1 = min(int(ceil(mx.y + trad)), ih - 1)
 	var painted := 0
-	img.lock()
 	for iy in range(y0, y1 + 1):
 		for ix in range(x0, x1 + 1):
 			var pix = Vector2(ix + 0.5, iy + 0.5)
@@ -1333,10 +1570,9 @@ func _paint_path(req : Dictionary) -> Dictionary:
 			var w = rate * falloff
 			if w <= 0.0:
 				continue
-			img.set_pixel(ix, iy, _splat_set_channel(img.get_pixel(ix, iy), ch, w))
+			_splat_paint_pixel(sp, ix, iy, w)
 			painted += 1
-	img.unlock()
-	_close_splat(level, sp.which, img)
+	_close_splat(level, sp)
 	return _ok({ "painted_slot": slot, "segments": tpts.size() - 1, "pixels": painted })
 
 
@@ -1360,10 +1596,8 @@ func _fill_region(req : Dictionary) -> Dictionary:
 	if level == null: return _err("no map open")
 	var slot = int(req.get("slot", 0))
 	var rate = float(req.get("rate", 1.0))
-	if req.has("asset"):
-		var tex = _asset_tex("Terrain", req["asset"])
-		if tex == null: return _err("could not load terrain asset: " + str(req["asset"]))
-		level.Terrain.SetTexture(tex, slot)
+	var bad = _prepare_terrain_slot(level, req, slot)
+	if bad != "": return _err(bad)
 
 	# Gather the shape's world-space polygon (rect -> 4 corners).
 	var poly := []
@@ -1405,11 +1639,9 @@ func _fill_region(req : Dictionary) -> Dictionary:
 	rate = clamp(rate, 0.0, 1.0)
 	var sp = _open_splat(level, slot)
 	if sp == null: return _err("could not read splat image for slot " + str(slot))
-	var img = sp.img
-	var iw = img.get_width()
-	var ih = img.get_height()
+	var iw = sp.img.get_width()
+	var ih = sp.img.get_height()
 	var painted := 0
-	img.lock()
 	for py in range(bh):
 		var iy = int(origin.y) + py
 		if iy < 0 or iy >= ih:
@@ -1420,10 +1652,9 @@ func _fill_region(req : Dictionary) -> Dictionary:
 				continue
 			if not _point_in_poly(Vector2(px + 0.5, py + 0.5), local):
 				continue
-			img.set_pixel(ix, iy, _splat_set_channel(img.get_pixel(ix, iy), sp.ch, rate))
+			_splat_paint_pixel(sp, ix, iy, rate)
 			painted += 1
-	img.unlock()
-	_close_splat(level, sp.which, img)
+	_close_splat(level, sp)
 
 	return _ok({
 		"filled_slot": slot, "shape": ("rect" if req.has("rect") else "polygon"),
@@ -1432,41 +1663,65 @@ func _fill_region(req : Dictionary) -> Dictionary:
 	})
 
 
-# Clone the splat weight image holding `slot` for direct editing. Returns
-# { img, ch, which } where ch is the RGBA channel (0..3) for that slot and
-# which is 0 (slots 0-3 -> splatImage) or 1 (slots 4-7 -> splatImage2), or null
-# if the image isn't available. Pair with _close_splat to push edits back.
+# Clone the splat weight images for direct editing of `slot` (callers validate
+# it with _terrain_slot_error first). Returns { img, other, ch, which }, locked:
+# img holds the slot in RGBA channel ch (0..3) and is splat image `which` (0 =
+# slots 0-3, 1 = slots 4-7); other is the second image when the level has
+# expanded slots (its weights must shrink as the slot's grow), else null.
+# Returns null if an image isn't available. Pair with _close_splat.
 func _open_splat(level, slot : int):
 	var which = 0 if slot < 4 else 1
-	var img = level.Terrain.CloneSplatImage() if which == 0 else level.Terrain.CloneSplatImage2()
+	var first = level.Terrain.CloneSplatImage()
+	var second = level.Terrain.CloneSplatImage2() if level.Terrain.ExpandedSlots else null
+	var img = first if which == 0 else second
+	var other = second if which == 0 else first
 	if img == null:
 		return null
-	return { "img": img, "ch": slot % 4, "which": which }
+	img.lock()
+	if other != null:
+		other.lock()
+	return { "img": img, "other": other, "ch": slot % 4, "which": which }
 
 
-func _close_splat(level, which : int, img) -> void:
-	if which == 0:
-		level.Terrain.RestoreSplat(img)
+# Push an _open_splat edit back into the terrain. RestoreSplat2 takes BOTH
+# images (first, second), as DD's PaintTerrain2 record passes them.
+func _close_splat(level, sp : Dictionary) -> void:
+	sp.img.unlock()
+	if sp.other == null:
+		level.Terrain.RestoreSplat(sp.img)
 	else:
-		level.Terrain.RestoreSplat2(img)
+		sp.other.unlock()
+		if sp.which == 0:
+			level.Terrain.RestoreSplat2(sp.img, sp.other)
+		else:
+			level.Terrain.RestoreSplat2(sp.other, sp.img)
 	level.Terrain.UpdateSplat()
 
 
-# Push channel `ch` (0=R,1=G,2=B,3=A) of an RGBA splat weight toward 1 by `rate`,
-# scaling the remaining channels down so the four weights still sum to ~1.
-func _splat_set_channel(c : Color, ch : int, rate : float) -> Color:
+# Push the open slot's weight at one pixel toward 1 by `rate`, scaling the
+# remaining slots (all 8 with expanded slots) down so the weights still sum to ~1.
+func _splat_paint_pixel(sp : Dictionary, x : int, y : int, rate : float) -> void:
+	var c = sp.img.get_pixel(x, y)
 	var w = [c.r, c.g, c.b, c.a]
+	if sp.other != null:
+		var o = sp.other.get_pixel(x, y)
+		w += [o.r, o.g, o.b, o.a]
+	var ch = sp.ch
 	var target = w[ch] + (1.0 - w[ch]) * rate
 	var rest = 1.0 - target
-	var others = (w[0] + w[1] + w[2] + w[3]) - w[ch]
-	for i in range(4):
+	var others = -w[ch]
+	for v in w:
+		others += v
+	for i in range(w.size()):
 		if i == ch:
 			w[i] = target
 		elif others > 0.0001:
 			w[i] = w[i] / others * rest
 		else:
 			w[i] = 0.0
-	return Color(w[0], w[1], w[2], w[3])
+	sp.img.set_pixel(x, y, Color(w[0], w[1], w[2], w[3]))
+	if sp.other != null:
+		sp.other.set_pixel(x, y, Color(w[4], w[5], w[6], w[7]))
 
 
 # Even-odd point-in-polygon test (ray cast). `poly` is an array of Vector2.
@@ -1482,6 +1737,17 @@ func _point_in_poly(pt : Vector2, poly : Array) -> bool:
 			inside = not inside
 		j = i
 	return inside
+
+
+# _point_in_poly, but a point on the outline counts as inside (the ray cast
+# alone is a coin toss there, and grid-aligned shapes put many points on it).
+func _point_in_or_on_poly(pt : Vector2, poly : Array) -> bool:
+	if _point_in_poly(pt, poly):
+		return true
+	for i in range(poly.size()):
+		if _dist_point_segment(pt, poly[i], poly[(i + 1) % poly.size()]) <= 0.5:
+			return true
+	return false
 
 
 # ---------------------------------------------------------------------------
@@ -1518,6 +1784,118 @@ func _modify_object(req : Dictionary) -> Dictionary:
 	if warning != "":
 		d["warning"] = warning
 	return _ok(d)
+
+
+# Edit an existing wall by id: texture (`asset`), tint (`color`), `shadow`
+# and/or geometry (`points`, `loop`, `type`, `joint`). Anything omitted is kept.
+func _modify_wall(req : Dictionary) -> Dictionary:
+	var wall = _resolve(req)
+	if wall == null or not _is_wall(wall): return _err("no wall with id " + str(req.get("id")))
+	var old = _wall_state(wall)
+	var want = old.duplicate()
+	if req.has("points"): want["points"] = _points(req["points"])
+	if req.has("loop"): want["loop"] = bool(req["loop"])
+	if req.has("type"): want["type"] = int(req["type"])
+	if req.has("joint"): want["joint"] = int(req["joint"])
+	if req.has("shadow"): want["shadow"] = bool(req["shadow"])
+	if req.has("asset"):
+		var tex = _asset_tex("Walls", req["asset"])
+		if tex == null: return _err("could not load wall asset: " + str(req["asset"]))
+		want["texture"] = tex
+		# A new texture brings its own default tint, as in draw_wall.
+		want["color"] = _wall_color(req, tex)
+	elif req.has("color") and str(req.get("color", "")) != "":
+		want["color"] = _color(req["color"], old["color"])
+	var bad = _apply_wall_state(wall, want)
+	if bad != "": return _err(bad)
+	return _ok_op(_describe_wall(wall), { "kind": "wall", "id": _id(wall), "old": old, "new": want })
+
+
+# A wall's editable state: what modify_wall changes and its undo puts back.
+func _wall_state(wall) -> Dictionary:
+	return {
+		"points": wall.Points, "loop": wall.Loop,
+		"type": int(wall.Type), "joint": int(wall.Joint),
+		"texture": wall.Texture, "color": wall.Color, "shadow": wall.HasShadow,
+	}
+
+
+# Apply a _wall_state to a wall. Returns "" on success, or why it was refused
+# (nothing has changed then).
+#
+# Wall.Set, the only call that replaces a wall's shape wholesale, frees every
+# mounted portal (its Clear() does), and ModifyPoint deletes the ones next to
+# the moved vertex. So a wall with doors/windows is reshaped in place instead:
+# same point count / loop / type / joint, each portal carried along at the same
+# fraction of its segment and turned with it, then re-keyed with MovePortal
+# (what SelectTool does when a door is dragged along its wall).
+func _apply_wall_state(wall, s : Dictionary) -> String:
+	var pts : PoolVector2Array = s["points"]
+	var n = pts.size()
+	if n < 2:
+		return "'points' needs >= 2 [x,y] pairs"
+	if not (int(s["type"]) in [0, 1, 2]) or not (int(s["joint"]) in [0, 1, 2]):
+		return "'type' and 'joint' must each be 0, 1 or 2"
+	var cur : PoolVector2Array = wall.Points
+	var same_shape = n == cur.size() and s["loop"] == wall.Loop \
+			and int(s["type"]) == int(wall.Type) and int(s["joint"]) == int(wall.Joint)
+	var moved = not same_shape
+	if same_shape:
+		for i in range(n):
+			if pts[i] != cur[i]:
+				moved = true
+				break
+
+	var anchors := []
+	if moved and wall.Portals.size() > 0:
+		if not same_shape:
+			return "wall has mounted doors/windows, so only its existing points can be moved (same point count, loop, type and joint); delete the portals first to reshape it"
+		for portal in wall.Portals:
+			var i = int(portal.WallPointIndex)
+			var j = (i + 1) % n
+			if i < 0 or i >= n or (j == 0 and not wall.Loop):
+				return "portal %d has an invalid wall anchor" % _id(portal)
+			var old_edge = cur[j] - cur[i]
+			var new_edge = pts[j] - pts[i]
+			if old_edge.length() < 0.001 or new_edge.length() < 0.001:
+				return "a wall segment holding a door/window can't have zero length"
+			var t = clamp((portal.position - cur[i]).dot(old_edge) / old_edge.length_squared(), 0.0, 1.0)
+			# Room on the shorter side of the portal's centre, before and after:
+			# it must still fit (or at least fit no worse than it already did).
+			var room_was = min(t, 1.0 - t) * old_edge.length()
+			var room_now = min(t, 1.0 - t) * new_edge.length()
+			if room_now + 0.5 < min(float(portal.Radius), room_was):
+				return "segment %d would be too short for its door/window (portal %d)" % [i, _id(portal)]
+			anchors.append({
+				"portal": portal, "index": i, "position": pts[i] + new_edge * t,
+				"turn": new_edge.angle() - old_edge.angle(),
+			})
+
+	if moved and anchors.empty():
+		wall.Set(pts, s["texture"], s["color"], s["loop"], s["shadow"],
+			int(s["type"]), int(s["joint"]), wall.NormalizeUV)
+	else:
+		if moved:
+			wall.Points = pts
+			if wall.Loop:
+				# Set() keeps a closed copy of a loop for hit-testing; refresh it too.
+				var closed = pts
+				closed.append(pts[0])
+				wall.set("pointsClosed", closed)
+			for a in anchors:
+				var portal = a["portal"]
+				portal.position = a["position"]
+				portal.rotation += a["turn"]
+				portal.Direction = portal.Direction.rotated(a["turn"])
+				wall.MovePortal(portal, a["index"])
+		if s["texture"] != wall.Texture:
+			wall.UpdateTexture(s["texture"])
+		wall.SetColor(s["color"])
+		wall.HasShadow = s["shadow"]
+	# Set() leaves the previous shadow lines behind, and the setters above only
+	# store values: RemakeLines rebuilds lines, shadows and occluders from them.
+	wall.RemakeLines()
+	return ""
 
 
 func _duplicate_object(req : Dictionary) -> Dictionary:
@@ -2038,6 +2416,27 @@ func _describe(node) -> Dictionary:
 	return d
 
 
+# Wall-only API as the test: SelectTool.GetSelectableType can't be asked about
+# every node (see _is_text).
+func _is_wall(node) -> bool:
+	return (node is Node2D) and node.has_method("AddPortal") and node.has_method("RemakeLines")
+
+
+# _describe plus a wall's geometry, for get_element and modify_wall: `points`
+# is what modify_wall's `points` replaces (list_elements stays compact).
+func _describe_wall(wall) -> Dictionary:
+	var d = _describe(wall)
+	var pts := []
+	for p in wall.Points:
+		pts.append(_vec(p))
+	d["points"] = pts
+	d["loop"] = wall.Loop
+	d["type"] = int(wall.Type)
+	d["joint"] = int(wall.Joint)
+	d["portal_count"] = wall.Portals.size()
+	return d
+
+
 func _texture_path(node, kind : int) -> String:
 	var tex = null
 	if kind in [1, 2, 3, 4]:
@@ -2078,6 +2477,31 @@ func _points(raw) -> PoolVector2Array:
 	return pts
 
 
+# Shape params shared by draw_water / draw_material: `rect:[x,y,w,h]` or
+# `points:[[x,y]...]` -> the polygon's corners in woxels. Empty when neither
+# gives a usable shape (fewer than 3 points, or no area to fill).
+func _shape_points(req : Dictionary) -> PoolVector2Array:
+	var pts := PoolVector2Array()
+	if req.has("rect"):
+		var r = req["rect"]
+		if typeof(r) != TYPE_ARRAY or r.size() < 4:
+			return pts
+		var x = float(r[0]); var y = float(r[1]); var w = float(r[2]); var h = float(r[3])
+		pts = PoolVector2Array([Vector2(x, y), Vector2(x + w, y), Vector2(x + w, y + h), Vector2(x, y + h)])
+	else:
+		pts = _points(req.get("points", []))
+	if pts.size() < 3:
+		return PoolVector2Array()
+	var area := 0.0   # shoelace, doubled
+	for i in range(pts.size()):
+		var a = pts[i]
+		var b = pts[(i + 1) % pts.size()]
+		area += a.x * b.y - b.x * a.y
+	if abs(area) < 2.0:
+		return PoolVector2Array()
+	return pts
+
+
 # Accepts "#rrggbb" / "rrggbb" string, or [r,g,b] / [r,g,b,a] floats 0..1.
 func _color(v, fallback : Color) -> Color:
 	if typeof(v) == TYPE_STRING and v != "":
@@ -2092,6 +2516,12 @@ func _color(v, fallback : Color) -> Color:
 
 func _ok(result) -> Dictionary:
 	return { "ok": true, "result": result }
+
+
+# _ok for a handler that builds its own undo op: _record_and_dispatch takes
+# "op" off the response and pushes it onto the undo stack.
+func _ok_op(result, op : Dictionary) -> Dictionary:
+	return { "ok": true, "result": result, "op": op }
 
 
 func _err(msg) -> Dictionary:

@@ -119,7 +119,11 @@ def list_elements(kind: str = "objects", limit: int = 200) -> dict:
 
 @mcp.tool()
 def get_element(id: int) -> dict:
-    """Get details (kind, position, rotation, scale, asset) for a single element by id."""
+    """Get details (kind, position, rotation, scale, asset) for a single element by id.
+
+    A wall also reports its geometry: points ([[x, y], ...]), loop, type, joint
+    and portal_count. Those points are what modify_wall replaces.
+    """
     return bridge.request("get_element", id=id)
 
 
@@ -423,14 +427,142 @@ def add_text(
     return bridge.request("add_text", **params)
 
 
+@mcp.tool()
+def import_image(
+    path: str,
+    x: Optional[float] = None,
+    y: Optional[float] = None,
+    scale: float = 1.0,
+    rotation: float = 0.0,
+    sorting: int = 0,
+    shadow: bool = True,
+) -> dict:
+    """Embed an image file from disk into the map as an object. Returns the new element id.
+
+    Use it for art that is not in an asset pack: a custom prop or token, a
+    handout, or a whole battle map as a backdrop. The pixels are stored inside
+    the map file (as when a file is dropped onto Dungeondraft), so the saved
+    map does not need the original image.
+
+    path: absolute path to a .png, .jpg or .webp on the machine running
+    Dungeondraft. PNG keeps transparency. x, y: woxel position of the image's
+    center (defaults to map center). At scale=1, 256 image pixels cover one
+    tile. rotation: degrees. sorting: 0=over, 1=under other objects.
+    shadow: drop shadow; pass False for a backdrop.
+
+    The result is an ordinary object: move_element, modify_object,
+    duplicate_object and delete_element work on it, and undo removes it.
+    Importing the same path again reuses the copy already embedded (even if
+    the file changed since); save an edited image under a new name.
+    """
+    params: dict = {
+        "path": os.path.abspath(os.path.expanduser(path)),
+        "scale": scale, "rotation": rotation, "sorting": sorting, "shadow": shadow,
+    }
+    if x is not None:
+        params["x"] = x
+    if y is not None:
+        params["y"] = y
+    return bridge.request("import_image", **params)
+
+
+@mcp.tool()
+def draw_water(
+    rect: Optional[list[float]] = None,
+    points: Optional[list[list[float]]] = None,
+    erase: bool = False,
+    deep_color: str = "",
+    shallow_color: str = "",
+    blend_distance: Optional[float] = None,
+) -> dict:
+    """Draw (or erase) water: a lake, pond, river or moat, in woxel coords.
+
+    Provide ONE of:
+      rect: [x, y, w, h] axis-aligned rectangle, or
+      points: [[x,y], ...] a polygon (>= 3 points); trace a river as a long
+      thin polygon along both banks.
+    The shape is merged into the water already on the level; Dungeondraft adds
+    the shoreline and the shallow-to-deep gradient. erase=True cuts the shape
+    out of existing water instead (an island, or removing a pond).
+
+    deep_color / shallow_color: '#rrggbb' for the middle and the shore.
+    blend_distance: tiles from the shore to full depth (0-4). Each defaults to
+    the Water Brush's current setting (initially '#3aa19a', '#8bceb0', 1.5).
+    They apply to the body of water this shape creates or joins; the result
+    reports the values used. Undoable via undo().
+    """
+    if (rect is None) == (points is None):
+        raise ValueError("provide exactly one of 'rect' or 'points'")
+    params: dict = {"erase": erase}
+    if rect is not None:
+        params["rect"] = rect
+    if points is not None:
+        params["points"] = points
+    if deep_color:
+        params["deep_color"] = deep_color
+    if shallow_color:
+        params["shallow_color"] = shallow_color
+    if blend_distance is not None:
+        params["blend_distance"] = blend_distance
+    return bridge.request("draw_water", **params)
+
+
+@mcp.tool()
+def draw_material(
+    asset: str,
+    rect: Optional[list[float]] = None,
+    points: Optional[list[list[float]]] = None,
+    layer: int = -400,
+    smooth: Optional[bool] = None,
+    erase: bool = False,
+) -> dict:
+    """Paint (or erase) a ground material over a region: lava, ice, cobblestone, acid, etc.
+
+    A material is a textured patch with its own blended border (the Material
+    Brush). Unlike terrain it is independent of the 4/8 terrain slots, so any
+    number of materials can be used on one level.
+
+    asset: a Materials asset path from list_assets(category='Materials').
+    Provide ONE of rect: [x, y, w, h] or points: [[x,y], ...] (>= 3 points), in
+    woxels. Materials are drawn on a half-tile grid with an organic edge, so
+    the patch covers the shape and may run up to a quarter tile (64 woxels)
+    past it; do not rely on it for exact edges.
+
+    layer: one of the level's draw layers. -400 'Below Ground' (default) lies
+    on the terrain, beneath floors, objects and walls. The others are, unless
+    the map renamed them: -100 'Below Water', 100/200/300/400 'User Layer 1-4',
+    700 'Above Walls', 900 'Above Roofs'.
+    smooth: round the outline (default on for a new material patch).
+    erase=True removes this material from the region. Undoable via undo().
+    """
+    if (rect is None) == (points is None):
+        raise ValueError("provide exactly one of 'rect' or 'points'")
+    params: dict = {"asset": asset, "layer": layer, "erase": erase}
+    if rect is not None:
+        params["rect"] = rect
+    if points is not None:
+        params["points"] = points
+    if smooth is not None:
+        params["smooth"] = smooth
+    return bridge.request("draw_material", **params)
+
+
 # --------------------------------------------------------------------------
 # Terrain
 # --------------------------------------------------------------------------
 
 @mcp.tool()
-def set_terrain_slot(asset: str, slot: int = 0) -> dict:
-    """Assign a Terrain asset to a terrain slot index so it can be filled/painted with that slot."""
-    return bridge.request("set_terrain_slot", asset=asset, slot=slot)
+def set_terrain_slot(asset: str, slot: int = 0, expand: bool = False) -> dict:
+    """Assign a Terrain asset to a terrain slot index so it can be filled/painted with that slot.
+
+    A level has slots 0-3. Slots 4-7 exist only once the level's expanded
+    slots are on (get_status reports terrain_slots: 4 or 8): pass expand=True
+    with a slot of 4-7 to turn them on, which stays on for the level.
+    """
+    params: dict = {"asset": asset, "slot": slot}
+    if expand:
+        params["expand"] = True
+    return bridge.request("set_terrain_slot", **params)
 
 
 @mcp.tool()
@@ -598,6 +730,52 @@ def modify_object(
     if shadow is not None:
         params["shadow"] = shadow
     return bridge.request("modify_object", **params)
+
+
+@mcp.tool()
+def modify_wall(
+    id: int,
+    points: Optional[list[list[float]]] = None,
+    loop: Optional[bool] = None,
+    type: Optional[int] = None,
+    joint: Optional[int] = None,
+    asset: str = "",
+    color: str = "",
+    shadow: Optional[bool] = None,
+) -> dict:
+    """Edit an existing wall by id: reshape it and/or change its look. Returns the wall with its points.
+
+    points: the wall's new [[x, y], ...] woxel points, replacing all of them
+    (read the current ones with get_element). loop: closed loop or open run.
+    type: 0=auto, 1=manual, 2=cave. joint: 0=sharp, 1=bevel, 2=round.
+    asset: a Walls asset path; the wall takes that texture's default tint unless
+    color is given. color: '#rrggbb' tint. shadow: wall shadow on/off.
+    Anything omitted is left as it is.
+
+    Doors and windows mounted on the wall are kept: when points move they stay
+    at the same place along their segment and turn with it. That only works
+    while the wall keeps its shape, so a wall with doors/windows must get the
+    same number of points and unchanged loop/type/joint, and a segment can't
+    shrink below its door's width; otherwise the call fails and nothing
+    changes. To reshape such a wall, delete its doors first and add them back.
+    Undoable via undo().
+    """
+    params: dict = {"id": id}
+    if points is not None:
+        params["points"] = points
+    if loop is not None:
+        params["loop"] = loop
+    if type is not None:
+        params["type"] = type
+    if joint is not None:
+        params["joint"] = joint
+    if asset:
+        params["asset"] = asset
+    if color:
+        params["color"] = color
+    if shadow is not None:
+        params["shadow"] = shadow
+    return bridge.request("modify_wall", **params)
 
 
 @mcp.tool()
@@ -839,7 +1017,7 @@ def clear_selection() -> dict:
 
 @mcp.tool()
 def undo() -> dict:
-    """Reverse the last reversible edit you made (create / move / modify / terrain).
+    """Reverse the last reversible edit you made (create / move / modify / terrain / cave / water / material).
 
     The bridge keeps its own undo/redo stack, so this reliably steps back through
     your own edits. Note: it is independent of Dungeondraft's Ctrl+Z, and

@@ -4,8 +4,8 @@
 Run with Dungeondraft open (mod enabled, a map loaded). It exercises every
 bridge command and prints PASS/FAIL per command, so you can see exactly what
 works on your Dungeondraft version. It builds a small throwaway scene near the
-map center (a room of walls, an object, a light, a path) and then deletes what
-it created.
+map center (a room of walls with a door, an object, a light, a path, a patch of
+water and of material) and then deletes or undoes what it created.
 
     python test_bridge.py
 """
@@ -90,6 +90,43 @@ def main() -> int:
         if dup:
             created_ids.append(dup["id"])
 
+    # --- wall edit: a door mounted on the room must survive a reshape ---
+    door_asset = first_asset("Portals", "door")
+    if wall and door_asset:
+        def wall_edit():
+            door = bridge.request("add_portal", asset=door_asset, x=cx, y=cy - 200, radius=64)
+            grown = [[cx - 300, cy - 300], [cx + 300, cy - 300], [cx + 300, cy + 200], [cx - 200, cy + 200]]
+            res = bridge.request("modify_wall", id=wall["id"], points=grown)
+            doors = [e for e in bridge.request("list_elements", kind="portals")["elements"]
+                     if e["id"] == door["id"]]
+            if res["portal_count"] != 1 or not doors:
+                raise BridgeError("the mounted door did not survive the wall edit")
+            x, y = doors[0]["position"]
+            if abs(x - cx) > 1 or abs(y - (cy - 300)) > 1:
+                raise BridgeError(f"door should have followed its segment to {[cx, cy - 300]}, is at {[x, y]}")
+            return f"{len(res['points'])} points moved, door {door['id']} followed to {[x, y]}"
+
+        check("modify_wall", wall_edit)
+    else:
+        print("  SKIP  modify_wall        -> no wall or no Portals assets")
+
+    # --- water / material: draw a patch, then undo it (restores the layer exactly) ---
+    def draw_and_undo(cmd, **params):
+        res = bridge.request(cmd, **params)
+        undone = bridge.request("undo")
+        if undone.get("kind") != cmd.replace("draw_", ""):
+            raise BridgeError(f"undo after {cmd} reverted {undone} instead")
+        return res
+
+    check("draw_water", lambda: draw_and_undo(
+        "draw_water", rect=[cx - 768, cy + 384, 512, 384], deep_color="#204080"))
+    material_asset = first_asset("Materials")
+    if material_asset:
+        check("draw_material", lambda: draw_and_undo(
+            "draw_material", asset=material_asset, rect=[cx + 384, cy + 384, 384, 384]))
+    else:
+        print("  SKIP  draw_material      -> no Materials assets")
+
     check("list_levels", lambda: bridge.request("list_levels"))
     if created_ids:
         check("select_elements", lambda: bridge.request("select_elements", ids=created_ids))
@@ -104,10 +141,7 @@ def main() -> int:
         after_undo = bridge.request("get_status")["counts"]["objects"]
         bridge.request("redo")
         after_redo = bridge.request("get_status")["counts"]["objects"]
-        # track whatever exists now so cleanup removes it
-        for el in bridge.request("list_elements", kind="objects")["elements"]:
-            if el["id"] not in created_ids:
-                created_ids.append(el["id"])
+        created_ids.append(made["id"])   # redo rebuilds the object under the same id
         if not (after_create == before + 1 and after_undo == before and after_redo == before + 1):
             raise BridgeError(f"counts before={before} create={after_create} undo={after_undo} redo={after_redo}")
         return f"object count {before}->{after_create} undo->{after_undo} redo->{after_redo}"
@@ -124,7 +158,7 @@ def main() -> int:
             pass
     print(f"\nCleaned up {deleted}/{len(created_ids)} created elements.")
     print(f"\n{passed} passed, {failed} failed.")
-    print("(Terrain / portal / roof / text commands aren't auto-tested here to avoid "
+    print("(Terrain / image import / roof / text commands aren't auto-tested here to avoid "
           "messing up your map — try them by hand once the basics pass.)")
     return 0 if failed == 0 else 1
 
