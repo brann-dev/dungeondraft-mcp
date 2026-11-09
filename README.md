@@ -27,15 +27,26 @@ The mod opens a TCP server inside Dungeondraft and polls it every frame from the
 forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
 
 > **Status: working.** Confirmed end-to-end against Dungeondraft on **Godot
-> 3.4.2** — raw TCP from the modding sandbox works, no fallback needed. 75 tools
-> across query / create / modify / terrain / water / materials / levels /
-> layers / layout checks / selection / capture / camera / undo / map lifecycle,
+> 3.4.2** — raw TCP from the modding sandbox works, no fallback needed. 97 tools
+> across query / create / arrange / modify / terrain / water / materials /
+> levels / layers / layout and scene checks / asset packs / map files / VTT
+> import and export / selection / capture / camera / history / map lifecycle,
 > plus an escape hatch to Dungeondraft's own API and UI (see below).
 
 ## What the AI can do
 
 - **Inspect:** `ping`, `get_status`, `list_levels`, `list_elements`,
-  `get_element`, `list_asset_categories`, `list_assets` (with substring search).
+  `get_element`, `list_asset_categories`, `list_assets` (with substring search),
+  `get_terrain` (read the painted terrain back as a grid of slot weights).
+- **Asset packs:** `list_asset_packs` (which packs are installed, and which
+  this map can actually use: Dungeondraft scopes packs per map, and a map
+  made without them silently sees only the ~1800 core assets),
+  `search_pack_contents` (search inside every installed pack, including ones
+  the map lacks, by words and tags, never reading the art) and
+  `prepare_map_with_packs` (write a copy of the map that includes more packs
+  and open it). `inspect_map_file` summarises a `.dungeondraft_map` without
+  opening it: packs it needs, counts per level, most used textures, doors
+  whose closed flag contradicts their name; `compare_to` diffs two files.
 - **Create:** `place_object`, `draw_wall`, `draw_path`, `add_light`,
   `add_portal`, `add_roof`, `add_text`, `place_pattern` (tiled floor shapes —
   wood planks, tile, brick — rendered below objects), `build_room` (a wall loop
@@ -43,8 +54,15 @@ forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
   `import_image` (embed a PNG/JPG/WEBP from disk as an object: custom props,
   handouts or a whole battle-map backdrop; the pixels are stored in the map),
   `scatter_objects` (a stand of trees or a field of rubble in one call, kept
-  off walls and out of doorways), `set_trace_image` (a reference picture shown
-  over the map to trace from).
+  off walls and out of doorways), `place_objects` (many objects at chosen
+  spots in one call), `arrange_objects` (a row of shelves flush against a
+  wall, chairs ringing a table, items on a desk, fitted to what each asset
+  actually draws), `list_prefabs` / `place_prefab` (Dungeondraft's saved
+  groups), `generate_dungeon` (the Map Wizard's dungeon or cave layout in one
+  call), `set_trace_image` (a reference picture shown over the map to trace
+  from). `build_room` reuses a wall that already stands on the boundary, so
+  two rooms side by side share one wall and a door between them opens in a
+  VTT.
 - **Terrain:** `set_terrain_slot`, `fill_terrain` (whole level), `fill_region`
   (a rect/polygon, e.g. one room's floor), `paint_terrain` (a soft brush),
   `paint_path` (a smooth continuous stroke along a polyline — roads/trails).
@@ -57,13 +75,15 @@ forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
 - **Caves:** `dig_cave` carves caverns/tunnels along a path (the Cave Brush —
   dig open floor out of rock, with auto rocky walls + debris; `dig=false` fills
   back; optional ground/wall tints), `clear_caves` wipes the whole cave layer.
-- **Edit:** `move_element`, `modify_object` (scale, rotation, color, shadow,
-  mirror, light blocking), `modify_wall` (reshape or restyle a wall; its doors
-  and windows stay mounted and follow their segment), `modify_light`,
-  `modify_text`, `duplicate_object`, `delete_element`, `select_elements`,
-  `clear_selection`.
+- **Edit:** `move_element`, `move_elements` (several by one offset),
+  `modify_object` (scale, rotation, color, shadow, mirror, light blocking),
+  `modify_wall` (reshape or restyle a wall; its doors and windows stay mounted
+  and follow their segment), `modify_light`, `modify_text`,
+  `duplicate_object`, `delete_element`, `delete_elements`, `select_elements`,
+  `clear_selection`. `set_map_style` sets building wear and the grid's line
+  style map-wide.
 - **Levels:** `add_level`, `set_level`, `rename_level`, `clone_level` (copy a
-  whole floor to start the next one from), `reorder_levels`, `compare_levels`
+  whole floor to start the next one from), `delete_level`, `reorder_levels`, `compare_levels`
   (show another floor faintly beneath the current one to line things up),
   `configure_level` (ambient light for dusk and night scenes, lighting on/off,
   terrain visibility and blending, the water's shoreline).
@@ -73,7 +93,10 @@ forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
 - **Layout checks:** `get_asset_footprint` (how big an asset really is, before
   picking a scale), `check_object_placement` (try a spot: does it cross a
   wall, block a door, overlap something?), `validate_layout` (audit a furnished
-  level), and `set_spatial_region` / `remove_spatial_region` /
+  level), `validate_floorplan` (before furnishing: is every room reachable,
+  does every door open onto something, is there a way in), `validate_scene`
+  (bare ground with nothing painted on it, and lights with no visible source),
+  and `set_spatial_region` / `remove_spatial_region` /
   `list_spatial_regions` for rooms, keep-clear zones and protected ground. The
   object tools take `check=True` to refuse a bad placement outright; terrain,
   cave, water and material edits refuse to touch a `protected` region.
@@ -86,7 +109,9 @@ forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
   render, `grid=False` to export without the grid) return images, so the model
   can look at its own work and iterate. `set_grid` shows/hides the editor grid.
   `export_uvtt` writes a Universal VTT `.dd2vtt` (image + walls, doors, lights)
-  for import into Foundry or Roll20.
+  for import into Foundry or Roll20, and `import_dd2vtt` rebuilds one on the
+  open map: walls rejoined through each doorway, doors and windows, lights and
+  ambient light, with the export's image underneath as a trace.
 - **Camera:** `get_camera`, `set_camera`, `focus_element` (center on one
   element), `fit_elements` (frame a group), `reset_camera` (recover a lost
   view) — point the view before a `screenshot` to inspect specific spots like a
@@ -97,11 +122,14 @@ forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
   dedicated tool (smooth terrain blending, a brush's size, a biome preset).
   A last resort: it bypasses undo, so save first.
 - **Batch:** `batch` runs up to 100 tool calls in one request, for long runs
-  of independent placements.
-- **Undo:** the bridge keeps its own undo/redo stacks for create / move / modify
-  / layer / terrain / cave / water / material edits, so `undo` / `redo` let the
-  model reliably reverse its own changes (independent of Dungeondraft's Ctrl+Z;
-  `delete_element` is not reversible).
+  of independent placements, as one undo step.
+- **Undo:** the bridge keeps its own undo/redo stacks for create / delete /
+  move / modify / layer / terrain / cave / water / material edits, so `undo` /
+  `redo` let the model reliably reverse its own changes (independent of
+  Dungeondraft's Ctrl+Z). A batch, a scatter, a built room, a prefab or a
+  multi-element delete is one step. `checkpoint` marks a point in history and
+  `rollback_checkpoint` undoes everything since in one call; `list_checkpoints`
+  shows what is open. History keeps the last 200 steps.
 
 Every element is referenced by an integer `id`; create and list calls return
 ids you feed back into edit calls. Coordinates are woxel (pixel) space — call
@@ -259,10 +287,19 @@ mod/dungeondraft-mcp-bridge/   the Dungeondraft mod (copy into DD's mods folder)
 server/                        the Python MCP server
   dungeondraft_mcp/server.py   MCP tool definitions
   dungeondraft_mcp/spatial.py  layout checks (pure geometry on a map snapshot)
+  dungeondraft_mcp/layout.py   furniture arrangement and shared walls
+  dungeondraft_mcp/floorplan.py  room reachability from walls and doors
+  dungeondraft_mcp/scene.py    bare ground and light-source checks
+  dungeondraft_mcp/mapfile.py  .dungeondraft_map reader and pack manifest editing
+  dungeondraft_mcp/packs.py    asset pack index, tags and search (offline)
+  dungeondraft_mcp/uvtt_import.py  Universal VTT export parser and rebuild plan
   dungeondraft_mcp/bridge_client.py  TCP/JSON client
   tests/                       offline unit tests (no Dungeondraft needed)
   test_bridge.py               standalone per-command smoke test
+  test_features.py             live validator for the 0.3.0 tools
   demo_build.py                builds a visible sample room and leaves it
+tools/check_gdscript.py        offline compile check of the mod (stock Godot 3.4.2)
+.github/workflows/ci.yml       unit tests and the compile check on every push
 PROTOCOL.md                    wire protocol + implementation notes
 ```
 
@@ -276,6 +313,13 @@ level and layer tools, layout checks, native/UI access, light and text editing,
 scatter and batch were first built by Li-Jiaquan in
 [dungeondraft-mcp-bridge](https://github.com/Li-Jiaquan/dungeondraft-mcp-bridge),
 a fork of this project, and were ported back from there.
+
+Shared walls, whole-request undo and undoable deletes, the floorplan and scene
+checks, asset pack reading, map-file inspection, the Universal VTT import, the
+arrangement tool and Dungeondraft's own Range for lights were first built by
+thekannen in [battlemap-mcp](https://github.com/thekannen/battlemap-mcp), a
+rebuild of this project's June prototype, and were re-derived here against
+Dungeondraft's own code.
 
 ## License
 
