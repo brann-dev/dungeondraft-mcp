@@ -23,7 +23,7 @@ mod/      ── Dungeondraft 模组（GDScript，运行在 DD 内部）
 
 模组在 Dungeondraft 内部开启一个 TCP 服务，并在每帧的 `update(delta)` 回调中轮询；Python 端把每项能力暴露为一个 MCP 工具，并以 JSON 转发调用。通信格式见 [PROTOCOL.md](PROTOCOL.md)（英文）。
 
-> **状态：可用。** 已在基于 **Godot 3.4.2** 的 Dungeondraft 上完成端到端验证：模组沙箱内可以直接使用原生 TCP，无需备用方案。共 100 个工具，涵盖查询、创建、排布、修改、地形、水域、材质、楼层、图层、布局与场景检查、素材包、地图文件、VTT 导入与导出、选择、截图与导出、镜头、历史记录、地图的打开与保存，另有一条直达 Dungeondraft 自身 API 和界面的兜底通道（见下文）。
+> **状态：可用。** 已在基于 **Godot 3.4.2** 的 Dungeondraft 上完成端到端验证：模组沙箱内可以直接使用原生 TCP，无需备用方案。共 101 个工具，涵盖查询、创建、排布、修改、地形、水域、材质、楼层、图层、布局与场景检查、素材包、地图文件、VTT 导入与导出、选择、截图与导出、镜头、历史记录、地图的打开与保存，另有一条直达 Dungeondraft 自身 API 和界面的兜底通道（见下文）。
 
 ## AI 能做什么
 
@@ -33,7 +33,7 @@ mod/      ── Dungeondraft 模组（GDScript，运行在 DD 内部）
 - **地形：** `set_terrain_slot`、`fill_terrain`（整层填充）、`fill_region`（填充矩形或多边形，例如某个房间的地面）、`paint_terrain`（柔边笔刷）、`paint_path`（沿折线连续平滑地涂抹，适合道路和小径）。默认使用 0–3 号槽；`set_terrain_slot(..., expand=True)` 可开启该楼层的 4–7 号槽。
 - **水域与材质：** `draw_water`（以矩形或多边形绘制湖泊、河流、护城河，自带岸线和深浅渐变；`erase` 可挖出岛屿）和 `draw_material`（在指定图层上以矩形或多边形铺设熔岩、冰面、卵石路等材质笔刷纹理）。
 - **洞穴：** `dig_cave` 沿路径开凿洞穴和隧道（即洞穴笔刷：从岩石中挖出可通行的地面，自动生成岩壁和碎石；`dig=false` 为回填；可选地面和岩壁染色），`clear_caves` 清空整个洞穴层。
-- **编辑：** `move_element`、`move_elements`（把多个元素按同一偏移量移动）、`modify_object`（缩放、旋转、颜色、阴影、镜像、是否遮挡光线）、`modify_wall`（改变墙体的形状或外观；墙上的门窗保持安装状态，并随所在墙段移动）、`modify_light`、`modify_text`、`duplicate_object`、`delete_element`、`delete_elements`、`select_elements`、`clear_selection`。`set_map_style` 设置整张地图的建筑磨损程度和网格线样式；`set_map_size` 以格为单位调整地图大小，效果与 Dungeondraft 自带的 Change Map Size 相同。放置类工具可传 `snap=True` 对齐到用户的网格，若加载了 Lievven 的 Custom Snap Mod，也包括它的六边形或等轴网格；`get_snap_settings` 可读取当前的吸附设置。
+- **编辑：** `move_element`、`move_elements`（把多个元素按同一偏移量移动）、`modify_object`（缩放、旋转、颜色、阴影、镜像、是否遮挡光线）、`modify_wall`（改变墙体的形状或外观；墙上的门窗保持安装状态，并随所在墙段移动）、`modify_light`、`modify_text`、`duplicate_object`、`delete_element`、`delete_elements`、`select_elements`、`clear_selection`。`set_map_style` 设置整张地图的建筑磨损程度和网格线样式；`set_map_size` 以格为单位调整地图大小，效果与 Dungeondraft 自带的 Change Map Size 相同；`crop_map` 可从任意一侧裁剪地图，只保留选定范围内的格子，并会先预览将被裁掉的部分。放置类工具可传 `snap=True` 对齐到用户的网格，若加载了 Lievven 的 Custom Snap Mod，也包括它的六边形或等轴网格；`get_snap_settings` 可读取当前的吸附设置。
 - **楼层：** `add_level`、`set_level`、`rename_level`、`clone_level`（复制整个楼层，作为下一层的起点）、`delete_level`、`reorder_levels`、`compare_levels`（把另一楼层半透明地显示在当前楼层下方，便于对齐）、`configure_level`（用于黄昏和夜景的环境光、灯光开关、地形的显示与混合方式、水域岸线）。
 - **图层：** `list_layers`、`set_element_layer`（决定谁盖住谁：地毯在桌子下面，树冠在小路上方）、`add_layer`；`place_object` 和 `import_image` 也接受 `layer` 参数。
 - **布局检查：** `get_asset_footprint`（素材的实际大小，选缩放比例前先看）、`check_object_placement`（试放一个位置：会不会穿墙、堵门、压到别的物件？）、`validate_layout`（检查已经布置好的楼层）、`validate_floorplan`（布置家具之前：每个房间都能到达吗，每扇门都通向某处吗，有进去的入口吗）、`validate_scene`（什么都没涂的裸露地面，以及没有可见光源的灯光），以及用于登记房间、净空区和保护区的 `set_spatial_region` / `remove_spatial_region` / `list_spatial_regions`。物件类工具可以传 `check=True`，直接拒绝不合理的放置；地形、洞穴、水域和材质的编辑不会触碰 `protected`（保护）区域。

@@ -27,7 +27,7 @@ The mod opens a TCP server inside Dungeondraft and polls it every frame from the
 forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
 
 > **Status: working.** Confirmed end-to-end against Dungeondraft on **Godot
-> 3.4.2** — raw TCP from the modding sandbox works, no fallback needed. 100 tools
+> 3.4.2** — raw TCP from the modding sandbox works, no fallback needed. 101 tools
 > across query / create / arrange / modify / terrain / water / materials /
 > levels / layers / layout and scene checks / asset packs / map files / VTT
 > import and export / selection / capture / camera / history / map lifecycle,
@@ -84,7 +84,8 @@ forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
   `duplicate_object`, `delete_element`, `delete_elements`, `select_elements`,
   `clear_selection`. `set_map_style` sets building wear and the grid's line
   style map-wide; `set_map_size` resizes the map in tiles, as Dungeondraft's
-  own Change Map Size does. The placement tools take `snap=True` to land on
+  own Change Map Size does, and `crop_map` keeps a window of tiles from any
+  side, previewing what would be removed first. The placement tools take `snap=True` to land on
   the user's grid, including Lievven's Custom Snap Mod's hex or isometric
   grid when that mod is loaded; `get_snap_settings` reads it.
 - **Levels:** `add_level`, `set_level`, `rename_level`, `clone_level` (copy a
