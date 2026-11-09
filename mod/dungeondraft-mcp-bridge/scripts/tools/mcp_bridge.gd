@@ -21,7 +21,7 @@ var script_class = "tool"
 
 const HOST := "127.0.0.1"
 const PORT := 8787
-const PROTOCOL_VERSION := 29
+const PROTOCOL_VERSION := 30
 
 # Commands that get wrapped in a Dungeondraft undo record (see _record_and_dispatch).
 const CREATE_CMDS := [
@@ -745,10 +745,11 @@ func _terrain_snapshot(level) -> Dictionary:
 	}
 
 
-func _restore_splat(snap):
+func _restore_splat(snap, level = null):
 	if snap == null or snap["splat"] == null:
 		return
-	var level = Global.World.GetCurrentLevel()
+	if level == null:
+		level = Global.World.GetCurrentLevel()
 	if level == null:
 		return
 	if snap["splat2"] != null and level.Terrain.ExpandedSlots:
@@ -4000,6 +4001,7 @@ func _spatial_snapshot(req : Dictionary) -> Dictionary:
 		walls.append({
 			"id": _id(wall), "points": route, "loop": bool(wall.get("Loop")),
 			"half_width": half * max(abs(wall.scale.x), abs(wall.scale.y)),
+			"asset": str(tex.resource_path) if (tex != null and tex is Texture) else "",
 		})
 		for portal in wall.Portals:
 			var along = portal.Direction
@@ -4133,6 +4135,23 @@ func _describe(node) -> Dictionary:
 	var tex_path = _texture_path(node, t)
 	if tex_path != "":
 		d["asset"] = tex_path
+	# Walls, paths and roofs keep their geometry in Points and leave position at
+	# the origin; report the points in world space so a caller can place them.
+	var pts = node.get("Points")
+	if node is Node2D and pts != null and (typeof(pts) == TYPE_VECTOR2_ARRAY or typeof(pts) == TYPE_ARRAY):
+		var route := []
+		for q in pts:
+			if typeof(q) == TYPE_VECTOR2:
+				route.append(_vec(node.global_transform.xform(q)))
+		if not route.empty():
+			d["points"] = route
+			if node.get("Loop") != null:
+				d["loop"] = bool(node.get("Loop"))
+	# A roof has no point list but knows its world-space rectangle.
+	if not d.has("points"):
+		var grect = node.get("GlobalRect")
+		if typeof(grect) == TYPE_RECT2:
+			d["bounds"] = [grect.position.x, grect.position.y, grect.end.x, grect.end.y]
 	var layer = _element_layer(node)
 	if layer != null:
 		d["layer"] = layer
@@ -4676,8 +4695,9 @@ const MAP_SIZE_WINDOW := "ChangeMapSize"
 const MAP_TILES_MIN := 8
 const MAP_TILES_MAX := 128
 const SPLAT_PX_PER_TILE := 4
-const MAP_SIZE_HANDLERS := ["_on_ChangeMapSizeWindow_about_to_show", "_on_RightSpinBox_value_changed",
-	"_on_BottomSpinBox_value_changed", "_on_OkayButton_pressed"]
+const MAP_SIZE_HANDLERS := ["_on_ChangeMapSizeWindow_about_to_show", "_on_LeftSpinBox_value_changed",
+	"_on_TopSpinBox_value_changed", "_on_RightSpinBox_value_changed", "_on_BottomSpinBox_value_changed",
+	"_on_OkayButton_pressed"]
 
 # Dungeondraft's Change Map Size window, when this build has it with the
 # handlers the bridge drives. Its OK handler is Master.ChangeMapSize, which
@@ -4730,6 +4750,9 @@ func _set_map_size(req : Dictionary) -> Dictionary:
 	var old_h = int(Global.World.Height)
 	var left = int(req.get("left", 0))
 	var top = int(req.get("top", 0))
+	if abs(left) > MAP_TILES_MAX or abs(top) > MAP_TILES_MAX:
+		return _err("left and top must be within %d tiles either way" % MAP_TILES_MAX)
+	var shift_tiles = Vector2(left, top)
 	var right = w - old_w - left
 	var bottom = h - old_h - top
 	if left == 0 and top == 0 and right == 0 and bottom == 0:
@@ -4780,7 +4803,9 @@ func _set_map_size(req : Dictionary) -> Dictionary:
 	if not stale.empty():
 		return _err(("the map is %dx%d but the terrain of level(s) %s was not resized with it; " +
 			"do not save this map: reopen it") % [w, h, str(stale)])
-	var shift = [int(req.get("left", 0)) * 256, int(req.get("top", 0)) * 256]
+	if shifted:
+		_shift_regions(shift_tiles * 256)
+	var shift = [shift_tiles.x * 256, shift_tiles.y * 256]
 	return _ok({
 		"width_tiles": w, "height_tiles": h, "previous_tiles": [old_w, old_h], "changed": true,
 		"map_size_woxels": [Global.World.WoxelDimensions.x, Global.World.WoxelDimensions.y],
@@ -4799,8 +4824,9 @@ func _resize_snapshot() -> Dictionary:
 	for lvl in Global.World.levels:
 		if lvl == null or lvl.Terrain == null:
 			continue
-		splats.append({ "level": lvl, "splat": lvl.Terrain.CloneSplatImage(),
-			"splat2": lvl.Terrain.CloneSplatImage2() if lvl.Terrain.ExpandedSlots else null })
+		var snap = _terrain_snapshot(lvl)
+		snap["level"] = lvl
+		splats.append(snap)
 	var trace = Global.World.get("TraceImage")
 	var trace_at = null
 	if trace != null and is_instance_valid(trace) and trace.get("texture") != null:
@@ -4809,14 +4835,15 @@ func _resize_snapshot() -> Dictionary:
 
 
 # The old splat copied into an image of the new size, moved by the offset
-# (tiles, either sign); what falls outside is dropped, what is uncovered is
-# the unpainted base.
-func _resize_splat(img, left : int, top : int, size : Vector2):
+# (tiles, either sign); what falls outside is dropped, what is uncovered gets
+# `fill`: the unpainted base (1,0,0,0) for the first splat, nothing for the
+# second (slots 4-7 carry no base).
+func _resize_splat(img, left : int, top : int, size : Vector2, fill : Color):
 	if not (img is Image):
 		return null
 	var out = Image.new()
 	out.create(int(size.x), int(size.y), false, img.get_format())
-	out.fill(Color(1, 0, 0, 0))
+	out.fill(fill)
 	var dx = left * SPLAT_PX_PER_TILE
 	var dy = top * SPLAT_PX_PER_TILE
 	var src_x = int(max(0, -dx))
@@ -4838,15 +4865,11 @@ func _resize_repair(snap : Dictionary, left : int, top : int) -> void:
 		var now = lvl.Terrain.CloneSplatImage()
 		if now == null:
 			continue
-		var img = _resize_splat(entry["splat"], left, top, now.get_size())
+		var img = _resize_splat(entry["splat"], left, top, now.get_size(), Color(1, 0, 0, 0))
 		if img == null:
 			continue
-		var img2 = _resize_splat(entry["splat2"], left, top, now.get_size())
-		if img2 != null and lvl.Terrain.ExpandedSlots:
-			lvl.Terrain.RestoreSplat2(img, img2)
-		else:
-			lvl.Terrain.RestoreSplat(img)
-		lvl.Terrain.UpdateSplat()
+		var img2 = _resize_splat(entry["splat2"], left, top, now.get_size(), Color(0, 0, 0, 0))
+		_restore_splat({ "splat": img, "splat2": img2 }, lvl)
 	for lvl in Global.World.levels:
 		var cave = lvl.get("CaveMesh") if lvl != null else null
 		if cave != null and is_instance_valid(cave) and cave.has_method("FinalizeMeshAndBorders"):
@@ -4855,6 +4878,24 @@ func _resize_repair(snap : Dictionary, left : int, top : int) -> void:
 	if snap["trace_at"] != null and trace != null and is_instance_valid(trace) \
 			and trace.position.distance_to(snap["trace_at"]) < 0.5:
 		trace.position = snap["trace_at"] + Vector2(left, top) * 256
+
+
+# The bridge's spatial regions are woxel polygons on each level; after a
+# shifting resize they must move with everything else.
+func _shift_regions(delta : Vector2) -> void:
+	for lvl in Global.World.levels:
+		if lvl == null or not is_instance_valid(lvl) or not lvl.has_meta(META_REGIONS):
+			continue
+		var regions = lvl.get_meta(META_REGIONS)
+		for region in regions:
+			var moved := []
+			for q in region.get("points", []):
+				if typeof(q) == TYPE_ARRAY and q.size() >= 2:
+					moved.append([float(q[0]) + delta.x, float(q[1]) + delta.y])
+				else:
+					moved.append(q)
+			region["points"] = moved
+		lvl.set_meta(META_REGIONS, regions)
 
 
 func _forget_history() -> void:

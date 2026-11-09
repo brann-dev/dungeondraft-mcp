@@ -5,7 +5,7 @@ generator tools: the features added in 0.3.0. No MCP client involved.
 Run with Dungeondraft open (mod enabled, a map loaded). It drives the server's
 tool functions in-process, builds a small throwaway scene away from the map's
 centre, prints PASS/FAIL per check, and deletes or undoes what it created. The
-map file is never saved. Optional: pass two saved map files to exercise
+map file is never saved unless DD_MCP_TEST_CROP=1 (a backup is kept). Optional: pass two saved map files to exercise
 inspect_map_file's comparison; otherwise that check uses the open map's own file.
 
     python test_features.py [map_a.dungeondraft_map map_b.dungeondraft_map]
@@ -327,6 +327,21 @@ def main() -> int:
     pos = s.get_element(placed["id"])["position"]
     check("place_object(snap=True) lands where get_snap_settings says", [round(v, 2) for v in pos] == [round(v, 2) for v in snap["snapped"][0]], (pos, snap["snapped"]))
     s.delete_element(placed["id"])
+
+    # ---- crop (opt-in: it SAVES the map and leaves a backup beside it) ----
+    if os.environ.get("DD_MCP_TEST_CROP") == "1":
+        size_c = s.get_status()["map_size_woxels"]
+        tw, th = int(size_c[0] // 256), int(size_c[1] // 256)
+        if tw >= 12 and th >= 12:
+            far = s.place_object(asset, 300, 300)["id"]
+            prev = s.crop_map([2, 2, tw - 4, th - 4])
+            check("crop preview lists an object outside the window", far in prev["outside"].get("objects", []) and prev["changed"] is False, prev)
+            done = s.crop_map([2, 2, tw - 4, th - 4], confirm=True)
+            check("crop resized, deleted the outside object and left a backup",
+                  done["changed"] and os.path.exists(done["backup"]) and s.get_status()["map_size_woxels"] == [(tw - 4) * 256, (th - 4) * 256], done)
+            print("  backup:", done["backup"])
+    else:
+        print("  (set DD_MCP_TEST_CROP=1 to exercise crop_map; it saves the map and writes a backup)")
 
     # ---- preview sheet ----
     import json as _json
