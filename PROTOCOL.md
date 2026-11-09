@@ -95,10 +95,11 @@ node; default color is black.
 
 ### Terrain
 
-`fill_region` rasterizes a woxel-space rectangle or polygon into a texture-space
-alpha brush and stamps it once via `Terrain.Paint`, so it fills only inside the
-shape (e.g. one room's floor) rather than the whole level like `fill_terrain`.
-It is undo-recorded like the other terrain ops.
+`fill_region` rasterizes a woxel-space rectangle or polygon into the terrain's
+splat weight image, so it fills only inside the shape (e.g. one room's floor)
+rather than the whole level like `fill_terrain`. Like `paint_terrain` and
+`paint_path` it edits the weights directly (`Terrain.Paint` does nothing from a
+mod; see the notes below). It is undo-recorded like the other terrain ops.
 
 | cmd | params |
 | --- | --- |

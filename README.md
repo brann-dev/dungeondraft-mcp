@@ -32,8 +32,8 @@ forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
 
 ## What the AI can do
 
-- **Inspect:** `get_status`, `list_levels`, `list_elements`, `get_element`,
-  `list_asset_categories`, `list_assets` (with substring search).
+- **Inspect:** `ping`, `get_status`, `list_levels`, `list_elements`,
+  `get_element`, `list_asset_categories`, `list_assets` (with substring search).
 - **Create:** `place_object`, `draw_wall`, `draw_path`, `add_light`,
   `add_portal`, `add_roof`, `add_text`, `place_pattern` (tiled floor shapes —
   wood planks, tile, brick — rendered below objects), `build_room` (a wall loop
@@ -122,8 +122,11 @@ Claude Desktop). On Windows, `python`/`.venv\Scripts\` replace the `python3`/
 On load you should see in the Dungeondraft log:
 
 ```
-[mcp-bridge] listening on 127.0.0.1:8787 (protocol v6)
+[mcp-bridge] listening on 127.0.0.1:8787 (protocol vN)
 ```
+
+`N` is the bridge's protocol version, which goes up as commands are added
+(`ping` reports it too).
 
 ### 2. Install the MCP server
 
@@ -208,8 +211,13 @@ Adding a capability is symmetric — one handler on each side:
 2. **Server** (`server/dungeondraft_mcp/server.py`): add an `@mcp.tool()` that
    calls `bridge.request("my_command", ...)`.
 
-Good next targets: pattern shapes (floors), region-scoped terrain fill, and
-grouping a batch of edits into a single undo step.
+A capability that is only computation on what the mod already reports lives in
+the server alone: the layout checks (`spatial.py`), `scatter_objects` and
+`batch` have no handler of their own in the mod.
+
+Good next targets: deleting a level, grouping a batch of edits into a single
+undo step, and footprints that follow a sprite's outline instead of its
+bounding box.
 
 ### Dev loop (read this before iterating on the mod)
 
@@ -225,11 +233,17 @@ Two things will bite you if you don't know them up front:
   handler, server for the tool registration); changing an *existing* handler's
   behavior needs only the mod reload.
 
-- **There's no live `eval`/introspect command**, so probing a running node's
-  properties needs a mod reload. When a DD API behaves unexpectedly (e.g. a
-  setter that doesn't stick), a quick way to diagnose it is to **return
-  intermediate state in the response** — stash before/after values in a debug
-  field — so one reload shows where a value changes.
+- **Probe Dungeondraft before writing a handler.** `native_describe` lists a
+  live object's methods and properties, `native_get` reads them and
+  `native_call` tries a method, all without a mod reload, so you can find out
+  what an API really does first. Inside a handler there is still no debugger:
+  when a DD call behaves unexpectedly (e.g. a setter that doesn't stick),
+  **return intermediate state in the response** — stash before/after values in
+  a debug field — so one reload shows where a value changes.
+
+- **A script that doesn't compile crashes Dungeondraft** when the mod loads,
+  with no message. Compile-check `mcp_bridge.gd` offline first; PROTOCOL.md
+  ("Mod compile errors crash Dungeondraft") has the recipe.
 
 ## Layout
 
@@ -250,13 +264,13 @@ PROTOCOL.md                    wire protocol + implementation notes
 ## Credits
 
 Built against the [Dungeondraft Modding API](https://megasploot.github.io/DungeondraftModdingAPI/).
+Engine is Godot 3.4.2, so the GDScript uses Godot 3 networking class names.
 
 Expanded terrain slots, wall editing, image import, water, materials, the
 level and layer tools, layout checks, native/UI access, light and text editing,
-scatter and batch were first built by
-Li-Jiaquan in [dungeondraft-mcp-bridge](https://github.com/Li-Jiaquan/dungeondraft-mcp-bridge),
+scatter and batch were first built by Li-Jiaquan in
+[dungeondraft-mcp-bridge](https://github.com/Li-Jiaquan/dungeondraft-mcp-bridge),
 a fork of this project, and were ported back from there.
-Engine is Godot 3.4.2, so the GDScript uses Godot 3 networking class names.
 
 ## License
 
