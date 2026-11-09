@@ -768,26 +768,33 @@ def scatter_objects(
     rng = random.Random(seed)
     ids: list[int] = []
     attempts = 0
+    # The undo group opens with the first placement (an empty scatter records
+    # nothing) and always closes, so a bridge error mid-way cannot leave later
+    # edits joining a stale group.
     group = _undo_group("scatter_objects")
-    while len(ids) < count and attempts < count * 30:
-        attempts += 1
-        x, y = round(rng.uniform(x0, x1), 1), round(rng.uniform(y0, y1), 1)
-        asset = rng.choice(assets)
-        s = round(rng.uniform(min_scale, max_scale), 3)
-        turn = round(rng.uniform(0, 360), 1) if random_rotation else 0.0
-        if not spatial.point_in_polygon((x, y), area):
-            continue
-        footprint = spatial.transform(locals_[asset], (x, y), (s, s), turn)
-        if spatial.check_footprint(scene, footprint, layer=layer, allow_overlap=allow_overlap):
-            continue
-        if not ids:
-            group.__enter__()   # the first placement opens the undo group
-        made = bridge.request("place_object", asset=asset, x=x, y=y, scale=s, rotation=turn, layer=layer)
-        ids.append(made["id"])
-        # Later objects must keep clear of this one too.
-        scene["objects"].append({"id": made["id"], "asset": asset, "layer": layer, "polygon": footprint})
-    if ids:
-        group.__exit__(None, None, None)
+    opened = False
+    try:
+        while len(ids) < count and attempts < count * 30:
+            attempts += 1
+            x, y = round(rng.uniform(x0, x1), 1), round(rng.uniform(y0, y1), 1)
+            asset = rng.choice(assets)
+            s = round(rng.uniform(min_scale, max_scale), 3)
+            turn = round(rng.uniform(0, 360), 1) if random_rotation else 0.0
+            if not spatial.point_in_polygon((x, y), area):
+                continue
+            footprint = spatial.transform(locals_[asset], (x, y), (s, s), turn)
+            if spatial.check_footprint(scene, footprint, layer=layer, allow_overlap=allow_overlap):
+                continue
+            if not opened:
+                group.__enter__()
+                opened = True
+            made = bridge.request("place_object", asset=asset, x=x, y=y, scale=s, rotation=turn, layer=layer)
+            ids.append(made["id"])
+            # Later objects must keep clear of this one too.
+            scene["objects"].append({"id": made["id"], "asset": asset, "layer": layer, "polygon": footprint})
+    finally:
+        if opened:
+            group.__exit__(None, None, None)
     result: dict = {"placed": len(ids), "requested": count, "ids": ids, "seed": seed}
     if len(ids) < count:
         result["note"] = (f"only {len(ids)} of {count} fit after {attempts} tries; "
