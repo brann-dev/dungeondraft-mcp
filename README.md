@@ -27,7 +27,7 @@ The mod opens a TCP server inside Dungeondraft and polls it every frame from the
 forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
 
 > **Status: working.** Confirmed end-to-end against Dungeondraft on **Godot
-> 3.4.2** — raw TCP from the modding sandbox works, no fallback needed. 97 tools
+> 3.4.2** — raw TCP from the modding sandbox works, no fallback needed. 100 tools
 > across query / create / arrange / modify / terrain / water / materials /
 > levels / layers / layout and scene checks / asset packs / map files / VTT
 > import and export / selection / capture / camera / history / map lifecycle,
