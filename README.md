@@ -38,7 +38,9 @@ forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
 - **Inspect:** `ping` (also says whether the user has paused AI edits), `get_status`, `list_levels`, `list_elements`,
   `get_element`, `list_asset_categories`, `list_assets` (with substring search),
   `get_terrain` (read the painted terrain back as a grid of slot weights).
-- **Asset packs:** `list_asset_packs` (which packs are installed, and which
+- **Asset packs:** `preview_assets` (one contact sheet of up to 32 candidate
+  assets, so you can look before you place; `true_scale` shows their relative
+  sizes), `list_asset_packs` (which packs are installed, and which
   this map can actually use: Dungeondraft scopes packs per map, and a map
   made without them silently sees only the ~1800 core assets),
   `search_pack_contents` (search inside every installed pack, including ones
@@ -81,7 +83,10 @@ forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
   and follow their segment), `modify_light`, `modify_text`,
   `duplicate_object`, `delete_element`, `delete_elements`, `select_elements`,
   `clear_selection`. `set_map_style` sets building wear and the grid's line
-  style map-wide.
+  style map-wide; `set_map_size` resizes the map in tiles, as Dungeondraft's
+  own Change Map Size does. The placement tools take `snap=True` to land on
+  the user's grid, including Lievven's Custom Snap Mod's hex or isometric
+  grid when that mod is loaded; `get_snap_settings` reads it.
 - **Levels:** `add_level`, `set_level`, `rename_level`, `clone_level` (copy a
   whole floor to start the next one from), `delete_level`, `reorder_levels`, `compare_levels`
   (show another floor faintly beneath the current one to line things up),
