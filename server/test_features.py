@@ -41,6 +41,35 @@ def main() -> int:
     MAP_A = sys.argv[1] if len(sys.argv) > 2 else current
     MAP_B = sys.argv[2] if len(sys.argv) > 2 else current
 
+    # ---- token ----
+    import json
+    import socket
+
+    def raw(**req):
+        with socket.create_connection((s.HOST, s.PORT), timeout=5) as sock:
+            sock.sendall((json.dumps(req) + "\n").encode()); buf = b""
+            while b"\n" not in buf:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+        return json.loads(buf.split(b"\n")[0])
+    pg = s.ping()
+    check("server is authenticated", pg.get("authenticated") is True, pg)
+    if pg.get("auth") == "token":
+        bare = raw(cmd="ping")
+        check("ping without a token answers unauthenticated", bare["ok"] and bare["result"]["authenticated"] is False, bare)
+        wrong = raw(cmd="get_status", token="0" * 64)
+        check("a wrong token is refused", not wrong["ok"] and wrong["error"].startswith("bad token"), wrong)
+    try:
+        s.native_describe("Tool:mcp_bridge"); guarded = None
+    except Exception as exc:
+        guarded = str(exc)
+    check("the bridge's own panel is unreachable", guarded is not None, guarded)
+    if pg.get("paused"):
+        print("AI edits are paused in Dungeondraft's MCP Bridge panel: resume them and run again")
+        return 1
+
     # ---- history ----
 
 

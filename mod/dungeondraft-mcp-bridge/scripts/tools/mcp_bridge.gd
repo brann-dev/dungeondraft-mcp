@@ -21,7 +21,7 @@ var script_class = "tool"
 
 const HOST := "127.0.0.1"
 const PORT := 8787
-const PROTOCOL_VERSION := 28
+const PROTOCOL_VERSION := 29
 
 # Commands that get wrapped in a Dungeondraft undo record (see _record_and_dispatch).
 const CREATE_CMDS := [
@@ -38,6 +38,21 @@ const MAX_UNDO_OPS := 200
 const MAX_CHECKPOINTS := 16
 # Commands that settle history before they run: any open undo group is closed.
 const HISTORY_CMDS := ["undo", "redo", "checkpoint", "list_checkpoints", "rollback_checkpoint"]
+# The bridge's token and settings live in Dungeondraft's user folder (user://,
+# the folder that holds config.ini), where the Python server reads them too.
+const TOKEN_FILE := "user://mcp_bridge_token"
+const SETTINGS_FILE := "user://mcp_bridge_settings.json"
+# Commands that look but change nothing on the map: they still run while the
+# user has paused AI edits in the MCP Bridge panel.
+const READ_ONLY_CMDS := [
+	"ping", "get_status", "list_asset_categories", "list_assets", "list_elements", "get_element",
+	"list_levels", "list_layers", "list_asset_packs", "terrain_samples", "get_current_map",
+	"screenshot", "export_map", "export_finish", "set_grid",
+	"get_camera", "set_camera", "focus_element", "fit_elements", "reset_camera",
+	"native_targets", "native_describe", "native_get", "ui_tree",
+	"spatial_snapshot", "asset_footprint", "list_spatial_regions", "list_checkpoints",
+	"get_map_style", "list_prefabs", "generator_options", "select_elements", "clear_selection",
+]
 # Neutral opaque tint for pattern floors when no color is given. PatternShapeTool
 # has no per-texture default (and its .Color leaks across calls), so we apply a
 # deterministic wood/stone-neutral tone; callers pass an explicit color to override.
@@ -76,6 +91,12 @@ var _op_serial := 0      # numbers every op pushed; checkpoints remember where t
 var _lost_serial := 0    # the newest serial dropped from history (see _push_op)
 var _groups := []        # open undo groups, innermost last (begin_undo_group / end_undo_group)
 var _checkpoints := {}   # label -> { "label", "after": serial, "opened": msec }
+var _token := ""         # the shared secret every request must carry (see _ensure_token)
+var _require_token := true
+var _paused := false     # "Pause AI edits" in the panel: only READ_ONLY_CMDS run
+var _panel = null
+var _panel_labels := {}  # key -> Label in the panel
+var _last_request := ""
 var _colorable = null    # lazily built set of "Colorable"-tagged texture paths
 var _export = null       # export in flight: { grid_was, cam: {anchor, pos, zoom} }; see _finish_export
 
@@ -93,6 +114,10 @@ const META_SERVER := "mcp_bridge_server"
 const META_OWNER := "mcp_bridge_owner"
 
 func start():
+	var settings = _settings_read()
+	_require_token = bool(settings.get("require_token", true))
+	_paused = bool(settings.get("paused", false))   # a pause outlives a restart; the user lifts it
+	_token = _ensure_token()
 	_register_tool()
 	var prev = Engine.get_meta(META_SERVER) if Engine.has_meta(META_SERVER) else null
 	if prev != null and prev is TCP_Server and prev.is_listening():
@@ -160,8 +185,105 @@ func _handle_line(peer : StreamPeerTCP, line : String):
 	if parsed.error != OK or typeof(req) != TYPE_DICTIONARY:
 		resp = _err("invalid JSON request")
 	else:
-		resp = _record_and_dispatch(req)
+		var cmd = str(req.get("cmd", ""))
+		_last_request = "%s at %s" % [cmd, _clock()]
+		if cmd != "ping" and not _authenticated(req):
+			resp = _err(_auth_error(req))
+		elif _paused and not (cmd in READ_ONLY_CMDS):
+			resp = _err("paused: the user paused AI edits in Dungeondraft's MCP Bridge panel " +
+				"(Settings > MCP Bridge). Read-only commands still work; make no edits until they resume.")
+		else:
+			resp = _record_and_dispatch(req)
+	_refresh_panel()
 	peer.put_data((JSON.print(resp) + "\n").to_utf8())
+
+
+# ---------------------------------------------------------------------------
+# Token, settings, pause
+# ---------------------------------------------------------------------------
+#
+# Anything that can reach 127.0.0.1:8787 could drive Dungeondraft: another
+# user on the machine, a sandboxed program, a web page making a request to
+# localhost. The mod writes a random token to Dungeondraft's user folder on
+# first start; the Python server reads the same file and sends the token with
+# every request. Something that cannot read the user's files cannot drive the
+# map. It is a bearer token over localhost, not encryption: integrity against
+# a process that can already read the user's files is not a goal.
+
+func _authenticated(req : Dictionary) -> bool:
+	if not _require_token:
+		return true
+	return _token != "" and str(req.get("token", "")) == _token
+
+
+func _auth_error(req : Dictionary) -> String:
+	if _token == "":
+		return "this bridge could not create its token (see Dungeondraft's log); the bridge refuses every edit until it can"
+	if not req.has("token"):
+		return ("this bridge requires a token and the request carried none: update the MCP server " +
+			"(0.4 or newer reads the token from Dungeondraft's user folder), or turn off " +
+			"'Require token' in Dungeondraft's MCP Bridge panel")
+	return ("bad token: the MCP server's token does not match this Dungeondraft's. Restart " +
+		"Dungeondraft and reconnect the server, or turn off 'Require token' in the MCP Bridge panel")
+
+
+# Read the token the last start wrote, or make a new one (32 random bytes as
+# 64 hex characters). An unreadable or malformed file is replaced.
+func _ensure_token() -> String:
+	var f = File.new()
+	if f.file_exists(TOKEN_FILE) and f.open(TOKEN_FILE, File.READ) == OK:
+		var existing = f.get_as_text().strip_edges()
+		f.close()
+		if existing.length() == 64 and existing.is_valid_hex_number(false):
+			return existing
+	return _regenerate_token()
+
+
+func _regenerate_token() -> String:
+	if not ClassDB.can_instance("Crypto"):
+		print("[mcp-bridge] this build cannot instance Crypto; no token, the bridge refuses edits")
+		return ""
+	var crypto = ClassDB.instance("Crypto")
+	var raw = crypto.generate_random_bytes(32)
+	if typeof(raw) != TYPE_RAW_ARRAY or raw.size() != 32:
+		print("[mcp-bridge] Crypto.generate_random_bytes failed; no token, the bridge refuses edits")
+		return ""
+	var token = raw.hex_encode()
+	var f = File.new()
+	if f.open(TOKEN_FILE, File.WRITE) != OK:
+		print("[mcp-bridge] could not write %s; no token, the bridge refuses edits" % TOKEN_FILE)
+		return ""
+	f.store_string(token)
+	f.close()
+	print("[mcp-bridge] wrote a new bridge token to %s" % ProjectSettings.globalize_path(TOKEN_FILE))
+	return token
+
+
+func _settings_read() -> Dictionary:
+	var f = File.new()
+	if not f.file_exists(SETTINGS_FILE) or f.open(SETTINGS_FILE, File.READ) != OK:
+		return {}
+	var parsed = JSON.parse(f.get_as_text())
+	f.close()
+	if parsed.error != OK or typeof(parsed.result) != TYPE_DICTIONARY:
+		return {}
+	return parsed.result
+
+
+func _settings_write(key : String, value) -> void:
+	var settings = _settings_read()
+	settings[key] = value
+	var f = File.new()
+	if f.open(SETTINGS_FILE, File.WRITE) != OK:
+		print("[mcp-bridge] could not write %s" % SETTINGS_FILE)
+		return
+	f.store_string(JSON.print(settings, "\t"))
+	f.close()
+
+
+func _clock() -> String:
+	var t = OS.get_time()
+	return "%02d:%02d:%02d" % [t.hour, t.minute, t.second]
 
 
 # Runs a command and, if it succeeded and is a reversible map edit, pushes an op
@@ -674,7 +796,9 @@ func _safe_dispatch(req : Dictionary) -> Dictionary:
 	var cmd = req.get("cmd", "")
 	match cmd:
 		# --- read / query ---
-		"ping": return _ok({ "pong": true, "protocol": PROTOCOL_VERSION, "engine": Engine.get_version_info() })
+		"ping": return _ok({ "pong": true, "protocol": PROTOCOL_VERSION, "engine": Engine.get_version_info(),
+			"auth": "token" if _require_token else "off", "authenticated": _authenticated(req),
+			"paused": _paused })
 		"get_status": return _get_status()
 		"list_asset_categories": return _ok({ "categories": ASSET_CATEGORIES })
 		"list_assets": return _list_assets(req)
@@ -804,6 +928,7 @@ func _get_status() -> Dictionary:
 		"terrain_visible": level.Terrain.visible,
 		"counts": counts,
 		"active_tool": Global.Editor.ActiveToolName,
+		"paused": _paused,
 	})
 
 
@@ -3229,8 +3354,12 @@ func _native_target(path : String):
 
 # _native_target, but only a live object will do. Returns null otherwise.
 func _native_object(path : String):
+	if path.begins_with("Tool:mcp_bridge"):
+		return null   # the bridge's own panel is the user's, not the assistant's
 	var obj = _native_target(path)
 	if typeof(obj) == TYPE_OBJECT and is_instance_valid(obj):
+		if _inside_panel(obj):
+			return null
 		return obj
 	return null
 
@@ -4598,11 +4727,125 @@ func _err(msg) -> Dictionary:
 	return { "ok": false, "error": msg }
 
 
+# The MCP Bridge panel under Settings: what the bridge is doing, and the
+# controls that belong to the user alone (the assistant cannot reach them: see
+# _native_object). Labels are created with a marker text and found again, since
+# CreateLabel returns nothing.
 func _register_tool():
 	var icon = _ensure_icon()
 	var panel = Global.Editor.Toolset.CreateModTool(self, "Settings", "mcp_bridge", "MCP Bridge", icon)
-	panel.CreateLabel("Listening on")
-	panel.CreateLabel("%s:%d" % [HOST, PORT])
+	if panel == null:
+		return
+	_panel = panel
+	_panel_labels = {}
+	_panel_label("listening", "Listening on %s:%d, protocol %d" % [HOST, PORT, PROTOCOL_VERSION])
+	_panel_label("token", "")
+	_panel_label("last", "No requests yet")
+	_panel_label("history", "Assistant history: 0 steps")
+	panel.CreateSeparator()
+	var pause = panel.CreateCheckButton("Pause AI edits", "mcp_pause", _paused)
+	if pause != null:
+		pause.connect("toggled", self, "_on_panel_pause")
+	var undo = panel.CreateButton("Undo the assistant's last step", icon)
+	if undo != null:
+		undo.connect("pressed", self, "_on_panel_undo")
+	panel.CreateSeparator()
+	var require = panel.CreateCheckButton("Require token", "mcp_require_token", _require_token)
+	if require != null:
+		require.connect("toggled", self, "_on_panel_require_token")
+	var regen = panel.CreateButton("New token", icon)
+	if regen != null:
+		regen.connect("pressed", self, "_on_panel_new_token")
+	panel.CreateNote("Pause and the token are yours: the assistant can read them but cannot " +
+		"change them. The MCP server reads the token from Dungeondraft's user folder; " +
+		"after a new token, reconnect it.")
+	_refresh_panel()
+
+
+func _panel_label(key : String, text : String) -> void:
+	var marker = "__mcp_%s__" % key
+	_panel.CreateLabel(marker)
+	var label = _find_label(_panel, marker, 0)
+	if label != null:
+		label.text = text
+		_panel_labels[key] = label
+
+
+func _find_label(node, text : String, depth : int):
+	if node == null or depth > 6:
+		return null
+	for child in node.get_children():
+		if child is Label and child.text == text:
+			return child
+		var deeper = _find_label(child, text, depth + 1)
+		if deeper != null:
+			return deeper
+	return null
+
+
+func _set_panel_text(key : String, text : String) -> void:
+	var label = _panel_labels.get(key)
+	if label != null and is_instance_valid(label):
+		label.text = text
+
+
+func _refresh_panel() -> void:
+	if _panel == null:
+		return
+	var token_text = "Token: required" if _require_token else "Token: not required"
+	if _require_token and _token == "":
+		token_text = "Token: could not be created, edits refused (see the log)"
+	_set_panel_text("token", token_text)
+	_set_panel_text("last", "Last request: " + (_last_request if _last_request != "" else "none yet"))
+	_set_panel_text("history", "Assistant history: %d of %d steps%s" % [_undo_stack.size(), MAX_UNDO_OPS,
+		" (paused)" if _paused else ""])
+
+
+func _on_panel_pause(pressed : bool) -> void:
+	_paused = pressed
+	_settings_write("paused", pressed)
+	print("[mcp-bridge] AI edits %s from the panel" % ("paused" if pressed else "resumed"))
+	_refresh_panel()
+
+
+func _on_panel_undo() -> void:
+	_close_all_groups()
+	var result = _do_undo()
+	if result.get("ok", false) and result["result"].get("undone", false):
+		_last_request = "undone from the panel at %s (%s)" % [_clock(), str(result["result"].get("kind", ""))]
+	elif result.get("ok", false):
+		_last_request = "nothing of the assistant's to undo"
+	else:
+		_last_request = "could not undo: " + str(result.get("error", ""))
+	_refresh_panel()
+
+
+func _on_panel_require_token(pressed : bool) -> void:
+	_require_token = pressed
+	_settings_write("require_token", pressed)
+	print("[mcp-bridge] token %s from the panel" % ("required" if pressed else "not required"))
+	_refresh_panel()
+
+
+func _on_panel_new_token() -> void:
+	_token = _regenerate_token()
+	_last_request = "new token written at %s; reconnect the MCP server" % _clock()
+	_refresh_panel()
+
+
+# True for the bridge's own panel or anything in it: the assistant must not
+# operate the user's controls through ui_action or native_*.
+func _inside_panel(node) -> bool:
+	if _panel == null or node == null or not (node is Node):
+		return false
+	var cursor = node
+	var hops := 0
+	while cursor != null and hops < 32:
+		if cursor == _panel:
+			return true
+		cursor = cursor.get_parent()
+		hops += 1
+	return false
 
 
 func _ensure_icon() -> String:

@@ -9,6 +9,31 @@ A deliberately tiny protocol so both halves stay trivial to extend.
   request line, reads one response line. The mod also tolerates multiple
   requests on a persistent connection.
 
+## Token and pause
+
+Every request except `ping` must carry `"token": "<64 hex chars>"`. The mod
+writes a random token to Dungeondraft's user folder on first start
+(`user://mcp_bridge_token`, the folder that holds `config.ini`), and the
+Python server reads that file for every request (`DD_BRIDGE_TOKEN_FILE` and
+`DD_BRIDGE_TOKEN` override it, and the server sets the file to mode 0600 on
+POSIX). A request without the right token gets `{ ok: false, error: "bad
+token: ..." }` or `"this bridge requires a token ..."`. The user can turn the
+requirement off ("Require token") or write a new token ("New token") in the
+**MCP Bridge** panel under Settings; the choice persists in
+`user://mcp_bridge_settings.json`. It is a bearer token over localhost: a
+program that cannot read the user's files cannot drive the map (another user,
+a sandboxed app, a web page talking to localhost). It is not encryption.
+
+The same panel has **Pause AI edits**. While paused, only read-only commands
+run (`READ_ONLY_CMDS` in the mod: ping, status, listings, the terrain and
+spatial read-backs, screenshot and export, camera, selection, `native_get` /
+`native_describe` / `native_targets`, `ui_tree`); everything else is refused
+with `error: "paused: ..."`. `ping` and `get_status` report `paused`; `ping`
+also reports `auth` ("token" / "off") and `authenticated`. The pause persists
+across restarts until the user lifts it. **Undo the assistant's last step**
+in the panel pops the bridge's own undo stack. The panel and its controls are
+unreachable through `native_*` and `ui_action`.
+
 ## Request
 
 ```json
@@ -43,8 +68,8 @@ Coordinates are **woxel** (world pixel) space; map center is in
 
 | cmd | params | result |
 | --- | --- | --- |
-| `ping` | — | `{ pong, protocol, engine }` |
-| `get_status` | — | `{ map_open, level_id, level_index, level_count, map_size_woxels, map_center, terrain_slots (4 or 8), terrain_visible, counts{}, active_tool }` |
+| `ping` | — (no token needed) → `{ pong: true, protocol, engine, auth: "token"|"off", authenticated, paused }` |
+| `get_status` | — | `{ map_open, level_id, level_index, level_count, map_size_woxels, map_center, terrain_slots (4 or 8), terrain_visible, counts{}, active_tool }`, `paused` |
 | `list_asset_categories` | — | `{ categories[] }` |
 | `list_assets` | `category="Objects"`, `search=""`, `limit=100` | `{ category, total, matched, returned, assets[] }` |
 | `list_elements` | `kind="objects"`, `limit=200` | `{ kind, count, elements[] }` |

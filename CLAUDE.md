@@ -14,10 +14,13 @@ The tools talk to a live Dungeondraft, not this repo. They only work when:
 2. **a map is open**.
 
 If both aren't true, calls fail (connection refused, or `"no map open"`).
-**Verify first:** call `ping` (expect `pong` + a protocol version), then
-`get_status` (expect `map_open: true` and a `map_center`). If `ping` fails, the
-mod isn't loaded or DD isn't running — ask the user to start it; don't retry
-blindly.
+**Verify first:** call `ping` (expect `pong`, a protocol version and
+`authenticated: true`), then `get_status` (expect `map_open: true` and a
+`map_center`). If `ping` fails, the mod isn't loaded or DD isn't running — ask
+the user to start it; don't retry blindly. `authenticated: false` means the
+server and the mod don't share the bridge token (restart DD and reconnect);
+`paused: true` means the user paused AI edits in DD's MCP Bridge panel: say
+so and make no edits until they resume.
 
 ## Working with the map
 
