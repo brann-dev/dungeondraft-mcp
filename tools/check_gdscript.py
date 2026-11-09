@@ -91,7 +91,13 @@ def main() -> int:
     if not args.godot:
         print("no Godot binary: pass --godot or set GODOT_HEADLESS", file=sys.stderr)
         return 2
-    return check(Path(args.script), Path(args.godot))
+    # Absolute, so a relative path such as ./Godot… is run as a file, not
+    # looked up on PATH.
+    godot = Path(args.godot).resolve()
+    if not godot.is_file():
+        print(f"no Godot binary at {godot}", file=sys.stderr)
+        return 2
+    return check(Path(args.script).resolve(), godot)
 
 
 if __name__ == "__main__":
