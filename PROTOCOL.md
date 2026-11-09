@@ -50,6 +50,8 @@ Coordinates are **woxel** (world pixel) space; map center is in
 | `list_elements` | `kind="objects"`, `limit=200` | `{ kind, count, elements[] }` |
 | `get_element` | `id` | element descriptor |
 | `list_levels` | — | `{ current_index, current_id, levels[{ index, id, label }] }`, top floor first |
+| `list_asset_packs` | — → `{ installed: [{id, name, version, author, keywords?, allow_3rd_party_mapping_software_to_read?}], included_in_this_map: [{id, name, version, author}], installed_but_not_in_this_map, uses_default_assets }`. Installed = the folders under `res://packs` (every mounted pack); included = `Header.AssetManifest`, the only packs whose assets this map can use. |
+| `terrain_samples` | `samples=32` (2–64 per side), `rect?[x,y,w,h]` → `{ level_id, map_size, rect, samples_per_side, slots: [texture path or null per slot], smooth_blending, samples: [{ x, y, weights: [slot0..slot3 (+4..7)], covered }] }`. Weights are read straight from the splat image(s); `covered` is true under a pattern floor (`PatternShapes.GetShapes()` polygons) or a dug cave cell (the `CaveMesh` BitMap, cell = floor(woxel/64)+1). Floor-tool shapes are Clipper paths with no accessor and do not count. |
 | `list_layers` | — | `{ level_id, layers[{ layer, label, locked }] }`, bottom to top |
 
 `kind` ∈ `objects, walls, lights, paths, portals, roofs, texts`. An element
@@ -85,7 +87,9 @@ node; default color is black.
 | `place_object` | `asset`, `x?`, `y?`, `scale=1`, `rotation=0`, `sorting=0`, `color?`, `layer=100` → `{ id, position, color?, warning? }` |
 | `draw_wall` | `points[[x,y]...]`, `asset?`, `loop=false`, `shadow=true`, `type=0`, `joint=1`, `color?` |
 | `draw_path` | `points[[x,y]...]`, `asset`, `layer=100`, `sorting=0`, `smoothness?`, `width?` |
-| `add_light` | `x?`, `y?`, `color?`, `energy=1`, `range=1`, `shadows=true`, `asset?` |
+| `add_light` | `x?`, `y?`, `color?`, `energy=1`, `range=2.0`, `shadows=true`, `asset?` |
+
+`range` on `add_light`, `modify_light` and in descriptors is Dungeondraft's own Range, the number the Light tool shows and the saved map and Universal VTT export carry: `texture_scale * texture_width / 512` (twice the texture scale for the built-in 1024 px light textures). The mod converts (`_light_range` / `_light_scale`).
 | `add_portal` | `asset`, `x?`, `y?`, `closed=false`, `radius=64`, `mount="wall"`, `snap_max=256`, `flip=false`, `fallback_free=true`, `rotation=0` |
 | `add_roof` | `points[[x,y]...]` (the RIDGE line), `asset`, `width=256`, `type=0`, `sorting=0` |
 | `add_text` | `text`, `x?`, `y?`, `size?`, `color?`, `font?` |
@@ -138,16 +142,24 @@ polygon, >= 3 points, with some area).
 | `modify_wall` | `id`, `points?[[x,y]...]`, `loop?`, `type?`, `joint?`, `asset?`, `color?`, `shadow?` → wall descriptor with geometry |
 | `set_element_layer` | `id`, `layer` → `{ id, layer, previous }` (objects, paths and pattern floors) |
 | `duplicate_object` | `id`, `dx=64`, `dy=0` → `{ id }` |
-| `delete_element` | `id` → `{ deleted }` |
+| `delete_element` | `id` → `{ deleted, id, undoable: true }` (reversible, see History) |
+| `delete_elements` | `ids[]` (≤100, all checked first) → `{ deleted, ids, undoable: true }`; one undo step |
 | `add_level` | `label="Level"`, `terrain=false` → `{ id, label, index: 0, current_index, terrain_visible }` |
 | `set_level` | `index` → `{ current_index, current_id }` |
 | `rename_level` | `index`, `label` → level list |
 | `clone_level` | `index`, `label?` → `{ id, label, index: 0, current_index }` |
 | `reorder_levels` | `ids[]` (every level id once, top floor first) → level list |
 | `compare_levels` | `index=-1` (-1 = off), `reference_opacity=0.35`, `current_opacity=1` → `{ comparing, ... }` |
+| `delete_level` | `index` → level list + `{ deleted_id, deleted_label }`; refuses the last level; **not** undoable |
 | `add_layer` | `layer` (z, -4096..4096), `label?` → layer list |
 | `configure_level` | `ambient_light?`, `lighting?`, `terrain_visible?`, `smooth_terrain?`, `water_shoreline?` → `{ level_id, ambient_light, lighting, terrain_visible, smooth_terrain, water_shoreline }` (no params = just read) |
 | `set_trace_image` | `path` (empty = remove), `x?`, `y?`, `scale=1`, `opacity=0.5` → `{ trace_image, path?, position?, scale?, opacity?, image_size? }` |
+| `get_map_style` | — → `{ building_wear, building_wear_texture, building_wear_options: [{index, name, texture}], grid_style, grid_texture, grid_style_options }` (the Map Settings tool's wear list and `MapSettings.GRID_TEXTURES`) |
+| `set_map_style` | `building_wear?` (option name or index), `grid_style?` (dashes / dotted / narrow_line / thick_line) → as `get_map_style`; applied through `MapSettings.SetBuildingWear` / `SetGridStyle`, undoable (`map_style` op snapshots `World.BuildingWear` and the grid texture) |
+| `list_prefabs` | `set?` → `{ sets, set, prefabs }` (the Prefab tool's Set dropdown and List; the tool is enabled for the read and disabled again unless it was active) |
+| `place_prefab` | `name`, `set?`, `x?`, `y?` → `{ prefab, ids, count, centre, unmoved?, note? }`. Selects the list item (`PrefabTool.OnSelectPrefab` deserialises the prefab into the level), shifts the movable pieces (props, lights, free portals, texts) so their centre lands on x,y, then `Confirm()`. One `group` undo op of the created nodes. |
+| `generator_options` | — → `{ design, designs, dials: { boundary, complexity, density: {value, min, max, step} } }` (the Generator tool's `Design` and Range controls) |
+| `generate_dungeon` | `design?` (Dungeon / Cave), `boundary?`, `complexity?`, `density?` → `{ design, dials, counts_before, counts_after, level_id }`; runs `Generator.Generate()` on the current level. **Not** undoable. |
 | `select_elements` | `ids[]` |
 | `clear_selection` | — |
 
@@ -287,20 +299,47 @@ The bridge keeps its **own** undo/redo stacks (it does not use Dungeondraft's
 reversible edit (creates including `import_image`, `move_element`,
 `modify_object`, `modify_wall`, `modify_light`, `modify_text`,
 `set_element_layer`, `fill_terrain`, `fill_region`, `paint_terrain`,
-`paint_path`, `dig_cave`, `clear_caves`, `draw_water`, `draw_material`) pushes an
-op; a fresh edit clears the redo stack. Terrain ops snapshot the splat images
+`paint_path`, `dig_cave`, `clear_caves`, `draw_water`, `draw_material`,
+`place_pattern`, `delete_element`, `delete_elements`) pushes an op; a fresh
+edit clears the redo stack. Terrain ops snapshot the splat images
 before/after; `dig_cave` and `draw_material` snapshot their `BitMap` the same
 way, `draw_water` the water mesh's saved state, `modify_wall` the wall's points,
-texture, tint and flags.
+texture, tint and flags. A deleted object is serialised (`Prop.Save`) and
+rebuilt by `LoadObject` on undo with its id; any other deleted node is detached
+from the tree and held by the op. History keeps the last 200 ops; past that
+the oldest is dropped (and freed, if it held a detached node).
 
 | cmd | params | result |
 | --- | --- | --- |
-| `undo` | — | `{ undone, kind?, undo_depth? }` / `{ undone: false, reason }` |
-| `redo` | — | `{ redone, kind?, redo_depth? }` / `{ redone: false, reason }` |
+| `undo` | — | `{ undone, kind?, steps?, label?, undo_depth? }` / `{ undone: false, reason }` |
+| `redo` | — | `{ redone, kind?, steps?, label?, redo_depth? }` / `{ redone: false, reason }` |
+| `begin_undo_group` | `label?`, `undo_group` (token) | `{ open_groups, label }` |
+| `end_undo_group` | `undo_group` (token) | `{ steps, open_groups, undo_depth }` |
+| `checkpoint` | `label` (≤64 chars; reusing a label moves it) | `{ label, undo_depth, history_limit }` |
+| `list_checkpoints` | — | `{ checkpoints: [{ label, steps_since, reachable, age_ms }] }` |
+| `rollback_checkpoint` | `label` | `{ label, rolled_back, kinds[], undo_depth, redo_depth }`; refuses if history no longer reaches the mark |
 
-`delete_element` is **not** reversible (it frees the node). Levels, selection
-and capture commands are not recorded. This stack is independent of the user's
-Ctrl+Z in Dungeondraft.
+**Undo groups.** Between `begin_undo_group` and `end_undo_group`, every
+recorded op joins the group instead of the stack; the group is pushed as one
+op of kind `group` (undone newest entry first, redone in order), or as the
+lone entry when only one edit was recorded, or not at all when none was. The
+server opens a group around `batch`, `scatter_objects`, `place_objects` and
+`move_elements`, and the mod around `build_room`'s wall and floor, so each is
+one undo step. Every request made inside a group carries the group's token as
+`undo_group`; a request without the open group's token closes the group first
+(its owner stopped talking), so a server that dies mid-batch cannot leave later
+edits swallowed into a stale group. `undo`, `redo` and the checkpoint commands
+close any open group before they run.
+
+**Checkpoints** remember the serial number of the newest op at the time; a
+rollback undoes while the top op is newer than that. Ops pushed get increasing
+serials (a redo gets a fresh one), and `_lost_serial` records the newest op
+dropped from history: a checkpoint older than it is reported `reachable:
+false` and refused.
+
+Not recorded: `delete_level`, `set_terrain_slot`, levels, selection, capture
+and native/UI commands. This stack is independent of the user's Ctrl+Z in
+Dungeondraft.
 
 `color` accepts `"#rrggbb"` / `"#rrggbbaa"` (the `#` is optional) or `[r,g,b]`
 / `[r,g,b,a]` floats 0..1. Colors in results use the same form, with the alpha
