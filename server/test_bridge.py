@@ -86,9 +86,24 @@ def main() -> int:
         check("get_element", lambda: bridge.request("get_element", id=obj["id"]))
         check("move_element", lambda: bridge.request("move_element", id=obj["id"], x=cx + 80, y=cy + 80))
         check("modify_object", lambda: bridge.request("modify_object", id=obj["id"], scale=1.5, rotation=45))
+        def mirror_and_block():
+            res = bridge.request("modify_object", id=obj["id"], mirror=True, block_light=True)
+            if not (res.get("mirror") and res.get("block_light")):
+                raise BridgeError(f"mirror / block_light did not stick: {res}")
+            return {k: res[k] for k in ("scale", "mirror", "block_light", "layer")}
+
+        check("mirror/block_light", mirror_and_block)
         dup = check("duplicate_object", lambda: bridge.request("duplicate_object", id=obj["id"], dx=120))
         if dup:
             created_ids.append(dup["id"])
+    if light:
+        def relight():
+            res = bridge.request("modify_light", id=light["id"], color="#3366ff", energy=0.8, range=1.5)
+            if res.get("color") != "#3366ff" or res.get("range") != 1.5:
+                raise BridgeError(f"light did not take the new values: {res}")
+            return {k: res[k] for k in ("color", "energy", "range", "shadows")}
+
+        check("modify_light", relight)
 
     # --- wall edit: a door mounted on the room must survive a reshape ---
     door_asset = first_asset("Portals", "door")
@@ -129,17 +144,18 @@ def main() -> int:
 
     check("list_levels", lambda: bridge.request("list_levels"))
 
-    # --- layers ---
+    # --- layers / level settings ---
     layers = check("list_layers", lambda: bridge.request("list_layers"))
     if obj and layers:
         def relayer():
-            res = bridge.request("set_element_layer", id=obj["id"], layer=100)
+            res = bridge.request("set_element_layer", id=obj["id"], layer=200)
             now = bridge.request("get_element", id=obj["id"])["layer"]
-            if now != 100:
-                raise BridgeError(f"object is on layer {now}, expected 100")
+            if res["previous"] != 100 or now != 200:
+                raise BridgeError(f"expected a move from layer 100 to 200, got {res['previous']} -> {now}")
             return res
 
         check("set_element_layer", relayer)
+    check("configure_level", lambda: bridge.request("configure_level"))
 
     # --- layout facts: footprints, one snapshot, a region set and removed again ---
     check("asset_footprint", lambda: bridge.request("asset_footprint", asset=obj_asset))
@@ -207,8 +223,8 @@ def main() -> int:
             pass
     print(f"\nCleaned up {deleted}/{len(created_ids)} created elements.")
     print(f"\n{passed} passed, {failed} failed.")
-    print("(Terrain / image import / roof / text / level commands and the native write calls "
-          "aren't auto-tested here to avoid messing up your map — try them by hand once the basics pass.)")
+    print("(Terrain / image import / trace image / roof / text / level commands and the native write "
+          "calls aren't auto-tested here to avoid messing up your map — try them by hand once the basics pass.)")
     return 0 if failed == 0 else 1
 
 

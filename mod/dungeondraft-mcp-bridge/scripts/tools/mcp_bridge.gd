@@ -21,7 +21,7 @@ var script_class = "tool"
 
 const HOST := "127.0.0.1"
 const PORT := 8787
-const PROTOCOL_VERSION := 26
+const PROTOCOL_VERSION := 27
 
 # Commands that get wrapped in a Dungeondraft undo record (see _record_and_dispatch).
 const CREATE_CMDS := [
@@ -45,6 +45,9 @@ const IMAGE_EXTENSIONS := ["png", "jpg", "jpeg", "webp"]
 const MAX_IMAGE_SIDE := 16384
 # MaterialBrush's own default layer ("Below Ground": above terrain, under floors).
 const DEFAULT_MATERIAL_LAYER := -400
+# The layer DD's Object, Path and Scatter tools start on ("User Layer 1"), so
+# what the bridge places stacks with what is placed by hand.
+const DEFAULT_LAYER := 100
 
 # SelectTool.GetSelectableType() integer -> readable kind.
 const KIND_NAMES := {
@@ -259,6 +262,16 @@ func _apply_op(op, undo : bool):
 				var wall = Global.World.GetNodeByID(int(op["id"]))
 				if wall != null and _is_wall(wall):
 					_apply_wall_state(wall, op["old"] if undo else op["new"])
+		"light":
+			if Global.World.HasNodeID(int(op["id"])):
+				var light = Global.World.GetNodeByID(int(op["id"]))
+				if light != null and light is Light2D:
+					_apply_light_state(light, op["old"] if undo else op["new"])
+		"text":
+			if Global.World.HasNodeID(int(op["id"])):
+				var text = Global.World.GetNodeByID(int(op["id"]))
+				if text != null and _is_text(text):
+					_apply_text_state(text, op["old"] if undo else op["new"])
 		"layer":
 			if Global.World.HasNodeID(int(op["id"])):
 				var node = Global.World.GetNodeByID(int(op["id"]))
@@ -324,6 +337,8 @@ func _apply_props(node, snap):
 		node.scale = snap["scale"]
 	if snap.get("shadow") != null:
 		node.set("HasShadow", snap["shadow"])
+	if snap.get("block_light") != null and node.has_method("SetBlockLight"):
+		node.SetBlockLight(snap["block_light"])
 	if snap.has("color"):
 		if snap["color"] != null:
 			_apply_custom_color(node, snap["color"])
@@ -388,6 +403,8 @@ func _snapshot(node) -> Dictionary:
 		s["scale"] = node.scale
 	if node.get("HasShadow") != null:
 		s["shadow"] = node.get("HasShadow")
+	if node.has_method("SetBlockLight"):
+		s["block_light"] = bool(node.get("BlockLight"))
 	if node.has_method("HasCustomColor"):
 		s["color"] = node.GetCustomColor() if node.HasCustomColor() else null
 	return s
@@ -430,6 +447,8 @@ func _safe_dispatch(req : Dictionary) -> Dictionary:
 		"move_element": return _move_element(req)
 		"modify_object": return _modify_object(req)
 		"modify_wall": return _modify_wall(req)
+		"modify_light": return _modify_light(req)
+		"modify_text": return _modify_text(req)
 		"set_element_layer": return _set_element_layer(req)
 		"duplicate_object": return _duplicate_object(req)
 		"delete_element": return _delete_element(req)
@@ -446,6 +465,8 @@ func _safe_dispatch(req : Dictionary) -> Dictionary:
 		"compare_levels": return _compare_levels(req)
 		"list_layers": return _list_layers()
 		"add_layer": return _add_layer(req)
+		"configure_level": return _configure_level(req)
+		"set_trace_image": return _set_trace_image(req)
 		# --- capture ---
 		"screenshot": return _screenshot(req)
 		"export_map": return _export_map(req)
@@ -776,7 +797,7 @@ func _place_object(req : Dictionary) -> Dictionary:
 	if level == null: return _err("no map open")
 	var tex = _asset_tex("Objects", req.get("asset", ""))
 	if tex == null: return _err("could not load object asset: " + str(req.get("asset")))
-	var layer = int(req.get("layer", 0))
+	var layer = int(req.get("layer", DEFAULT_LAYER))
 	var bad = _layer_error(level, layer)
 	if bad != "": return _err(bad)
 	var prop = level.Objects.CreateObject(int(req.get("sorting", 0)))
@@ -918,8 +939,11 @@ func _draw_path(req : Dictionary) -> Dictionary:
 	if pts.size() < 2: return _err("'points' needs >= 2 [x,y] pairs")
 	var tex = _asset_tex("Paths", req.get("asset", ""))
 	if tex == null: return _err("could not load path asset: " + str(req.get("asset")))
+	var layer = int(req.get("layer", DEFAULT_LAYER))
+	var bad = _layer_error(level, layer)
+	if bad != "": return _err(bad)
 	var path = level.Pathways.CreatePath(
-		tex, int(req.get("layer", 0)), int(req.get("sorting", 0)),
+		tex, layer, int(req.get("sorting", 0)),
 		bool(req.get("fade_in", false)), bool(req.get("fade_out", false)),
 		bool(req.get("grow", false)), bool(req.get("shrink", false)))
 	path.SetEditPoints(pts)
@@ -1279,7 +1303,7 @@ func _import_image(req : Dictionary) -> Dictionary:
 	if not Global.Editor.Tools.has("ObjectTool"): return _err("ObjectTool unavailable")
 	var s = float(req.get("scale", 1.0))
 	if s <= 0.0: return _err("'scale' must be > 0")
-	var layer = int(req.get("layer", 0))
+	var layer = int(req.get("layer", DEFAULT_LAYER))
 	var bad = _layer_error(level, layer)
 	if bad != "": return _err(bad)
 	# EmbedObject dereferences the texture it loads without a null check, so a
@@ -1295,8 +1319,8 @@ func _import_image(req : Dictionary) -> Dictionary:
 	var prop = level.Objects.get_child(level.Objects.get_child_count() - 1)
 	# EmbedObject leaves the prop at the cursor, on the Object tool's layer, with
 	# the tool's shadow setting, and indexed for selection under that layer. Give
-	# it the caller's layer (place_object's default, 0) and transform, then
-	# re-index it (the search table is keyed by z_index; see _register_prop).
+	# it the caller's layer and transform, then re-index it (the search table
+	# is keyed by z_index; see _register_prop).
 	var sorting = int(req.get("sorting", 0))
 	level.Objects.RemoveFromSearchTable(prop)
 	prop.z_index = layer
@@ -1808,9 +1832,15 @@ func _modify_object(req : Dictionary) -> Dictionary:
 	var node = _resolve(req)
 	if node == null: return _err("no element with id " + str(req.get("id")))
 	if req.has("scale"):
-		var s = float(req["scale"]); node.scale = Vector2(s, s)
+		# A mirrored prop is one with a negative x scale (Prop.Mirror): keep the sign.
+		var s = abs(float(req["scale"]))
+		node.scale = Vector2(-s if node.scale.x < 0 else s, s)
 	if req.has("rotation"):
 		node.rotation = deg2rad(float(req["rotation"]))
+	if req.has("mirror") and node is Node2D:
+		node.scale = Vector2(abs(node.scale.x) * (-1.0 if bool(req["mirror"]) else 1.0), node.scale.y)
+	if req.has("block_light") and node.has_method("SetBlockLight"):
+		node.SetBlockLight(bool(req["block_light"]))
 	var warning = ""
 	if req.has("color") and str(req.get("color", "")) != "":
 		if _is_colorable(node):
@@ -1823,6 +1853,76 @@ func _modify_object(req : Dictionary) -> Dictionary:
 	if warning != "":
 		d["warning"] = warning
 	return _ok(d)
+
+
+# What modify_light changes on a light, and its undo puts back. `range` is the
+# Light2D's texture_scale (see add_light).
+func _light_state(light) -> Dictionary:
+	return {
+		"color": light.color, "energy": light.energy, "range": light.texture_scale,
+		"shadows": light.shadow_enabled, "rotation": light.rotation, "texture": light.texture,
+	}
+
+
+func _apply_light_state(light, s : Dictionary) -> void:
+	light.color = s["color"]
+	light.energy = s["energy"]
+	light.texture_scale = s["range"]
+	light.shadow_enabled = s["shadows"]
+	light.rotation = s["rotation"]
+	if s["texture"] != null:
+		light.texture = s["texture"]
+
+
+func _modify_light(req : Dictionary) -> Dictionary:
+	var light = _resolve(req)
+	if light == null or not (light is Light2D): return _err("no light with id " + str(req.get("id")))
+	var old = _light_state(light)
+	var want = old.duplicate()
+	if req.has("color") and str(req.get("color", "")) != "":
+		want["color"] = _color(req["color"], old["color"])
+	if req.has("energy"):
+		want["energy"] = float(req["energy"])
+		if want["energy"] < 0.0: return _err("'energy' must be >= 0")
+	if req.has("range"):
+		want["range"] = float(req["range"])
+		if want["range"] <= 0.0: return _err("'range' must be > 0")
+	if req.has("shadows"): want["shadows"] = bool(req["shadows"])
+	if req.has("rotation"): want["rotation"] = deg2rad(float(req["rotation"]))
+	if req.has("asset") and str(req.get("asset", "")) != "":
+		var tex = _asset_tex("Lights", req["asset"])
+		if tex == null: return _err("could not load light asset: " + str(req["asset"]))
+		want["texture"] = tex
+	_apply_light_state(light, want)
+	return _ok_op(_describe(light), { "kind": "light", "id": _id(light), "old": old, "new": want })
+
+
+func _text_state(text) -> Dictionary:
+	return { "text": text.text, "font": str(text.fontName), "size": int(text.fontSize), "color": text.fontColor }
+
+
+# Text.SetFont builds the font for a name + size and refits the label to its
+# text, so it is called for any change; the color is separate.
+func _apply_text_state(text, s : Dictionary) -> void:
+	text.text = s["text"]
+	text.SetFont(s["font"], s["size"])
+	text.SetFontColor(s["color"])
+
+
+func _modify_text(req : Dictionary) -> Dictionary:
+	var text = _resolve(req)
+	if text == null or not _is_text(text): return _err("no text with id " + str(req.get("id")))
+	var old = _text_state(text)
+	var want = old.duplicate()
+	if req.has("text"): want["text"] = str(req["text"])
+	if req.has("font") and str(req.get("font", "")) != "": want["font"] = str(req["font"])
+	if req.has("size"):
+		want["size"] = int(req["size"])
+		if want["size"] <= 0: return _err("'size' must be > 0")
+	if req.has("color") and str(req.get("color", "")) != "":
+		want["color"] = _color(req["color"], old["color"])
+	_apply_text_state(text, want)
+	return _ok_op(_describe(text), { "kind": "text", "id": _id(text), "old": old, "new": want })
 
 
 # Edit an existing wall by id: texture (`asset`), tint (`color`), `shadow`
@@ -1951,6 +2051,8 @@ func _duplicate_object(req : Dictionary) -> Dictionary:
 	prop.rotation = src.rotation
 	if src.has_method("HasCustomColor") and src.HasCustomColor():
 		_apply_custom_color(prop, src.GetCustomColor())
+	if bool(src.get("BlockLight")):
+		prop.SetBlockLight(true)
 	_register_prop(level, prop, 0)
 	return _ok({ "id": _id(prop), "position": _vec(prop.position) })
 
@@ -2067,6 +2169,71 @@ func _set_toggle_quietly(button, pressed : bool) -> void:
 		button.set_pressed_no_signal(pressed)
 
 
+# Level-wide settings DD keeps on tool panels: the ambient light (Environment),
+# lighting on/off (the Lighting checkbox, which is map-wide), the terrain's
+# visibility and smooth blending (Terrain Brush) and the water's shoreline
+# (Water Brush). Sets what is given, then reports all of them.
+func _configure_level(req : Dictionary) -> Dictionary:
+	var level = Global.World.GetCurrentLevel()
+	if level == null: return _err("no map open")
+	if req.has("ambient_light") and str(req.get("ambient_light", "")) != "":
+		var c = _color(req["ambient_light"], level.LightPassRender.color)
+		level.LightPassRender.color = c
+		if Global.Editor.Tools.has("Environment"):
+			var env = Global.Editor.Tools["Environment"]
+			env.SetAmbientLight(c)
+			var picker = env.get("Controls").get("AmbientLight")
+			if picker != null and picker is ColorPickerButton:
+				picker.color = c
+	if req.has("lighting"):
+		# Not Editor.ToggleLighting: outside an export it dereferences
+		# World.SourceLevel, which is null. This is what its checkbox does.
+		for lv in Global.World.levels:
+			lv.ToggleLighting(bool(req["lighting"]))
+		_set_toggle_quietly(Global.Editor.get("LightingToggle"), bool(req["lighting"]))
+	if req.has("terrain_visible"):
+		level.Terrain.visible = bool(req["terrain_visible"])
+	if req.has("smooth_terrain"):
+		level.Terrain.SetSmoothBlending(bool(req["smooth_terrain"]))
+	if req.has("water_shoreline"):
+		level.WaterMesh.DisableBorder(not bool(req["water_shoreline"]))
+	return _ok({
+		"level_id": level.ID,
+		"ambient_light": _hex(level.LightPassRender.color),
+		"lighting": level.Lights.visible,
+		"terrain_visible": level.Terrain.visible,
+		"smooth_terrain": level.Terrain.SmoothBlending,
+		"water_shoreline": not bool(level.WaterMesh.get("disableBorder")),
+	})
+
+
+# Show an image over the map to trace from (World.AddTraceImage, the Trace
+# Image tool). It is an editing aid: DD hides it while exporting. An empty
+# `path` removes it.
+func _set_trace_image(req : Dictionary) -> Dictionary:
+	var path = str(req.get("path", ""))
+	if path == "":
+		Global.World.RemoveTraceImage()
+		return _ok({ "trace_image": false })
+	if not (path.get_extension().to_lower() in IMAGE_EXTENSIONS):
+		return _err("unsupported image type (use png, jpg or webp): " + path)
+	var img = Image.new()
+	if not File.new().file_exists(path) or img.load(path) != OK:
+		return _err("could not read image: " + path)
+	var scale = float(req.get("scale", 1.0))
+	if scale <= 0.0: return _err("'scale' must be > 0")
+	var opacity = clamp(float(req.get("opacity", 0.5)), 0.0, 1.0)
+	Global.World.TraceImageVisible = true
+	Global.World.AddTraceImage(path, scale, opacity)
+	var sprite = Global.World.TraceImage
+	if sprite == null: return _err("AddTraceImage created no image")
+	sprite.position = _xy(req, Global.World.WoxelDimensions * 0.5)
+	return _ok({
+		"trace_image": true, "path": path, "position": _vec(sprite.position),
+		"scale": scale, "opacity": opacity, "image_size": [img.get_width(), img.get_height()],
+	})
+
+
 # ---------------------------------------------------------------------------
 # Layers
 # ---------------------------------------------------------------------------
@@ -2087,11 +2254,11 @@ func _user_layers(level) -> Dictionary:
 	return level.SaveLayers()
 
 
-# Layers an element may be put on: the level's drawing layers, plus 0, where the
-# bridge has always created objects and paths. Returns "" or the error.
+# Layers an element may be put on: the level's drawing layers, as in DD's own
+# layer menus (the locked ones are greyed out there). Returns "" or the error.
 func _layer_error(level, layer : int) -> String:
 	var layers = _user_layers(level)
-	if layer == 0 or layers.has(layer):
+	if layers.has(layer):
 		return ""
 	var keys = layers.keys()
 	keys.sort()
@@ -3430,13 +3597,22 @@ func _describe(node) -> Dictionary:
 	if node is Node2D:
 		d["position"] = _vec(node.position)
 		d["rotation"] = rad2deg(node.rotation)
-		d["scale"] = node.scale.x
+		d["scale"] = abs(node.scale.x)
 	var tex_path = _texture_path(node, t)
 	if tex_path != "":
 		d["asset"] = tex_path
 	var layer = _element_layer(node)
 	if layer != null:
 		d["layer"] = layer
+	if node is Light2D:
+		d["color"] = _hex(node.color)
+		d["energy"] = node.energy
+		d["range"] = node.texture_scale
+		d["shadows"] = node.shadow_enabled
+	if node.has_method("SetBlockLight"):       # objects and paths
+		d["block_light"] = bool(node.get("BlockLight"))
+	if node.has_method("SetCustomColor"):      # objects only
+		d["mirror"] = node.scale.x < 0
 	if t == 4 and node.has_method("HasCustomColor"):
 		d["colorable"] = _is_colorable(node)
 		if node.HasCustomColor():

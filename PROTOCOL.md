@@ -54,7 +54,9 @@ Coordinates are **woxel** (world pixel) space; map center is in
 
 `kind` ∈ `objects, walls, lights, paths, portals, roofs, texts`. An element
 descriptor is `{ id, kind, position[x,y], rotation(deg), scale, asset?, layer? }`
-(`layer` for objects, paths and pattern floors, the kinds that have one).
+(`layer` for objects, paths and pattern floors, the kinds that have one). An
+object adds `mirror` and `block_light` (and `scale` is positive even when it is
+mirrored), a light `color`, `energy`, `range`, `shadows`.
 A level's `index` is its place in the list and changes when levels are added,
 cloned or reordered; its `id` stays put while the map is open (DD hands ids out
 afresh on load). `get_status.level_id` is the id (it used to report the index
@@ -80,16 +82,16 @@ node; default color is black.
 
 | cmd | params |
 | --- | --- |
-| `place_object` | `asset`, `x?`, `y?`, `scale=1`, `rotation=0`, `sorting=0`, `color?`, `layer=0` → `{ id, position, color?, warning? }` |
+| `place_object` | `asset`, `x?`, `y?`, `scale=1`, `rotation=0`, `sorting=0`, `color?`, `layer=100` → `{ id, position, color?, warning? }` |
 | `draw_wall` | `points[[x,y]...]`, `asset?`, `loop=false`, `shadow=true`, `type=0`, `joint=1`, `color?` |
-| `draw_path` | `points[[x,y]...]`, `asset`, `layer=0`, `sorting=0`, `smoothness?`, `width?` |
+| `draw_path` | `points[[x,y]...]`, `asset`, `layer=100`, `sorting=0`, `smoothness?`, `width?` |
 | `add_light` | `x?`, `y?`, `color?`, `energy=1`, `range=1`, `shadows=true`, `asset?` |
 | `add_portal` | `asset`, `x?`, `y?`, `closed=false`, `radius=64`, `mount="wall"`, `snap_max=256`, `flip=false`, `fallback_free=true`, `rotation=0` |
 | `add_roof` | `points[[x,y]...]` (the RIDGE line), `asset`, `width=256`, `type=0`, `sorting=0` |
 | `add_text` | `text`, `x?`, `y?`, `size?`, `color?`, `font?` |
 | `place_pattern` | `asset`, `rect=[x,y,w,h]` **or** `points=[[x,y]...]`, `category="Patterns"`, `color?`, `rotation?` |
 | `build_room` | `rect=[x,y,w,h]` **or** `points=[[x,y]...]`, `wall_asset?`, `floor="pattern"\|"terrain"\|"none"`, `floor_asset?`, `floor_category="Simple Tiles"`, `floor_color?`, `floor_slot=1`, `wall_type=0`, `wall_joint=1` → `{ wall_id, floor_id?, points }` |
-| `import_image` | `path` (absolute; `.png` / `.jpg` / `.jpeg` / `.webp`), `x?`, `y?`, `scale=1`, `rotation=0`, `sorting=0`, `shadow=true`, `layer=0` → `{ id, position, image_size[w,h], asset }`. The new element is an ordinary object whose `asset` is `embedded://<path>` |
+| `import_image` | `path` (absolute; `.png` / `.jpg` / `.jpeg` / `.webp`), `x?`, `y?`, `scale=1`, `rotation=0`, `sorting=0`, `shadow=true`, `layer=100` → `{ id, position, image_size[w,h], asset }`. The new element is an ordinary object whose `asset` is `embedded://<path>` |
 
 ### Terrain
 
@@ -129,7 +131,9 @@ polygon, >= 3 points, with some area).
 | cmd | params |
 | --- | --- |
 | `move_element` | `id`, `x`, `y` |
-| `modify_object` | `id`, `scale?`, `rotation?`, `color?`, `shadow?` → descriptor (+ `warning?`) |
+| `modify_object` | `id`, `scale?`, `rotation?`, `color?`, `shadow?`, `mirror?`, `block_light?` → descriptor (+ `warning?`) |
+| `modify_light` | `id`, `color?`, `energy?`, `range?`, `shadows?`, `rotation?`, `asset?` → light descriptor |
+| `modify_text` | `id`, `text?`, `size?`, `color?`, `font?` → text descriptor |
 | `modify_wall` | `id`, `points?[[x,y]...]`, `loop?`, `type?`, `joint?`, `asset?`, `color?`, `shadow?` → wall descriptor with geometry |
 | `set_element_layer` | `id`, `layer` → `{ id, layer, previous }` (objects, paths and pattern floors) |
 | `duplicate_object` | `id`, `dx=64`, `dy=0` → `{ id }` |
@@ -141,6 +145,8 @@ polygon, >= 3 points, with some area).
 | `reorder_levels` | `ids[]` (every level id once, top floor first) → level list |
 | `compare_levels` | `index=-1` (-1 = off), `reference_opacity=0.35`, `current_opacity=1` → `{ comparing, ... }` |
 | `add_layer` | `layer` (z, -4096..4096), `label?` → layer list |
+| `configure_level` | `ambient_light?`, `lighting?`, `terrain_visible?`, `smooth_terrain?`, `water_shoreline?` → `{ level_id, ambient_light, lighting, terrain_visible, smooth_terrain, water_shoreline }` (no params = just read) |
+| `set_trace_image` | `path` (empty = remove), `x?`, `y?`, `scale=1`, `opacity=0.5` → `{ trace_image, path?, position?, scale?, opacity?, image_size? }` |
 | `select_elements` | `ids[]` |
 | `clear_selection` | — |
 
@@ -278,7 +284,8 @@ the rect's midpoint; `fit_elements` frames the union of all rects.
 The bridge keeps its **own** undo/redo stacks (it does not use Dungeondraft's
 `History.CreateCustomRecord`, which is unreliable on 3.4.2 — see notes). Every
 reversible edit (creates including `import_image`, `move_element`,
-`modify_object`, `modify_wall`, `set_element_layer`, `fill_terrain`, `fill_region`, `paint_terrain`,
+`modify_object`, `modify_wall`, `modify_light`, `modify_text`,
+`set_element_layer`, `fill_terrain`, `fill_region`, `paint_terrain`,
 `paint_path`, `dig_cave`, `clear_caves`, `draw_water`, `draw_material`) pushes an
 op; a fresh edit clears the redo stack. Terrain ops snapshot the splat images
 before/after; `dig_cave` and `draw_material` snapshot their `BitMap` the same
@@ -509,9 +516,9 @@ pair only when the color is not opaque.
   dereferences the loaded texture unchecked, so the bridge decodes the file
   itself first and refuses what Godot can't read. The prop is created at the
   cursor on the Object tool's active layer with the tool's shadow setting and is
-  indexed for selection under that layer; the bridge moves it to layer 0 (where
-  `place_object` props live), applies the transform and `shadow`, and re-indexes
-  it (`RemoveFromSearchTable` / `AddToSearchTable`). Undo/redo use the prop path
+  indexed for selection under that layer; the bridge gives it the requested
+  `layer`, transform and `shadow`, and re-indexes it
+  (`RemoveFromSearchTable` / `AddToSearchTable`). Undo/redo use the prop path
   (`Prop.Save` / `Objects.LoadObject`), which resolves `embedded://` textures.
 - **`draw_water`** — `WaterMesh.DrawPolygon(points, invert)` is the Water
   Brush's shape mode: it unions the polygon into the level's water (or
@@ -639,11 +646,30 @@ pair only when the color is not opaque.
   follows `SelectTool`: for an object, `Objects.RemoveFromSearchTable`, set
   `z_index`, `AddToSearchTable`, because the selection index is keyed by z.
   Within one z, the level's node order decides: Water, Patterns, Materials,
-  Paths, Objects. The bridge creates objects and paths on **0** (DD's own tools
-  default to 100), so 0 is accepted as a layer although it is the locked Water
-  layer. A light's `range` is its `texture_scale`; DD's Range slider is
+  Paths, Objects. The bridge creates objects and paths on **100**, the layer
+  DD's Object, Path and Scatter tools start on, so what it places stacks with
+  what is placed by hand (it used 0, the locked Water layer, until protocol
+  27, and 0 is no longer accepted). Pattern floors stay on -100 and materials
+  on -400. A light's `range` is its `texture_scale`; DD's Range slider is
   `texture_scale * texture width / 512`, twice that for the built-in 1024-px
   light textures.
+- **Element and level settings** — a mirrored object is one with a negative x
+  scale (`Prop.Mirror`), so `modify_object`'s `scale` keeps the sign and the
+  transform snapshot already covers it; `SetBlockLight` builds light occluders
+  from the sprite's silhouette. `modify_light` writes the `Light2D` directly
+  (`color`, `energy`, `texture_scale`, `shadow_enabled`, `rotation`, `texture`),
+  which is all `Lights.SaveLight` stores. `modify_text` goes through
+  `Text.SetFont(name, size)`, which rebuilds the font and refits the label, and
+  `SetFontColor`. The ambient light is the color of the level's
+  `LightPassRender` rect (saved per level as `ambient_light`); the bridge also
+  hands it to the Environment tool and its picker. The Lighting checkbox calls
+  `Level.ToggleLighting` on every level, and so does the bridge:
+  `Editor.ToggleLighting(true)` itself dereferences `World.SourceLevel`, which
+  is null outside an export. The trace image is `World.AddTraceImage(path,
+  scale, opacity)`, a sprite DD hides while exporting; the bridge decodes the
+  file first because a file that fails to load leaves a texture-less sprite.
+  `scatter_objects` and `batch` are not bridge commands: the server composes
+  them from `place_object` and from its own tools.
 - **Native access** — built on Godot's reflection of DD's C# objects.
   `get_method_list()` gives every C# method with argument names and Variant
   types (object arguments carry no class, and nothing marks a method private),

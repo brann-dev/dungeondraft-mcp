@@ -29,6 +29,7 @@ TOUCH = 0.5          # woxels
 MIN_OVERLAP = 16.0   # square woxels (a 4 x 4 woxel sliver)
 
 DEFAULT_DOOR_CLEARANCE = 128.0   # half a tile on each side of a door
+DEFAULT_LAYER = 100              # where the bridge (like Dungeondraft) puts new objects
 
 
 # --------------------------------------------------------------------------
@@ -205,7 +206,7 @@ def proposed_footprint(scene: dict, cmd: str, params: dict) -> Optional[Proposal
             position = (params["x"], params["y"])
         s = float(params.get("scale", 1.0))
         polygon = transform(fp["local"], position, (s, s), float(params.get("rotation", 0.0)))
-        return Proposal(polygon, int(params.get("layer", 0)), None)
+        return Proposal(polygon, int(params.get("layer", DEFAULT_LAYER)), None)
 
     obj = find_object(scene, params.get("id"))
     if obj is None:
@@ -213,7 +214,8 @@ def proposed_footprint(scene: dict, cmd: str, params: dict) -> Optional[Proposal
     if cmd == "move_element":
         return moved(obj, x=params["x"], y=params["y"])
     if cmd == "modify_object":
-        return moved(obj, scale=params.get("scale"), rotation=params.get("rotation"))
+        return moved(obj, scale=params.get("scale"), rotation=params.get("rotation"),
+                     mirror=params.get("mirror"))
     if cmd == "duplicate_object":
         x, y = obj["position"]
         copy = moved(obj, x=x + params.get("dx", 64.0), y=y + params.get("dy", 0.0))
@@ -226,14 +228,21 @@ def find_object(scene: dict, id) -> Optional[dict]:
     return next((o for o in scene["objects"] if o["id"] == id), None)
 
 
-def moved(obj: dict, *, x=None, y=None, scale=None, rotation=None) -> Proposal:
-    """A snapshot object's footprint after a move, a uniform rescale and/or a turn."""
+def moved(obj: dict, *, x=None, y=None, scale=None, rotation=None, mirror=None) -> Proposal:
+    """A snapshot object's footprint after a move, a uniform rescale, a turn and/or a flip.
+
+    A mirrored object is one with a negative x scale; a rescale keeps the flip.
+    """
     position = obj["position"]
     if x is not None and y is not None:
         position = (x, y)
-    size = obj["scale"] if scale is None else (float(scale), float(scale))
+    sx, sy = obj["scale"]
+    if scale is not None:
+        sx, sy = math.copysign(abs(float(scale)), sx), abs(float(scale))
+    if mirror is not None:
+        sx = -abs(sx) if mirror else abs(sx)
     turn = obj["rotation"] if rotation is None else float(rotation)
-    return Proposal(transform(obj["local"], position, size, turn), int(obj["layer"]), obj["id"])
+    return Proposal(transform(obj["local"], position, (sx, sy), turn), int(obj["layer"]), obj["id"])
 
 
 # --------------------------------------------------------------------------

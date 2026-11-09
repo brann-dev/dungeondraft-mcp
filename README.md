@@ -25,7 +25,7 @@ The mod opens a TCP server inside Dungeondraft and polls it every frame from the
 forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
 
 > **Status: working.** Confirmed end-to-end against Dungeondraft on **Godot
-> 3.4.2** — raw TCP from the modding sandbox works, no fallback needed. 69 tools
+> 3.4.2** — raw TCP from the modding sandbox works, no fallback needed. 75 tools
 > across query / create / modify / terrain / water / materials / levels /
 > layers / layout checks / selection / capture / camera / undo / map lifecycle,
 > plus an escape hatch to Dungeondraft's own API and UI (see below).
@@ -39,7 +39,10 @@ forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
   wood planks, tile, brick — rendered below objects), `build_room` (a wall loop
   + matching floor on one shared path, like the UI's combined trace),
   `import_image` (embed a PNG/JPG/WEBP from disk as an object: custom props,
-  handouts or a whole battle-map backdrop; the pixels are stored in the map).
+  handouts or a whole battle-map backdrop; the pixels are stored in the map),
+  `scatter_objects` (a stand of trees or a field of rubble in one call, kept
+  off walls and out of doorways), `set_trace_image` (a reference picture shown
+  over the map to trace from).
 - **Terrain:** `set_terrain_slot`, `fill_terrain` (whole level), `fill_region`
   (a rect/polygon, e.g. one room's floor), `paint_terrain` (a soft brush),
   `paint_path` (a smooth continuous stroke along a polyline — roads/trails).
@@ -52,12 +55,16 @@ forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
 - **Caves:** `dig_cave` carves caverns/tunnels along a path (the Cave Brush —
   dig open floor out of rock, with auto rocky walls + debris; `dig=false` fills
   back; optional ground/wall tints), `clear_caves` wipes the whole cave layer.
-- **Edit:** `move_element`, `modify_object`, `modify_wall` (reshape or restyle
-  a wall; its doors and windows stay mounted and follow their segment),
-  `duplicate_object`, `delete_element`, `select_elements`, `clear_selection`.
+- **Edit:** `move_element`, `modify_object` (scale, rotation, color, shadow,
+  mirror, light blocking), `modify_wall` (reshape or restyle a wall; its doors
+  and windows stay mounted and follow their segment), `modify_light`,
+  `modify_text`, `duplicate_object`, `delete_element`, `select_elements`,
+  `clear_selection`.
 - **Levels:** `add_level`, `set_level`, `rename_level`, `clone_level` (copy a
   whole floor to start the next one from), `reorder_levels`, `compare_levels`
-  (show another floor faintly beneath the current one to line things up).
+  (show another floor faintly beneath the current one to line things up),
+  `configure_level` (ambient light for dusk and night scenes, lighting on/off,
+  terrain visibility and blending, the water's shoreline).
 - **Layers:** `list_layers`, `set_element_layer` (decide what covers what: a
   rug under a table, a canopy over a path), `add_layer`; `place_object` and
   `import_image` take a `layer` too.
@@ -87,6 +94,8 @@ forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
   `ui_action` read and operate its panels and dialogs, for anything without a
   dedicated tool (smooth terrain blending, a brush's size, a biome preset).
   A last resort: it bypasses undo, so save first.
+- **Batch:** `batch` runs up to 100 tool calls in one request, for long runs
+  of independent placements.
 - **Undo:** the bridge keeps its own undo/redo stacks for create / move / modify
   / layer / terrain / cave / water / material edits, so `undo` / `redo` let the
   model reliably reverse its own changes (independent of Dungeondraft's Ctrl+Z;
@@ -243,7 +252,8 @@ PROTOCOL.md                    wire protocol + implementation notes
 Built against the [Dungeondraft Modding API](https://megasploot.github.io/DungeondraftModdingAPI/).
 
 Expanded terrain slots, wall editing, image import, water, materials, the
-level and layer tools, layout checks and native/UI access were first built by
+level and layer tools, layout checks, native/UI access, light and text editing,
+scatter and batch were first built by
 Li-Jiaquan in [dungeondraft-mcp-bridge](https://github.com/Li-Jiaquan/dungeondraft-mcp-bridge),
 a fork of this project, and were ported back from there.
 Engine is Godot 3.4.2, so the GDScript uses Godot 3 networking class names.

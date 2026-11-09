@@ -11,8 +11,10 @@ list_assets(category, search=...).
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
+import random
 import tempfile
 import time
 from typing import Any, Optional
@@ -188,7 +190,8 @@ def list_layers() -> dict:
     caves, floor, water, portals, walls, roofs). The others are where objects,
     paths, pattern floors and materials can go: by default -400 'Below Ground',
     -100 'Below Water', 100-400 'User Layer 1-4', 700 'Above Walls', 900 'Above
-    Roofs'. The bridge creates objects and paths on 0 unless told otherwise.
+    Roofs'. New objects and paths go on 100 unless told otherwise, as in
+    Dungeondraft itself; on one layer, later objects draw over earlier ones.
     """
     return bridge.request("list_layers")
 
@@ -206,7 +209,7 @@ def place_object(
     rotation: float = 0.0,
     sorting: int = 0,
     color: str = "",
-    layer: int = 0,
+    layer: int = spatial.DEFAULT_LAYER,
     check: bool = False,
     allow_overlap: bool = False,
     region: str = "",
@@ -217,7 +220,7 @@ def place_object(
     x, y: woxel coordinates; defaults to map center. rotation: degrees.
     sorting: 0=over, 1=under the other objects on the same layer.
     layer: draw layer (see list_layers); a higher layer always draws on top.
-    Objects placed by hand in Dungeondraft go on 100 by default.
+    The default, 100, is the one Dungeondraft's own Object tool uses.
     color: '#rrggbb' custom color. Only 'Colorable' assets (red-mask areas) take
     one; with no color they get DD's default '#6b3834'. On other assets color is
     ignored and the result carries a 'warning'. The result reports the applied color.
@@ -238,8 +241,7 @@ def place_object(
         params["y"] = y
     if color:
         params["color"] = color
-    if layer:
-        params["layer"] = layer
+    params["layer"] = layer
     if check or region:
         _refuse_if_blocked("place_object", params, allow_overlap, region)
     return bridge.request("place_object", **params)
@@ -269,7 +271,7 @@ def draw_wall(
 def draw_path(
     points: list[list[float]],
     asset: str,
-    layer: int = 0,
+    layer: int = spatial.DEFAULT_LAYER,
     sorting: int = 0,
     smoothness: Optional[float] = None,
     width: Optional[float] = None,
@@ -277,6 +279,8 @@ def draw_path(
     """Draw a path/road/river through a list of [x, y] woxel points. Returns the new element id.
 
     asset: a Paths asset path from list_assets(category='Paths').
+    layer: draw layer (see list_layers); on the default, 100, a path lies under
+    the objects placed there. sorting: 0=over, 1=under other paths on its layer.
     smoothness: optional curve smoothing. width: optional width scale multiplier.
     """
     params = {"points": points, "asset": asset, "layer": layer, "sorting": sorting}
@@ -521,7 +525,7 @@ def import_image(
     rotation: float = 0.0,
     sorting: int = 0,
     shadow: bool = True,
-    layer: int = 0,
+    layer: int = spatial.DEFAULT_LAYER,
     check: bool = False,
     allow_overlap: bool = False,
     region: str = "",
@@ -550,9 +554,8 @@ def import_image(
     params: dict = {
         "path": os.path.abspath(os.path.expanduser(path)),
         "scale": scale, "rotation": rotation, "sorting": sorting, "shadow": shadow,
+        "layer": layer,
     }
-    if layer:
-        params["layer"] = layer
     if x is not None:
         params["x"] = x
     if y is not None:
@@ -560,6 +563,101 @@ def import_image(
     if check or region:
         _refuse_if_blocked("import_image", params, allow_overlap, region)
     return bridge.request("import_image", **params)
+
+
+@mcp.tool()
+def set_trace_image(
+    path: str = "",
+    x: Optional[float] = None,
+    y: Optional[float] = None,
+    scale: float = 1.0,
+    opacity: float = 0.5,
+) -> dict:
+    """Show a reference image over the map to trace from, or remove it with an empty path.
+
+    For rebuilding a map from a picture: put a floor plan or sketch on screen,
+    draw walls and floors over it, and compare with screenshot. Unlike
+    import_image it is not part of the map: Dungeondraft leaves it out of
+    exports, and there is only one at a time.
+
+    path: absolute path to a .png, .jpg or .webp. x, y: woxel position of its
+    center (defaults to the map center). scale: 256 image pixels cover one tile
+    at 1.0. opacity: 0-1.
+    """
+    if not path:
+        return bridge.request("set_trace_image", path="")
+    params: dict = {"path": os.path.abspath(os.path.expanduser(path)), "scale": scale, "opacity": opacity}
+    if x is not None:
+        params["x"] = x
+    if y is not None:
+        params["y"] = y
+    return bridge.request("set_trace_image", **params)
+
+
+@mcp.tool()
+def scatter_objects(
+    assets: list[str],
+    rect: Optional[list[float]] = None,
+    points: Optional[list[list[float]]] = None,
+    count: int = 20,
+    seed: int = 0,
+    min_scale: float = 0.8,
+    max_scale: float = 1.2,
+    random_rotation: bool = True,
+    layer: int = spatial.DEFAULT_LAYER,
+    allow_overlap: bool = False,
+) -> dict:
+    """Scatter objects at random over an area in one call: a stand of trees, rocks, rubble, crates.
+
+    assets: one or more Objects asset paths; each object picks one at random.
+    Provide ONE of rect: [x, y, w, h] or points: [[x,y], ...] (>= 3), in
+    woxels; object centers fall inside it. count: how many to place (1-200).
+    seed: the same seed gives the same scatter. min_scale / max_scale: each
+    object's scale is drawn from this range. random_rotation: turn each one
+    freely (pass False for things that should stay upright).
+
+    Every spot is checked like place_object(check=True): nothing lands across
+    a wall, in a doorway, off the map or in a 'clearance' region, and objects
+    don't overlap each other or what is already there. allow_overlap=True lets
+    them overlap, which is what a forest canopy needs. Spots that fail are
+    re-drawn, so fewer than count may fit; the result says how many were placed
+    and returns their ids. Each object is a separate undo() step.
+    """
+    if (rect is None) == (points is None):
+        raise ValueError("provide exactly one of 'rect' or 'points'")
+    if not assets or not 1 <= count <= 200:
+        raise ValueError("give at least one asset and a count from 1 to 200")
+    if not 0 < min_scale <= max_scale:
+        raise ValueError("need 0 < min_scale <= max_scale")
+    area = _shape_polygon(rect, points)
+    if len(area) < 3 or spatial.area(area) <= 0:
+        raise ValueError("the scatter area needs at least 3 points and some area")
+    locals_ = {a: bridge.request("asset_footprint", asset=a)["local"] for a in dict.fromkeys(assets)}
+    scene = bridge.request("spatial_snapshot")
+    x0, y0, x1, y1 = spatial.bounds(area)
+    rng = random.Random(seed)
+    ids: list[int] = []
+    attempts = 0
+    while len(ids) < count and attempts < count * 30:
+        attempts += 1
+        x, y = round(rng.uniform(x0, x1), 1), round(rng.uniform(y0, y1), 1)
+        asset = rng.choice(assets)
+        s = round(rng.uniform(min_scale, max_scale), 3)
+        turn = round(rng.uniform(0, 360), 1) if random_rotation else 0.0
+        if not spatial.point_in_polygon((x, y), area):
+            continue
+        footprint = spatial.transform(locals_[asset], (x, y), (s, s), turn)
+        if spatial.check_footprint(scene, footprint, layer=layer, allow_overlap=allow_overlap):
+            continue
+        made = bridge.request("place_object", asset=asset, x=x, y=y, scale=s, rotation=turn, layer=layer)
+        ids.append(made["id"])
+        # Later objects must keep clear of this one too.
+        scene["objects"].append({"id": made["id"], "asset": asset, "layer": layer, "polygon": footprint})
+    result: dict = {"placed": len(ids), "requested": count, "ids": ids, "seed": seed}
+    if len(ids) < count:
+        result["note"] = (f"only {len(ids)} of {count} fit after {attempts} tries; "
+                          "use a larger area, smaller scales or allow_overlap=True")
+    return result
 
 
 @mcp.tool()
@@ -838,14 +936,18 @@ def modify_object(
     rotation: Optional[float] = None,
     color: str = "",
     shadow: Optional[bool] = None,
+    mirror: Optional[bool] = None,
+    block_light: Optional[bool] = None,
     check: bool = False,
     allow_overlap: bool = False,
     region: str = "",
 ) -> dict:
-    """Modify an existing object's scale, rotation (degrees), color ('#rrggbb') and/or shadow flag by id.
+    """Modify an existing object by id: scale, rotation (degrees), color ('#rrggbb'), shadow, mirror, block_light.
 
     color applies only to 'Colorable' objects; otherwise it is ignored and the
     result has a 'warning'. The returned descriptor includes 'colorable' and 'color'.
+    mirror: flip the object left-to-right. block_light: make it cast shadows
+    from lights, following its silhouette (a pillar, a statue, a big crate).
 
     check / allow_overlap / region: the placement check as in place_object,
     applied to the footprint after the new scale and rotation.
@@ -859,6 +961,10 @@ def modify_object(
         params["color"] = color
     if shadow is not None:
         params["shadow"] = shadow
+    if mirror is not None:
+        params["mirror"] = mirror
+    if block_light is not None:
+        params["block_light"] = block_light
     if check or region:
         _refuse_if_blocked("modify_object", params, allow_overlap, region)
     return bridge.request("modify_object", **params)
@@ -908,6 +1014,64 @@ def modify_wall(
     if shadow is not None:
         params["shadow"] = shadow
     return bridge.request("modify_wall", **params)
+
+
+@mcp.tool()
+def modify_light(
+    id: int,
+    color: str = "",
+    energy: Optional[float] = None,
+    range: Optional[float] = None,
+    shadows: Optional[bool] = None,
+    rotation: Optional[float] = None,
+    asset: str = "",
+) -> dict:
+    """Change an existing light by id: color, brightness, size, shadows, rotation or texture. Returns the light.
+
+    color: '#rrggbb'. energy: brightness (>= 0). range: size as a multiple of
+    the light's texture, as in add_light (1.0 fades out about 2 tiles from the
+    center). shadows: whether walls and light-blocking objects cut it off.
+    rotation: degrees, for a directional texture. asset: a Lights asset path.
+    Anything omitted is kept; move a light with move_element. Undoable.
+    """
+    params: dict = {"id": id}
+    if color:
+        params["color"] = color
+    if energy is not None:
+        params["energy"] = energy
+    if range is not None:
+        params["range"] = range
+    if shadows is not None:
+        params["shadows"] = shadows
+    if rotation is not None:
+        params["rotation"] = rotation
+    if asset:
+        params["asset"] = asset
+    return bridge.request("modify_light", **params)
+
+
+@mcp.tool()
+def modify_text(
+    id: int,
+    text: Optional[str] = None,
+    size: Optional[int] = None,
+    color: str = "",
+    font: str = "",
+) -> dict:
+    """Change an existing text label by id: its wording, font size, color or font. Returns the label.
+
+    Anything omitted is kept; move a label with move_element. Undoable.
+    """
+    params: dict = {"id": id}
+    if text is not None:
+        params["text"] = text
+    if size is not None:
+        params["size"] = size
+    if color:
+        params["color"] = color
+    if font:
+        params["font"] = font
+    return bridge.request("modify_text", **params)
 
 
 @mcp.tool()
@@ -1078,6 +1242,36 @@ def add_layer(layer: int, label: str = "") -> dict:
     if label:
         params["label"] = label
     return bridge.request("add_layer", **params)
+
+
+@mcp.tool()
+def configure_level(
+    ambient_light: str = "",
+    lighting: Optional[bool] = None,
+    terrain_visible: Optional[bool] = None,
+    smooth_terrain: Optional[bool] = None,
+    water_shoreline: Optional[bool] = None,
+) -> dict:
+    """Read or change the current level's overall look. With no arguments it just reports the settings.
+
+    ambient_light: '#rrggbb', the color of everything no light reaches. White
+    (the default) is full daylight; a dark blue such as '#2a2f4a' makes a night
+    scene where the placed lights stand out; a dim warm gray suits a cellar.
+    lighting: turn lighting on or off. Off shows the map flat, as if fully lit.
+    Unlike the rest, this applies to every level.
+    terrain_visible: show or hide this level's terrain (see add_level).
+    smooth_terrain: blend terrain textures softly instead of with a rough edge.
+    water_shoreline: show or hide the outline drawn around this level's water.
+    Not undoable; call it again with the old values to go back.
+    """
+    params: dict = {}
+    if ambient_light:
+        params["ambient_light"] = ambient_light
+    for name, value in (("lighting", lighting), ("terrain_visible", terrain_visible),
+                        ("smooth_terrain", smooth_terrain), ("water_shoreline", water_shoreline)):
+        if value is not None:
+            params[name] = value
+    return bridge.request("configure_level", **params)
 
 
 # --------------------------------------------------------------------------
@@ -1313,7 +1507,8 @@ def check_object_placement(
     if asset:
         scene = bridge.request("spatial_snapshot", asset=asset)
         params = {"asset": asset, "x": x, "y": y, "scale": 1.0 if scale is None else scale,
-                  "rotation": rotation or 0.0, "layer": layer or 0}
+                  "rotation": rotation or 0.0,
+                  "layer": spatial.DEFAULT_LAYER if layer is None else layer}
         proposal = spatial.proposed_footprint(scene, "place_object", params)
     else:
         scene = bridge.request("spatial_snapshot")
@@ -1539,6 +1734,62 @@ def undo() -> dict:
 def redo() -> dict:
     """Re-apply the last edit reversed by undo()."""
     return bridge.request("redo")
+
+
+# --------------------------------------------------------------------------
+# Batch
+# --------------------------------------------------------------------------
+
+# Tools batch() won't run: the ones that return an image, the one that swaps
+# the map out from under the rest of the batch, and itself.
+_NOT_BATCHABLE = {"batch", "screenshot", "export_map", "export_uvtt", "open_map"}
+
+
+@mcp.tool()
+def batch(calls: list[dict], stop_on_error: bool = True) -> dict:
+    """Run several tool calls in order in one request. Use it for runs of independent edits.
+
+    calls: [{"tool": "<tool name>", "args": {...}}, ...] (up to 100), with the
+    same names and arguments as the tools themselves, e.g.
+      [{"tool": "place_object", "args": {"asset": "...", "x": 1024, "y": 768}},
+       {"tool": "add_light", "args": {"x": 1024, "y": 768, "range": 1.5}}]
+    A later call cannot use an earlier call's result (such as a new id); when
+    you need one, end the batch there. Not available inside a batch:
+    screenshot, export_map, export_uvtt, open_map.
+
+    Returns one entry per call that ran: {tool, ok, result} or {tool, ok: false,
+    error}. With stop_on_error (the default) the batch stops at the first
+    failure, leaving the earlier calls done: it is not all-or-nothing. Each
+    edit is still its own undo() step.
+    """
+    if not 1 <= len(calls) <= 100:
+        raise ValueError("give 1 to 100 calls")
+    results: list[dict] = []
+    for call in calls:
+        name = call.get("tool", "") if isinstance(call, dict) else ""
+        entry: dict = {"tool": name}
+        try:
+            if name in _NOT_BATCHABLE:
+                raise ValueError(f"'{name}' cannot be used inside a batch")
+            if name not in _TOOLS:
+                raise ValueError(f"unknown tool '{name}'")
+            args = call.get("args") or {}
+            if not isinstance(args, dict):
+                raise ValueError("'args' must be an object of argument names to values")
+            entry.update(ok=True, result=_TOOLS[name](**args))
+        except (BridgeError, ValueError, TypeError) as exc:
+            entry.update(ok=False, error=str(exc))
+        results.append(entry)
+        if not entry["ok"] and stop_on_error:
+            break
+    return {"requested": len(calls), "ran": len(results),
+            "failed": sum(1 for r in results if not r["ok"]), "results": results}
+
+
+# Every tool above by name, for batch(). Tools are this module's public
+# functions; helpers start with an underscore.
+_TOOLS = {name: fn for name, fn in list(globals().items())
+          if inspect.isfunction(fn) and fn.__module__ == __name__ and not name.startswith("_")}
 
 
 def main() -> None:

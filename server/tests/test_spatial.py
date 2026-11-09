@@ -165,9 +165,10 @@ class Proposals(unittest.TestCase):
         self.assertEqual(spatial.bounds(p.polygon), (300.0, 500.0, 700.0, 700.0))
         self.assertEqual((p.layer, p.ignore_id), (200, None))
 
-    def test_new_object_defaults_to_the_map_center(self):
+    def test_new_object_defaults_to_the_map_center_and_the_default_layer(self):
         p = spatial.proposed_footprint(self.scene, "place_object", {"asset": "x"})
         self.assertEqual(spatial.centroid(p.polygon), (2560.0, 2560.0))
+        self.assertEqual(p.layer, spatial.DEFAULT_LAYER)
 
     def test_move_keeps_rotation_and_ignores_itself(self):
         p = spatial.proposed_footprint(self.scene, "move_element", {"id": 10, "x": 3000, "y": 3000})
@@ -181,6 +182,15 @@ class Proposals(unittest.TestCase):
         x0, y0, x1, y1 = spatial.bounds(p.polygon)
         self.assertAlmostEqual(x1 - x0, 400.0)
         self.assertAlmostEqual(y1 - y0, 200.0)
+
+    def test_mirror_flips_an_off_center_footprint_and_a_rescale_keeps_the_flip(self):
+        lopsided = dict(obj(11, 1000, 1000), local=[(0, -50), (200, -50), (200, 50), (0, 50)])
+        self.assertEqual(spatial.bounds(spatial.moved(lopsided).polygon)[::2], (1000.0, 1200.0))
+        flipped = spatial.moved(lopsided, mirror=True)
+        self.assertEqual(spatial.bounds(flipped.polygon)[::2], (800.0, 1000.0))
+        already = dict(lopsided, scale=[-1.0, 1.0])
+        self.assertEqual(spatial.bounds(spatial.moved(already, scale=2).polygon)[::2], (600.0, 1000.0))
+        self.assertEqual(spatial.bounds(spatial.moved(already, mirror=False).polygon)[::2], (1000.0, 1200.0))
 
     def test_duplicate_may_overlap_its_source(self):
         p = spatial.proposed_footprint(self.scene, "duplicate_object", {"id": 10, "dx": 10, "dy": 0})

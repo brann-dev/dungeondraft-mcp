@@ -40,6 +40,11 @@ blindly.
   are intended (chairs under a table, canopies) take `allow_overlap=True`, or a
   different `layer` (rugs lower, tabletop items higher). Footprints are
   rectangles, so still look at a `screenshot`.
+- Objects and paths go on layer 100 by default, like Dungeondraft's own tools;
+  on one layer later objects cover earlier ones, and a higher layer always wins.
+- `configure_level(ambient_light=...)` sets the mood (a dark blue for night
+  makes the placed lights glow). `batch` runs many independent edits in one
+  call, and `scatter_objects` fills an area with trees or rubble.
 - Levels are listed **top floor first**; a level's `index` shifts when levels
   are added or cloned (new ones land at index 0). Its `id` holds while the map
   is open but is reassigned on load.
