@@ -35,7 +35,7 @@ forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
 
 ## What the AI can do
 
-- **Inspect:** `ping`, `get_status`, `list_levels`, `list_elements`,
+- **Inspect:** `ping` (also says whether the user has paused AI edits), `get_status`, `list_levels`, `list_elements`,
   `get_element`, `list_asset_categories`, `list_assets` (with substring search),
   `get_terrain` (read the painted terrain back as a grid of slot weights).
 - **Asset packs:** `list_asset_packs` (which packs are installed, and which
@@ -171,6 +171,14 @@ python3 -m venv .venv
 
 This installs the `dungeondraft_mcp` package and creates the
 `.venv/bin/dungeondraft-mcp` entrypoint.
+
+The first time Dungeondraft starts with the mod, the mod writes a random token
+to Dungeondraft's user folder (next to `config.ini`); the server reads it from
+there, so nothing needs configuring. Only a program that can read your files
+can drive your map. The **MCP Bridge** panel under Dungeondraft's Settings
+shows what the bridge is doing and holds the controls that are yours alone:
+**Pause AI edits** (read-only tools keep working), **Undo the assistant's
+last step**, and the token switch.
 
 ### 3. Verify the bridge works
 

@@ -34,7 +34,14 @@ from .bridge_client import BridgeClient, BridgeError
 HOST = os.environ.get("DD_BRIDGE_HOST", "127.0.0.1")
 PORT = int(os.environ.get("DD_BRIDGE_PORT", "8787"))
 
-mcp = FastMCP("dungeondraft")
+INSTRUCTIONS = """These tools drive a running Dungeondraft through its MCP Bridge mod. Call ping,
+then get_status, before anything else. If a call fails with "paused", the user
+paused AI edits in Dungeondraft's MCP Bridge panel: tell them, and make no edits
+until they resume (read-only tools still work). If a call fails with a token
+error, this server and the mod do not share the bridge token: say so and stop;
+restarting Dungeondraft and reconnecting the server fixes it."""
+
+mcp = FastMCP("dungeondraft", instructions=INSTRUCTIONS)
 
 # The open undo group, if any: every bridge request made inside _undo_group()
 # carries its token, so the mod records those edits as one undo() step and can
@@ -200,13 +207,19 @@ def _refuse_if_protected(what: str, **shape) -> None:
 
 @_tool()
 def ping() -> dict:
-    """Check connectivity to the running Dungeondraft bridge and report the Godot engine version."""
+    """Check connectivity to the running Dungeondraft bridge: protocol version, engine, whether this server is authenticated, and whether the user has paused AI edits.
+
+    ping answers without a token, so it can diagnose a token problem:
+    authenticated=False with auth="token" means the mod and this server do
+    not share the bridge token. paused=True means every editing tool will be
+    refused until the user resumes in Dungeondraft's MCP Bridge panel.
+    """
     return bridge.request("ping")
 
 
 @_tool()
 def get_status() -> dict:
-    """Report the current map: whether one is open, its size and center in woxels, per-type element counts, and level info.
+    """Report the current map: whether one is open, its size and center in woxels, per-type element counts, level info, and whether AI edits are paused.
 
     Call this first — map_center is the default placement point, and counts tell you what's already on the map.
     """
