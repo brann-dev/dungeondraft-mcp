@@ -23,7 +23,7 @@ mod/      ── Dungeondraft MOD（GDScript、DD 内で動作）
 
 MOD は Dungeondraft の内部で TCP サーバーを開き、毎フレーム `update(delta)` フックからポーリングします。Python 側は各機能を MCP ツールとして公開し、呼び出しを JSON で転送します。通信形式は [PROTOCOL.md](PROTOCOL.md)（英語）を参照してください。
 
-> **状態：動作中。** **Godot 3.4.2** ベースの Dungeondraft でエンドツーエンドの動作を確認済みです。MOD のサンドボックスから素の TCP が使えるため、代替手段は不要です。クエリ、作成、配置、変更、地形、水域、マテリアル、レベル、レイヤー、レイアウトとシーンのチェック、アセットパック、マップファイル、VTT のインポートとエクスポート、選択、キャプチャ、カメラ、履歴、マップの保存と読み込みにわたる 100 個のツールに加え、Dungeondraft 自身の API と UI に直接アクセスする最終手段も用意しています（下記参照）。
+> **状態：動作中。** **Godot 3.4.2** ベースの Dungeondraft でエンドツーエンドの動作を確認済みです。MOD のサンドボックスから素の TCP が使えるため、代替手段は不要です。クエリ、作成、配置、変更、地形、水域、マテリアル、レベル、レイヤー、レイアウトとシーンのチェック、アセットパック、マップファイル、VTT のインポートとエクスポート、選択、キャプチャ、カメラ、履歴、マップの保存と読み込みにわたる 101 個のツールに加え、Dungeondraft 自身の API と UI に直接アクセスする最終手段も用意しています（下記参照）。
 
 ## AI にできること
 
@@ -33,7 +33,7 @@ MOD は Dungeondraft の内部で TCP サーバーを開き、毎フレーム `u
 - **地形：** `set_terrain_slot`、`fill_terrain`（レベル全体）、`fill_region`（矩形または多角形。たとえば 1 部屋分の床）、`paint_terrain`（ソフトブラシ）、`paint_path`（折れ線に沿ったなめらかな連続ストローク。道や小道に）。既定ではスロット 0〜3 を使います。`set_terrain_slot(..., expand=True)` でそのレベルのスロット 4〜7 を有効にできます。
 - **水域とマテリアル：** `draw_water`（湖・川・堀を矩形または多角形で描画します。岸辺と深さのグラデーション付きで、`erase` を使うと島を切り抜けます）と `draw_material`（溶岩・氷・石畳などのマテリアルブラシのテクスチャを、指定したレイヤーに矩形または多角形で塗ります）。
 - **洞窟：** `dig_cave` はパスに沿って洞窟やトンネルを掘ります（洞窟ブラシに相当します。岩盤から床を掘り出し、岩壁とがれきを自動生成します。`dig=false` で埋め戻し。床と壁の色合いも指定できます）。`clear_caves` は洞窟レイヤー全体を消去します。
-- **編集：** `move_element`、`move_elements`（複数の要素を同じオフセットで移動）、`modify_object`（拡大縮小、回転、色、影、反転、光の遮断）、`modify_wall`（壁の形や見た目を変更します。取り付けられたドアや窓はそのまま残り、壁の区間に合わせて移動します）、`modify_light`、`modify_text`、`duplicate_object`、`delete_element`、`delete_elements`、`select_elements`、`clear_selection`。`set_map_style` はマップ全体の建物の劣化具合とグリッドの線種を設定します。`set_map_size` は Dungeondraft 自身の Change Map Size と同じように、マップのサイズをタイル数で変更します。配置系のツールに `snap=True` を渡すとユーザーのグリッドに合わせて置かれます。Lievven 氏の Custom Snap Mod が読み込まれていれば、その六角形グリッドやアイソメトリックグリッドにも対応します。`get_snap_settings` はその設定を読み取ります。
+- **編集：** `move_element`、`move_elements`（複数の要素を同じオフセットで移動）、`modify_object`（拡大縮小、回転、色、影、反転、光の遮断）、`modify_wall`（壁の形や見た目を変更します。取り付けられたドアや窓はそのまま残り、壁の区間に合わせて移動します）、`modify_light`、`modify_text`、`duplicate_object`、`delete_element`、`delete_elements`、`select_elements`、`clear_selection`。`set_map_style` はマップ全体の建物の劣化具合とグリッドの線種を設定します。`set_map_size` は Dungeondraft 自身の Change Map Size と同じように、マップのサイズをタイル数で変更します。`crop_map` はどの辺からでもマップを切り取って指定した範囲のタイルだけを残し、削除される内容を先にプレビューできます。配置系のツールに `snap=True` を渡すとユーザーのグリッドに合わせて置かれます。Lievven 氏の Custom Snap Mod が読み込まれていれば、その六角形グリッドやアイソメトリックグリッドにも対応します。`get_snap_settings` はその設定を読み取ります。
 - **レベル：** `add_level`、`set_level`、`rename_level`、`clone_level`（フロア全体をコピーして次の階の出発点にします）、`delete_level`、`reorder_levels`、`compare_levels`（別のフロアを現在のフロアの下に薄く表示して位置を合わせます）、`configure_level`（夕暮れや夜の場面のための環境光、ライティングのオン/オフ、地形の表示とブレンド、水域の岸辺）。
 - **レイヤー：** `list_layers`、`set_element_layer`（何が何を覆うかを決めます。ラグはテーブルの下、樹冠は小道の上など）、`add_layer`。`place_object` と `import_image` でも `layer` を指定できます。
 - **レイアウトチェック：** `get_asset_footprint`（アセットの実際の大きさ。スケールを決める前に確認します）、`check_object_placement`（場所を試します。壁をまたがないか、ドアをふさがないか、何かに重ならないか）、`validate_layout`（家具を置き終えたレベルを点検します）、`validate_floorplan`（家具を置く前に確認します。すべての部屋に到達できるか、すべてのドアがどこかに通じているか、入口はあるか）、`validate_scene`（何も塗られていないむき出しの地面と、目に見える光源のないライト）、そして部屋・空けておく区域・保護する地面を登録する `set_spatial_region` / `remove_spatial_region` / `list_spatial_regions`。オブジェクト系のツールに `check=True` を渡すと、不適切な配置をその場で拒否します。地形・洞窟・水域・マテリアルの編集は `protected`（保護）区域には触れません。
