@@ -52,6 +52,7 @@ const READ_ONLY_CMDS := [
 	"native_targets", "native_describe", "native_get", "ui_tree",
 	"spatial_snapshot", "asset_footprint", "list_spatial_regions", "list_checkpoints",
 	"get_map_style", "list_prefabs", "generator_options", "select_elements", "clear_selection",
+	"get_snap_settings",
 ]
 # Neutral opaque tint for pattern floors when no color is given. PatternShapeTool
 # has no per-texture default (and its .Color leaks across calls), so we apply a
@@ -319,6 +320,8 @@ func _record_and_dispatch(req : Dictionary) -> Dictionary:
 			_close_all_groups()
 	if cmd in HISTORY_CMDS:
 		_close_all_groups()
+	if bool(req.get("snap", false)):
+		_snap_request(req)
 
 	var result = _safe_dispatch(req)
 	if typeof(result) == TYPE_DICTIONARY and result.get("ok", false):
@@ -850,10 +853,12 @@ func _safe_dispatch(req : Dictionary) -> Dictionary:
 		"reorder_levels": return _reorder_levels(req)
 		"compare_levels": return _compare_levels(req)
 		"delete_level": return _delete_level(req)
+		"set_map_size": return _set_map_size(req)
 		"list_layers": return _list_layers()
 		"add_layer": return _add_layer(req)
 		"configure_level": return _configure_level(req)
 		"get_map_style": return _get_map_style()
+		"get_snap_settings": return _get_snap_settings(req)
 		"list_prefabs": return _list_prefabs(req)
 		"place_prefab": return _place_prefab(req)
 		"generator_options": return _generator_options()
@@ -4436,6 +4441,211 @@ func _restore_map_style(snap : Dictionary) -> void:
 # ---------------------------------------------------------------------------
 # Prefabs (groups saved with the Prefab settings) and the Map Wizard generator
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Snapping to the user's grid
+# ---------------------------------------------------------------------------
+
+const SNAP_MOD_TOOL := "snappy_mod"   # Lievven's Custom Snap Mod registers this tool
+const SNAP_GEOMETRY_NAMES := ["square", "hex_vertical", "hex_horizontal", "isometric"]
+
+# The Custom Snap Mod's script instance when it is loaded, else null.
+func _snap_mod():
+	if not Global.Editor.Tools.has(SNAP_MOD_TOOL):
+		return null
+	var wrapper = Global.Editor.Tools[SNAP_MOD_TOOL]
+	if wrapper == null or not wrapper.has_method("get_ScriptInstance"):
+		return null
+	var instance = wrapper.get_ScriptInstance()
+	if instance == null or typeof(instance) != TYPE_OBJECT or not instance.has_method("get_snapped_position"):
+		return null
+	return instance
+
+
+# Where the user's cursor would snap: the Custom Snap Mod's grid when the mod
+# is loaded (it falls back to Dungeondraft's own when its snapping is off),
+# else Dungeondraft's half-tile grid. The editor's snap toggle is for the
+# mouse; a request that asks to snap always does.
+func _snap_point(p : Vector2) -> Vector2:
+	var mod = _snap_mod()
+	if mod != null:
+		var snapped = mod.get_snapped_position(p)
+		if typeof(snapped) == TYPE_VECTOR2:
+			return snapped
+	if Global.WorldUI != null and Global.WorldUI.has_method("GetSnappedPosition"):
+		return Global.WorldUI.GetSnappedPosition(p)
+	return Vector2(stepify(p.x, 128.0), stepify(p.y, 128.0))
+
+
+# Snap a request's x/y, every point and a rect's two corners in place, so
+# every handler (and the ones build_room dispatches inside) sees grid points.
+func _snap_request(req : Dictionary) -> void:
+	if req.has("x") and req.has("y"):
+		var p = _snap_point(Vector2(float(req["x"]), float(req["y"])))
+		req["x"] = p.x
+		req["y"] = p.y
+	if typeof(req.get("points")) == TYPE_ARRAY:
+		var out := []
+		for raw in req["points"]:
+			if typeof(raw) == TYPE_ARRAY and raw.size() >= 2:
+				var p2 = _snap_point(Vector2(float(raw[0]), float(raw[1])))
+				out.append([p2.x, p2.y])
+			else:
+				out.append(raw)
+		req["points"] = out
+	if typeof(req.get("rect")) == TYPE_ARRAY and req["rect"].size() >= 4:
+		var r = req["rect"]
+		var a = _snap_point(Vector2(float(r[0]), float(r[1])))
+		var b = _snap_point(Vector2(float(r[0]) + float(r[2]), float(r[1]) + float(r[3])))
+		req["rect"] = [a.x, a.y, b.x - a.x, b.y - a.y]
+
+
+func _get_snap_settings(req : Dictionary) -> Dictionary:
+	var out := { "vanilla_snapping": bool(Global.Editor.IsSnapping), "mod_loaded": false }
+	if Global.WorldUI != null:
+		out["half_snap"] = bool(Global.WorldUI.get("UseHalfSnap"))
+		var cell = Global.WorldUI.get("CellSize")
+		if typeof(cell) == TYPE_VECTOR2:
+			out["cell_size"] = [cell.x, cell.y]
+	var mod = _snap_mod()
+	if mod != null:
+		out["mod_loaded"] = true
+		var geometry = mod.get("active_geometry")
+		out["mod"] = {
+			"enabled": bool(mod.get("custom_snap_enabled")),
+			"geometry": SNAP_GEOMETRY_NAMES[int(geometry)] if typeof(geometry) == TYPE_INT and int(geometry) >= 0 and int(geometry) < SNAP_GEOMETRY_NAMES.size() else str(geometry),
+			"interval": _vec(mod.get("snap_interval")) if typeof(mod.get("snap_interval")) == TYPE_VECTOR2 else null,
+			"offset": _vec(mod.get("snap_offset")) if typeof(mod.get("snap_offset")) == TYPE_VECTOR2 else null,
+			"radius_to_corner": mod.get("radial_mode_to_corner"),
+		}
+		var presets = mod.get("preset_options")
+		var chosen = mod.get("preset_menu_setting")
+		if typeof(presets) == TYPE_ARRAY and typeof(chosen) == TYPE_INT and chosen >= 0 \
+				and chosen < presets.size() and typeof(presets[chosen]) == TYPE_DICTIONARY:
+			out["mod"]["preset"] = str(presets[chosen].get("preset_name", ""))
+	var points = req.get("points", [])
+	if typeof(points) == TYPE_ARRAY and not points.empty():
+		if points.size() > 200:
+			return _err("'points' is capped at 200")
+		var snapped := []
+		for p in _points(points):
+			snapped.append(_vec(_snap_point(p)))
+		out["snapped"] = snapped
+	return _ok(out)
+
+
+# ---------------------------------------------------------------------------
+# Map size
+# ---------------------------------------------------------------------------
+
+const MAP_SIZE_WINDOW := "ChangeMapSize"
+const MAP_TILES_MIN := 8
+const MAP_TILES_MAX := 128
+const SPLAT_PX_PER_TILE := 4
+const MAP_SIZE_HANDLERS := ["_on_ChangeMapSizeWindow_about_to_show", "_on_RightSpinBox_value_changed",
+	"_on_BottomSpinBox_value_changed", "_on_OkayButton_pressed"]
+
+# Dungeondraft's Change Map Size window, when this build has it with the
+# handlers the bridge drives. Its OK handler is Master.ChangeMapSize, which
+# resizes every level's terrain, cave and floor layers together; setting the
+# World's size directly is the path that wrote maps Dungeondraft could not
+# reopen, so it is never used.
+func _map_size_window():
+	var windows = Global.Editor.get("Windows")
+	if typeof(windows) != TYPE_DICTIONARY or not windows.has(MAP_SIZE_WINDOW):
+		return null
+	var win = windows[MAP_SIZE_WINDOW]
+	if win == null or not is_instance_valid(win):
+		return null
+	for m in MAP_SIZE_HANDLERS:
+		if not win.has_method(m):
+			return null
+	for side in ["Top", "Bottom", "Left", "Right"]:
+		if win.find_node(side + "SpinBox", true, false) == null:
+			return null
+	return win
+
+
+func _map_size_side(win, side : String, value : int) -> void:
+	var spin = win.find_node(side + "SpinBox", true, false)
+	spin.set_value(float(value))
+	win.call("_on_%sSpinBox_value_changed" % side, float(value))
+
+
+# Grow or trim the map on its right and bottom edges, in tiles. The top-left
+# corner stays, so nothing placed moves. The top and left edges are not
+# offered: Dungeondraft's own trim there loses terrain paint near the far
+# edges and leaves cave borders behind their floor.
+func _set_map_size(req : Dictionary) -> Dictionary:
+	if not req.has("width") or not req.has("height"):
+		return _err("'width' and 'height' are required, in tiles")
+	var w = int(req["width"])
+	var h = int(req["height"])
+	if w < MAP_TILES_MIN or h < MAP_TILES_MIN or w > MAP_TILES_MAX or h > MAP_TILES_MAX:
+		return _err("width and height must each be %d to %d tiles" % [MAP_TILES_MIN, MAP_TILES_MAX])
+	if Global.World.GetCurrentLevel() == null:
+		return _err("no map open")
+	var win = _map_size_window()
+	if win == null:
+		return _err("this Dungeondraft build does not expose the Change Map Size window the bridge drives; " +
+			"create the map at the size you need from the New Map dialog")
+	var old_w = int(Global.World.Width)
+	var old_h = int(Global.World.Height)
+	var right = w - old_w
+	var bottom = h - old_h
+	if right == 0 and bottom == 0:
+		return _ok({ "width_tiles": w, "height_tiles": h, "changed": false })
+	# The spin boxes cap each step; a bigger change takes several.
+	var limit := 64
+	var probe = win.find_node("RightSpinBox", true, false)
+	if probe != null and probe.get("max_value") != null:
+		limit = int(max(1, min(abs(probe.min_value), probe.max_value)))
+	var steps := 0
+	while (right != 0 or bottom != 0) and steps < 32:
+		var dr = int(clamp(right, -limit, limit))
+		var db = int(clamp(bottom, -limit, limit))
+		win.call("_on_ChangeMapSizeWindow_about_to_show")
+		_map_size_side(win, "Right", dr)
+		_map_size_side(win, "Bottom", db)
+		win.call("_on_OkayButton_pressed")
+		right -= dr
+		bottom -= db
+		steps += 1
+	var now_w = int(Global.World.Width)
+	var now_h = int(Global.World.Height)
+	if now_w != w or now_h != h:
+		return _err("resize did not take: asked for %dx%d, the map is %dx%d" % [w, h, now_w, now_h])
+	# Read every level's splat back: that is what the saver writes.
+	var stale := []
+	for lvl in Global.World.levels:
+		if lvl == null or lvl.Terrain == null:
+			continue
+		var img = lvl.Terrain.CloneSplatImage()
+		if img == null or img.get_width() != w * SPLAT_PX_PER_TILE or img.get_height() != h * SPLAT_PX_PER_TILE:
+			stale.append(lvl.ID)
+	if not stale.empty():
+		return _err(("the map is %dx%d but the terrain of level(s) %s was not resized with it; " +
+			"do not save this map: reopen it") % [w, h, str(stale)])
+	# Terrain and cave snapshots in history have the old size; Dungeondraft
+	# cleared its own history too. Forget ours rather than restore wrongly.
+	_forget_history()
+	return _ok({
+		"width_tiles": w, "height_tiles": h, "previous_tiles": [old_w, old_h], "changed": true,
+		"map_size_woxels": [Global.World.WoxelDimensions.x, Global.World.WoxelDimensions.y],
+		"steps": steps, "history_cleared": true,
+		"note": "the map grew or shrank on the right and bottom; nothing placed moved, and " +
+			"shrinking does not delete what now lies outside the map",
+	})
+
+
+func _forget_history() -> void:
+	_close_all_groups()
+	for op in _undo_stack:
+		_release_op(op)
+	_undo_stack = []
+	_lost_serial = _op_serial
+	_discard_redo()
+
 
 const WIZARD_DESIGNS := ["Dungeon", "Cave"]
 
