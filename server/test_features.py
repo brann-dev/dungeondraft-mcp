@@ -173,7 +173,8 @@ def main() -> int:
     x2 = s.place_object(asset, cx-700, cy+700)["id"]
     s.move_elements([x1, x2], 50, 0)
     lc = s.list_checkpoints()
-    check("checkpoint sees 3 steps", lc["checkpoints"][0]["steps_since"] == 3 and lc["checkpoints"][0]["reachable"], lc)
+    mine = next(v for v in lc["checkpoints"] if v["label"] == "test")
+    check("checkpoint sees 3 steps", mine["steps_since"] == 3 and mine["reachable"], lc)
     rbk = s.rollback_checkpoint("test")
     ids = [e["id"] for e in s.list_elements("objects", 500)["elements"]]
     check("rollback undid 3 and removed the objects", rbk["rolled_back"] == 3 and x1 not in ids and x2 not in ids, rbk)

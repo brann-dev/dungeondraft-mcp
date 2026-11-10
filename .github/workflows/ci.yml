@@ -38,3 +38,5 @@ jobs:
           chmod +x Godot_v3.4.2-stable_linux_headless.64
       - name: Compile-check the bridge script
         run: python3 tools/check_gdscript.py --godot ./Godot_v3.4.2-stable_linux_headless.64
+      - name: Shared-history code against a stand-in for Dungeondraft's History
+        run: python3 tools/test_mod_history.py --godot ./Godot_v3.4.2-stable_linux_headless.64
