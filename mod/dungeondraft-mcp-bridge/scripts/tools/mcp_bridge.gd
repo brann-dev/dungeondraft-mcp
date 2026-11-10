@@ -99,6 +99,7 @@ var _steps := {}         # native mode: serial -> { "op", "shell" } for every st
 var _adopted := {}       # native mode: instance ids of the records Dungeondraft made itself during a bridge command
 var _job = null          # native mode: the history move in flight (see _start_job)
 var _pressed_mark = null # native mode: history as it was when ui_action pressed a button (see _adopt_pressed)
+var _on_canvas = null    # is the pointer on the map view rather than on a panel; null until known (see _watch_canvas)
 var _undo_stack := []    # fallback mode: bridge-managed undo ops (see _build_op / _apply_op)
 var _redo_stack := []
 var _op_serial := 0      # numbers every op pushed; checkpoints remember where they stood
@@ -157,6 +158,7 @@ func start():
 	_native = bool(settings.get("native_history", true)) and _native_available()
 	print("[mcp-bridge] undo history: %s" % ("shared with Dungeondraft (Ctrl+Z)" if _native
 		else "the bridge's own, separate from Ctrl+Z"))
+	_watch_canvas()
 	_register_tool()
 	var prev = Engine.get_meta(META_SERVER) if Engine.has_meta(META_SERVER) else null
 	if prev != null and prev is TCP_Server and prev.is_listening():
@@ -549,7 +551,7 @@ func _checkpoint(req : Dictionary) -> Dictionary:
 		# _watch_checkpoints for how that case is kept honest.
 		var records = _dd_records()
 		var at = _dd_bookmark()
-		var anchor = records[at].get_instance_id() if at >= 0 and at < records.size() else 0
+		var anchor = _record_key(records[at]) if at >= 0 and at < records.size() else 0
 		_checkpoints[label] = { "label": label, "anchor": anchor, "first": 0, "lost": false,
 			"opened": OS.get_ticks_msec() }
 		return _ok({ "label": label, "undo_depth": at + 1, "history_limit": _max_undos(),
@@ -726,9 +728,18 @@ func _record_owner(record) -> String:
 	return "user"
 
 
-func _record_index(records : Array, id : int) -> int:
+# What a checkpoint remembers a record by. A bridge step is recorded again in
+# place while its undo group grows (a new record object for the same step), so
+# it goes by its serial, negated to stay apart from instance ids; any other
+# record goes by its instance id.
+func _record_key(record) -> int:
+	var serial = _serial_of(record)
+	return -serial if serial > 0 else record.get_instance_id()
+
+
+func _record_index(records : Array, key : int) -> int:
 	for i in range(records.size()):
-		if records[i].get_instance_id() == id:
+		if _record_key(records[i]) == key:
 			return i
 	return -1
 
@@ -756,10 +767,9 @@ func _history_mark() -> Dictionary:
 # its methods record their own history step (a free-standing portal, a pattern
 # floor, water, a prefab, a generated layout). They sit on top of the done
 # steps, above everything that was there before and above the bridge's steps.
-func _made_since(mark : Dictionary) -> Array:
-	var records = _dd_records()
+func _made_since(mark : Dictionary, records : Array, at : int) -> Array:
 	var made := []
-	var i = _dd_bookmark()
+	var i = at
 	while i >= 0 and i < records.size():
 		var record = records[i]
 		if mark.has(record.get_instance_id()) or _shell_of(record) != null:
@@ -784,16 +794,16 @@ func _made_since(mark : Dictionary) -> Array:
 # Without an op (a command the bridge cannot reverse itself), Dungeondraft's
 # own records of it stay and count as the assistant's.
 func _settle(op, mark : Dictionary) -> void:
-	var made = _made_since(mark)
-	if op == null:
-		for record in made:
-			_adopted[record.get_instance_id()] = true
-		if not made.empty():
-			_prune_steps()   # a new record cuts off whatever could be redone
-		return
-	var h = _dd_history()
 	var records = _dd_records()
-	var under = _dd_bookmark() - made.size()   # the newest step from before the command
+	var at = _dd_bookmark()
+	var made = _made_since(mark, records, at)
+	if op == null:
+		if not made.empty():
+			for record in made:
+				_adopted[record.get_instance_id()] = true
+			_history_changed()   # a new record cut off whatever could be redone
+		return
+	var under = at - made.size()   # the newest step from before the command
 	var live = int(_groups[0].get("serial", 0)) if not _groups.empty() else 0
 	if live > 0 and under >= 0 and under < records.size() and _serial_of(records[under]) == live:
 		var step = _steps[live]
@@ -805,8 +815,7 @@ func _settle(op, mark : Dictionary) -> void:
 		if made.size() > 0 or under < records.size() - 1:
 			# Something lies above the step (Dungeondraft's records of this
 			# command, or steps the user undid): record it again in its place.
-			h.set("bookmark", under - 1)
-			h.CreateCustomRecord(step["shell"])
+			_put_step(step["shell"], under - 1, at)
 	else:
 		_op_serial += 1
 		var shell = McpStep.new()
@@ -815,22 +824,48 @@ func _settle(op, mark : Dictionary) -> void:
 		_steps[_op_serial] = { "op": op, "shell": shell }
 		if not _groups.empty():
 			_groups[0]["serial"] = _op_serial
-		if made.size() > 0:
-			h.set("bookmark", under)
-		h.CreateCustomRecord(shell)
+		_put_step(shell, under, at)
 	for group in _groups:
 		group["count"] = int(group.get("count", 0)) + 1
-	_prune_steps()
-	_watch_checkpoints()
+
+
+# Record a step as the newest one, with the bookmark first moved from `at` to
+# `under`, the newest record that is to stay: the recording cuts off what lay
+# above it. Like every call into Dungeondraft the result is checked: if the
+# step is not the newest record afterwards, the bookmark goes back and the
+# edit simply cannot be undone.
+func _put_step(shell, under : int, at : int) -> void:
+	var h = _dd_history()
+	if under != at:
+		h.set("bookmark", under)
+	h.CreateCustomRecord(shell)
+	var records = _dd_records()
+	var now = _dd_bookmark()
+	if now < 0 or now >= records.size() or records[now].get("ScriptInstance") != shell:
+		if under != at and now == under and at < records.size():
+			h.set("bookmark", at)
+		print("[mcp-bridge] Dungeondraft did not record a step; that edit cannot be undone")
+	_history_changed(records)
+
+
+# Dungeondraft's record list changed under the bridge's hand: drop the steps
+# it no longer holds and look after the checkpoints.
+func _history_changed(records = null) -> void:
+	if records == null:
+		records = _dd_records()
+	_prune_steps(records)
+	_watch_checkpoints(records)
 
 
 # Forget the steps Dungeondraft no longer holds: dropped off the bottom past
 # "Max undos", cut off as a redo branch by a new edit, or cleared. Nodes such
 # a step still kept out of the tree are freed here, on the main thread.
-func _prune_steps() -> void:
+func _prune_steps(records = null) -> void:
+	if records == null:
+		records = _dd_records()
 	var held := {}
 	var present := {}
-	for record in _dd_records():
+	for record in records:
 		present[record.get_instance_id()] = true
 		var serial = _serial_of(record)
 		if serial > 0:
@@ -849,12 +884,13 @@ func _prune_steps() -> void:
 # frame picks it up: those records are the assistant's, like the ones made
 # inside a command.
 func _adopt_pressed() -> void:
-	var made = _made_since(_pressed_mark)
+	var made = _made_since(_pressed_mark, _dd_records(), _dd_bookmark())
 	_pressed_mark = null
+	if made.empty():
+		return
 	for record in made:
 		_adopted[record.get_instance_id()] = true
-	if not made.empty():
-		_prune_steps()
+	_history_changed()
 
 
 # Dungeondraft is undoing or redoing one of the bridge's steps (McpStep).
@@ -922,36 +958,48 @@ func _job_tick() -> void:
 		_finish_job(_job_result(job, refusal))
 
 
-# One Undo() or Redo() for the job, with the checks Dungeondraft leaves to its
-# caller. Returns "" when the move was made, else why not.
+# One Undo() or Redo() for the job. Returns "" when the move was made, else
+# why not.
 func _job_move(job : Dictionary) -> String:
+	var move = _guarded_move(bool(job["redo"]), bool(job["include_user"]))
+	if not move["moved"]:
+		if move.has("by"):
+			job["blocked_by"] = move["by"]
+		return str(move["reason"])
+	job["moves"].append(move["summary"])
+	job["left"] = int(job["left"]) - 1
+	job["since"] = OS.get_ticks_msec()
+	return ""
+
+
+# One Undo() or Redo() with the checks Dungeondraft leaves to its caller:
+# there is a step to move to, it is one this caller may touch, and the
+# bookmark did move. The caller sees to it that Dungeondraft is free
+# (_dd_history_busy). Returns { "moved": true, "summary" } or
+# { "moved": false, "reason", "by"? }.
+func _guarded_move(redo : bool, include_user : bool) -> Dictionary:
 	var records = _dd_records()
 	var at = _dd_bookmark()
-	var redo = bool(job["redo"])
 	var index = at + 1 if redo else at
 	if index < 0 or index >= records.size():
-		return "nothing to redo" if redo else "nothing to undo"
+		return { "moved": false, "reason": "nothing to redo" if redo else "nothing to undo" }
 	var record = records[index]
-	if _record_owner(record) == "user" and not bool(job["include_user"]):
-		job["blocked_by"] = "user"
+	if _record_owner(record) == "user" and not include_user:
 		if redo:
-			return ("the step to redo is the user's own edit, made by hand in Dungeondraft. Leave it " +
-				"unless the user asked: redo(include_user=true) brings it back, and they can press " +
-				"Ctrl+Y themselves")
-		return ("the newest step is the user's own edit, made by hand in Dungeondraft. Leave it unless " +
-			"the user asked for it to be undone: undo(include_user=true) takes it back, and they can " +
-			"press Ctrl+Z themselves")
+			return { "moved": false, "by": "user", "reason": ("the step to redo is the user's own edit, " +
+				"made by hand in Dungeondraft. Leave it unless the user asked: redo(include_user=true) " +
+				"brings it back, and they can press Ctrl+Y themselves") }
+		return { "moved": false, "by": "user", "reason": ("the newest step is the user's own edit, made " +
+			"by hand in Dungeondraft. Leave it unless the user asked for it to be undone: " +
+			"undo(include_user=true) takes it back, and they can press Ctrl+Z themselves") }
 	var summary = _record_summary(record)
 	if redo:
 		_dd_history().Redo()
 	else:
 		_dd_history().Undo()
 	if _dd_bookmark() == at:
-		return "Dungeondraft did not take the step"
-	job["moves"].append(summary)
-	job["left"] = int(job["left"]) - 1
-	job["since"] = OS.get_ticks_msec()
-	return ""
+		return { "moved": false, "reason": "Dungeondraft did not take the step" }
+	return { "moved": true, "summary": summary }
 
 
 func _job_result(job : Dictionary, refusal : String) -> Dictionary:
@@ -992,24 +1040,28 @@ func _finish_job(resp : Dictionary) -> void:
 
 # A checkpoint taken with nothing to undo has no step to hold on to. It stays
 # reachable for as long as the oldest step made since is still in history, so
-# that step is noted the first time one is seen, and the checkpoint is given up
-# when it is gone, or when history was already full by then (steps may have
-# dropped off the bottom unseen). Runs before every request and after every
-# recorded step; it costs nothing unless such a checkpoint is open.
-func _watch_checkpoints() -> void:
-	var records = null
+# that step is noted the first time one is seen. The checkpoint is given up
+# when that step is gone, or when history was already full by then (steps may
+# have dropped off the bottom unseen). When everything since has been undone
+# the map is at the checkpoint again, and the next step made is the one to
+# note. Runs before every request and after every change to the record list;
+# it reads nothing unless such a checkpoint is open.
+func _watch_checkpoints(records = null) -> void:
 	for label in _checkpoints:
 		var cp = _checkpoints[label]
 		if not cp.has("first") or int(cp["anchor"]) != 0 or bool(cp["lost"]):
 			continue
 		if records == null:
 			records = _dd_records()
+		var at = _dd_bookmark()
 		if int(cp["first"]) == 0:
-			if _dd_bookmark() >= 0 and not records.empty():
-				cp["first"] = records[0].get_instance_id()
+			if at >= 0 and not records.empty():
+				cp["first"] = _record_key(records[0])
 				cp["lost"] = records.size() >= _max_undos()
 		elif _record_index(records, int(cp["first"])) < 0:
 			cp["lost"] = true
+		elif at < 0:
+			cp["first"] = 0
 
 
 # A checkpoint on the shared timeline: the steps done since it, how many of
@@ -2246,12 +2298,16 @@ func _add_text(req : Dictionary) -> Dictionary:
 		var tt = Global.Editor.Tools["TextTool"]
 		var saved_size = tt.FontSize
 		var saved_color = tt.FontColor
+		var saved_focus = tt.get("focus")
 		tt.FontSize = size
 		tt.FontColor = col
 		tt.focus = text
 		tt.UpdateText(text)
 		tt.FontSize = saved_size
 		tt.FontColor = saved_color
+		# The tool's focus is the text the user is editing: get_selection reads
+		# it, so it must not be left on a text the bridge made.
+		tt.focus = saved_focus if _live_text(saved_focus) else null
 	else:
 		# No tool available: best-effort direct set.
 		text.fontSize = size
@@ -3809,11 +3865,17 @@ func _clear_selection() -> Dictionary:
 
 const MAX_SELECTION := 200
 
+# A Text that is on the map right now.
+func _live_text(node) -> bool:
+	return node != null and typeof(node) == TYPE_OBJECT and is_instance_valid(node) \
+		and _is_text(node) and node.is_inside_tree()
+
+
 # What the user has selected: the Select tool's selection, described like
-# list_elements does, and the text in focus in the Text tool (texts are not
-# selectable with the Select tool). `bounds` and `center` cover all of it, so
-# "these" has a place as well as ids. Dungeondraft drops the selection when
-# the user switches tool.
+# list_elements does, and, while the Text tool is in hand, the text in focus
+# there (texts are not selectable with the Select tool). `bounds` and
+# `center` cover all of it, so "these" has a place as well as ids.
+# Dungeondraft drops the selection when the user switches tool.
 func _get_selection() -> Dictionary:
 	if Global.World.GetCurrentLevel() == null:
 		return _err("no map open")
@@ -3824,10 +3886,9 @@ func _get_selection() -> Dictionary:
 			for node in picked:
 				if node != null and is_instance_valid(node) and not (node in nodes):
 					nodes.append(node)
-	if Global.Editor.Tools.has("TextTool"):
+	if Global.Editor.ActiveToolName == "TextTool" and Global.Editor.Tools.has("TextTool"):
 		var focus = Global.Editor.Tools["TextTool"].get("focus")
-		if focus != null and typeof(focus) == TYPE_OBJECT and is_instance_valid(focus) \
-				and _is_text(focus) and not (focus in nodes):
+		if _live_text(focus) and not (focus in nodes):
 			nodes.append(focus)
 	var elements := []
 	var bounds = null
@@ -3847,12 +3908,31 @@ func _get_selection() -> Dictionary:
 	return _ok(out)
 
 
+# Whether the pointer is on the map view or on one of Dungeondraft's panels is
+# Godot's own hit test: the map view is one Control (Editor's `content`), and
+# it gets mouse_entered / mouse_exited as the pointer moves between it and
+# whatever is drawn over it. Until the first of those the control's rectangle
+# is the best guess.
+func _watch_canvas() -> void:
+	var canvas = Global.Editor.get("content")
+	if canvas == null or typeof(canvas) != TYPE_OBJECT or not (canvas is Control):
+		return
+	canvas.connect("mouse_entered", self, "_on_canvas_pointer", [true])
+	canvas.connect("mouse_exited", self, "_on_canvas_pointer", [false])
+	_on_canvas = canvas.get_global_rect().has_point(canvas.get_global_mouse_position())
+
+
+func _on_canvas_pointer(inside : bool) -> void:
+	_on_canvas = inside
+
+
 # Where the user's pointer is on the map, for "here": the woxel position, the
 # same point on the user's snap grid (what a placement with snap=true would
 # use), and the tile it is in. The position is where the pointer last was
 # inside Dungeondraft's window: `window_focused` false with `moving` false is
 # the usual picture while the user types in another window with the pointer
-# parked on the map. `over_map` false means it rests off the map's edge.
+# parked on the map. `over_map` false means it rests on a panel or toolbar, or
+# off the map's edge: the position is then not a place the user pointed at.
 func _get_cursor() -> Dictionary:
 	if Global.World.GetCurrentLevel() == null:
 		return _err("no map open")
@@ -3864,7 +3944,7 @@ func _get_cursor() -> Dictionary:
 		"position": _vec(pos),
 		"snapped": _vec(_snap_point(pos)),
 		"tile": [int(floor(pos.x / 256.0)), int(floor(pos.y / 256.0))],
-		"over_map": pos.x >= 0.0 and pos.y >= 0.0 and pos.x <= size.x and pos.y <= size.y,
+		"over_map": _on_canvas != false and pos.x >= 0.0 and pos.y >= 0.0 and pos.x <= size.x and pos.y <= size.y,
 		"moving": bool(Global.WorldUI.get("IsMouseMoving")),
 		"window_focused": OS.is_window_focused(),
 		"active_tool": Global.Editor.ActiveToolName,
@@ -5746,7 +5826,7 @@ func _generate_dungeon(req : Dictionary) -> Dictionary:
 	var after := {}
 	for kind in COLLECTIONS:
 		after[kind] = _collection(level, kind).get_child_count()
-	var recorded = mark != null and not _made_since(mark).empty()
+	var recorded = mark != null and not _made_since(mark, _dd_records(), _dd_bookmark()).empty()
 	return _ok({ "design": str(gen.get("Design")), "dials": _generator_dials(gen),
 		"counts_before": before, "counts_after": after, "level_id": level.ID, "undoable": recorded,
 		"note": ("added to the current level; undo() takes it back the way Dungeondraft's own Ctrl+Z " +
@@ -5931,15 +6011,12 @@ func _on_panel_undo() -> void:
 func _panel_undo_shared() -> String:
 	if _job != null or _dd_history_busy():
 		return "Dungeondraft is busy; try again in a moment"
-	var records = _dd_records()
-	var at = _dd_bookmark()
-	if at < 0 or at >= records.size():
-		return "nothing to undo"
-	if _record_owner(records[at]) != "assistant":
+	var move = _guarded_move(false, false)
+	if move["moved"]:
+		return "undone from the panel at %s (%s)" % [_clock(), str(move["summary"].get("kind", ""))]
+	if move.get("by") == "user":
 		return "the newest step is your own: Ctrl+Z undoes it"
-	var kind = str(_record_summary(records[at]).get("kind", ""))
-	_dd_history().Undo()
-	return "undone from the panel at %s (%s)" % [_clock(), kind]
+	return str(move["reason"])
 
 
 func _on_panel_require_token(pressed : bool) -> void:

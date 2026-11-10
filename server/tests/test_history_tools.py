@@ -50,6 +50,14 @@ class Registered(unittest.TestCase):
         for name in ("undo", "redo", "checkpoint", "rollback_checkpoint", "list_checkpoints"):
             self.assertIn(name, server._NOT_BATCHABLE)
 
+    def test_what_clears_the_history_stays_out_of_batches(self):
+        # Each of these wipes the batch's own undo group along with the history.
+        for name in ("set_map_size", "crop_map", "delete_level"):
+            self.assertIn(name, server._NOT_BATCHABLE)
+        out = server.batch([{"tool": "delete_level", "args": {"index": 0}}])
+        self.assertEqual(out["failed"], 1)
+        self.assertIn("cannot be used inside a batch", out["results"][0]["error"])
+
 
 if __name__ == "__main__":
     unittest.main()

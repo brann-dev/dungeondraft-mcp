@@ -44,6 +44,7 @@ class FakeHistory extends Reference:
 	var lock_frames = 0
 	var dropped = 0      # calls made while locked
 	var broken = 0       # calls made out of bounds
+	var refuses = false  # CreateCustomRecord fails, as a call into Dungeondraft can
 
 	func _get(property):
 		if property == "history":
@@ -60,6 +61,8 @@ class FakeHistory extends Reference:
 			bookmark += 1
 
 	func CreateCustomRecord(reference):
+		if refuses:
+			return null
 		var record = CustomRecord.new()
 		record.ScriptInstance = reference
 		Record(record)
@@ -186,8 +189,10 @@ func _init():
 			"test_own_records_adopted", "test_user_step_on_top", "test_group_is_one_record",
 			"test_group_split_by_user", "test_group_after_user_undo", "test_history_limit",
 			"test_checkpoint_rollback", "test_checkpoint_user_steps", "test_checkpoint_empty_history",
-			"test_checkpoint_replaced", "test_busy_and_disconnect", "test_forget_history",
-			"test_released_nodes", "test_stale_step"]:
+			"test_checkpoint_replaced", "test_checkpoint_survives_a_growing_group",
+			"test_checkpoint_survives_undo_and_retry", "test_busy_and_disconnect", "test_forget_history",
+			"test_released_nodes", "test_stale_step", "test_record_refused", "test_panel_undo",
+			"test_unreversible_call_in_a_group"]:
 		_fresh()
 		call(name)
 		check(name + ": no call dropped or out of bounds", history.dropped == 0 and history.broken == 0,
@@ -237,9 +242,11 @@ func _move(id, x):
 	return op
 
 
-# A bridge command that moves node `id` to x. `own` names the records
-# Dungeondraft adds by itself while the command runs.
+# A bridge command that moves node `id` to x, as _handle_line and
+# _record_and_dispatch run one. `own` names the records Dungeondraft adds by
+# itself while the command runs.
 func _command(id, x, own = []):
+	bridge._watch_checkpoints()
 	var mark = bridge._history_mark()
 	var op = _move(id, x)
 	for name in own:
@@ -636,3 +643,102 @@ func test_stale_step():
 	_frames(4)
 	check("a stale record is a no-op", world.nodes[1].position.x == 10 and history.bookmark == -1)
 	check("it still counts as the assistant's", _owners() == ["assistant"], _owners())
+
+
+func test_checkpoint_survives_a_growing_group():
+	# A group's step is recorded again in place when a later edit brings one of
+	# Dungeondraft's own records with it: a new record object for the same
+	# step. A checkpoint that holds on to that step must still find it.
+	_node(1)
+	_node(2)
+	_checkpoint("room")   # on an empty history
+	bridge._begin_group({ "label": "build_room", "undo_group": "t" })
+	_command(1, 10)
+	_command(2, 20, ["floor"])
+	bridge._end_group({ "undo_group": "t" })
+	var view = _views()["room"]
+	check("still reachable after the step was recorded again", view["reachable"] and view["steps_since"] == 1, view)
+	var rolled = _result("rollback_checkpoint", { "label": "room" })
+	check("and it rolls back", rolled.get("rolled_back") == 1 and world.nodes[1].position.x == 0
+		and world.nodes[2].position.x == 0, rolled)
+	# The same with a step to hold on to: the checkpoint sits on a group's step.
+	_fresh()
+	_node(1)
+	_node(2)
+	bridge._begin_group({ "label": "batch", "undo_group": "t" })
+	_command(1, 10)
+	bridge._watch_checkpoints()
+	bridge._checkpoints["mid"] = { "label": "mid", "anchor": bridge._record_key(history.records[0]),
+		"first": 0, "lost": false, "opened": 0 }
+	_command(2, 20, ["floor"])
+	bridge._end_group({ "undo_group": "t" })
+	check("a mark on a step that is recorded again keeps its hold", _views()["mid"]["reachable"], _views()["mid"])
+
+
+func test_checkpoint_survives_undo_and_retry():
+	# checkpoint, try something, undo it, try something else: undoing the
+	# second try still leads back to the checkpoint.
+	_node(1)
+	_checkpoint("c")
+	_command(1, 10)
+	check("first try undone", _result("undo").get("undone") == true)
+	_command(1, 20)
+	var view = _views()["c"]
+	check("reachable after undo and a new edit", view["reachable"] and view["steps_since"] == 1, view)
+	var rolled = _result("rollback_checkpoint", { "label": "c" })
+	check("rollback undoes the second try", rolled.get("rolled_back") == 1 and world.nodes[1].position.x == 0, rolled)
+	# Redone instead of replaced: the first step is the one held on to again.
+	_result("redo")
+	check("redo is a step since the checkpoint", _views()["c"]["steps_since"] == 1 and _views()["c"]["reachable"])
+
+
+func test_record_refused():
+	# A call into Dungeondraft can fail without a word. If the step is not
+	# recorded, the bookmark must be back where Dungeondraft left it.
+	_node(1)
+	_user_edit("u1")
+	history.refuses = true
+	_command(1, 10, ["floor"])
+	check("the bookmark is back on Dungeondraft's own record", history.bookmark == 1 and history.records.size() == 2,
+		[history.bookmark, history.records.size()])
+	check("no step is kept for an edit that was not recorded", bridge._steps.empty(), bridge._steps.size())
+	history.refuses = false
+	_command(1, 20)
+	check("the next edit records normally", history.records.size() == 3 and history.bookmark == 2
+		and bridge._steps.size() == 1)
+	_result("undo")
+	check("and undoes", world.nodes[1].position.x == 10)
+
+
+func test_panel_undo():
+	_node(1)
+	check("nothing to undo from the panel", bridge._panel_undo_shared() == "nothing to undo")
+	_command(1, 10)
+	master.IsBusy = true
+	check("the panel waits while Dungeondraft is busy", bridge._panel_undo_shared().begins_with("Dungeondraft is busy")
+		and history.bookmark == 0)
+	master.IsBusy = false
+	check("the panel undoes the assistant's step", bridge._panel_undo_shared().begins_with("undone from the panel")
+		and world.nodes[1].position.x == 0)
+	check("and not again inside the lock", bridge._panel_undo_shared().begins_with("Dungeondraft is busy"))
+	_frames(4)
+	_user_edit("by hand")
+	check("the panel leaves the user's step alone", bridge._panel_undo_shared().find("your own") != -1
+		and history.bookmark == 0 and trace.empty(), trace)
+
+
+func test_unreversible_call_in_a_group():
+	# A call the bridge has no op for, but Dungeondraft records, is a step of
+	# its own even inside a group, and the group goes on in a second record.
+	_node(1)
+	_node(2)
+	bridge._begin_group({ "label": "batch", "undo_group": "t" })
+	_command(1, 10)
+	var mark = bridge._history_mark()
+	history.Record(_own("generated"))
+	bridge._settle(null, mark)
+	_command(2, 20)
+	bridge._end_group({ "undo_group": "t" })
+	check("three records, all the assistant's", _owners() == ["assistant", "assistant", "assistant"], _owners())
+	check("undo takes the last part first", _result("undo").get("kind") == "transform" and world.nodes[2].position.x == 0)
+	check("then Dungeondraft's own record", _result("undo").get("kind") == "dungeondraft" and trace == ["undo generated"], trace)

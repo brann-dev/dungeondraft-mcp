@@ -204,8 +204,8 @@ polygon, >= 3 points, with some area).
 | `generate_dungeon` | `design?` (Dungeon / Cave), `boundary?`, `complexity?`, `density?` → `{ design, dials, counts_before, counts_after, level_id, undoable, note }`; runs `Generator.Generate()` on the current level. The bridge has no undo op for it; `undoable` is true when Dungeondraft recorded the generation in the shared history, where `undo` takes it back the way Ctrl+Z does (a Cave keeps its walls). |
 | `select_elements` | `ids[]` |
 | `clear_selection` | — |
-| `get_selection` | — → `{ count, elements[], truncated?, bounds?: [x0,y0,x1,y1], center?: [x,y], active_tool, level_index }`. What the user has selected: the Select tool's `Selected`, each element as `list_elements` describes it (up to 200), plus the text in focus in the Text tool. `bounds` / `center` enclose all of it. Dungeondraft drops the selection when the user switches tool. Read-only |
-| `get_cursor` | — → `{ position: [x,y], snapped: [x,y], tile: [col,row], over_map, moving, window_focused, active_tool, level_index }`. Where the user's pointer is: `WorldUI.MousePosition` in woxels, the same point on the snap grid (as `"snap": true` would place it), and the 256-woxel tile it is in. It is where the pointer last was inside Dungeondraft's window; `over_map` is false outside the map's edge. Read-only |
+| `get_selection` | — → `{ count, elements[], truncated?, bounds?: [x0,y0,x1,y1], center?: [x,y], active_tool, level_index }`. What the user has selected: the Select tool's `Selected`, each element as `list_elements` describes it (up to 200), plus, while the Text tool is the active tool, the text in focus there. `bounds` / `center` enclose all of it. Dungeondraft drops the selection when the user switches tool. Read-only |
+| `get_cursor` | — → `{ position: [x,y], snapped: [x,y], tile: [col,row], over_map, moving, window_focused, active_tool, level_index }`. Where the user's pointer is: `WorldUI.MousePosition` in woxels, the same point on the snap grid (as `"snap": true` would place it), and the 256-woxel tile it is in. It is where the pointer last was inside Dungeondraft's window; `over_map` is false when it rests on a panel or toolbar (the map view's own `mouse_entered` / `mouse_exited`) or outside the map's edge. Read-only |
 
 ### Map lifecycle
 
@@ -405,7 +405,10 @@ recorded op joins one step: the step is recorded with the group's first op, so
 Ctrl+Z in the middle of a batch undoes what the batch has done so far, and
 later ops join it for as long as it is still the newest step. If the user
 edited or undid by hand in between, the rest of the group becomes a second
-step. A step with several ops reports `kind: "group"`, `steps` and the
+step. So does a command inside the group that has no op but that
+Dungeondraft records itself (`generate_dungeon`, a `native_call`): its record
+is a step of its own and the ops after it start another. A step with several
+ops reports `kind: "group"`, `steps` and the
 outermost group's `label`; nested groups are flattened into it. The server
 opens a group around `batch`, `scatter_objects`, `place_objects` and
 `move_elements`, and the mod around `build_room`'s wall and floor, so each is
@@ -419,8 +422,11 @@ close any open group before they run.
 rollback undoes down to it. `reachable` turns false, and a rollback refuses,
 once that step is gone from history: dropped off the far end past Max undos,
 or undone by hand and then replaced by a new edit. A checkpoint taken with
-nothing to undo holds on to the first step made after it instead. A map resize
-and a deleted level clear the history and with it every open checkpoint.
+nothing to undo holds on to the first step made after it instead (and to the
+next one, once everything since has been undone). A step is remembered by its
+serial when it is the bridge's, since a group's step is recorded again in
+place as the group grows, and by its record otherwise. A map resize and a
+deleted level clear the history and with it every open checkpoint.
 
 Not recorded: `set_terrain_slot`, levels, selection, capture and
 `native_set`. `delete_level` and `set_map_size` clear the history.
@@ -575,7 +581,8 @@ pair only when the color is not opaque.
     cuts them off exactly as a new edit cuts off a redo branch (`_settle`).
     That write to `bookmark` is the one place the mod changes Dungeondraft's
     history other than through its methods, and `Record()` runs in the same
-    call. A command without an op keeps Dungeondraft's records, marked as the
+    call; `_put_step` then checks that the step is the newest record and puts
+    the bookmark back if it is not. A command without an op keeps Dungeondraft's records, marked as the
     assistant's (`_adopted`); `ui_action`'s deferred press is picked up one
     frame later.
   - **Side effects that come with it.** `OnHistoryChanged` marks the map

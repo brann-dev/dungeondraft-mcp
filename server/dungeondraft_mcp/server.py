@@ -1676,9 +1676,9 @@ def get_selection() -> dict:
     kind, position, asset, layer, and so on), so the ids go straight into
     move_element, modify_*, delete_elements or fit_elements. bounds
     [x0, y0, x1, y1] and center cover the whole selection in woxels: "next to
-    these" or "between them" has a place as well as ids. A text being edited
-    with the Text tool counts as selected. active_tool is the tool the user
-    has in hand.
+    these" or "between them" has a place as well as ids. While the user has
+    the Text tool in hand, the text they are editing counts as selected.
+    active_tool is the tool the user has in hand.
 
     count 0 means nothing is selected: Dungeondraft drops the selection when
     the user switches tool, so ask them to select with the Select tool and
@@ -1694,7 +1694,8 @@ def get_cursor() -> dict:
     position is the woxel point under the pointer; snapped is the same point
     on the user's snap grid (what a placement with snap=True would use); tile
     is the [column, row] of the grid cell it is in. over_map is False when the
-    pointer rests outside the map's edge.
+    pointer rests on one of Dungeondraft's panels or toolbars, or outside
+    the map's edge: the position is then not a place the user pointed at.
 
     The position is where the pointer last was inside Dungeondraft's window.
     While the user types to you the pointer is usually parked on the spot they
@@ -2783,7 +2784,8 @@ def delete_level(index: int) -> dict:
 # the map out from under the rest of the batch, and itself.
 _NOT_BATCHABLE = {"batch", "screenshot", "export_map", "export_uvtt", "open_map", "preview_assets",
                   # these close or wipe the batch's own undo group
-                  "undo", "redo", "checkpoint", "rollback_checkpoint", "list_checkpoints", "set_map_size", "crop_map"}
+                  "undo", "redo", "checkpoint", "rollback_checkpoint", "list_checkpoints", "set_map_size", "crop_map",
+                  "delete_level"}
 
 
 @_tool()
@@ -2796,14 +2798,18 @@ def batch(calls: list[dict], stop_on_error: bool = True, single_undo: bool = Tru
        {"tool": "add_light", "args": {"x": 1024, "y": 768, "range": 1.5}}]
     A later call cannot use an earlier call's result (such as a new id); when
     you need one, end the batch there. Not available inside a batch:
-    screenshot, export_map, export_uvtt, open_map, and the history tools
-    (undo, redo, checkpoints).
+    screenshot, export_map, export_uvtt, open_map, the history tools
+    (undo, redo, checkpoints), and the tools that clear the history
+    (set_map_size, crop_map, delete_level).
 
     Returns one entry per call that ran: {tool, ok, result} or {tool, ok: false,
     error}. With stop_on_error (the default) the batch stops at the first
     failure, leaving the earlier calls done: it is not all-or-nothing. With
     single_undo (the default) every edit in the batch is ONE undo() step;
-    pass False to keep each edit its own step.
+    pass False to keep each edit its own step. The exception is a call the
+    bridge has no undo for but Dungeondraft records itself (generate_dungeon,
+    native_call, ui_action): it is a step of its own, and the edits after it
+    in the batch form a second step.
     """
     if not 1 <= len(calls) <= 100:
         raise ValueError("give 1 to 100 calls")
