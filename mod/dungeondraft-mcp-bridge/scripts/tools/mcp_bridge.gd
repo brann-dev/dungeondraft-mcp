@@ -14,14 +14,16 @@
 # DeleteNodeByID). Creation commands return the new id; query commands return
 # ids you can pass back to move/modify/delete.
 #
-# Undo: reversible edits push an op onto the bridge's own undo/redo stacks
-# (DD 3.4.2's History.CreateCustomRecord is unreliable); see _record_and_dispatch.
+# Undo: every reversible edit is one step in Dungeondraft's own History, so the
+# user's Ctrl+Z and the bridge's `undo` walk one shared timeline (see "Shared
+# history" below). Where a Dungeondraft build lacks what that needs, the bridge
+# falls back to undo/redo stacks of its own.
 
 var script_class = "tool"
 
 const HOST := "127.0.0.1"
 const PORT := 8787
-const PROTOCOL_VERSION := 30
+const PROTOCOL_VERSION := 31
 
 # Commands that get wrapped in a Dungeondraft undo record (see _record_and_dispatch).
 const CREATE_CMDS := [
@@ -38,6 +40,12 @@ const MAX_UNDO_OPS := 200
 const MAX_CHECKPOINTS := 16
 # Commands that settle history before they run: any open undo group is closed.
 const HISTORY_CMDS := ["undo", "redo", "checkpoint", "list_checkpoints", "rollback_checkpoint"]
+# The ones that move Dungeondraft's history: carried out over several frames
+# when the history is shared (see _start_job).
+const HISTORY_MOVES := ["undo", "redo", "rollback_checkpoint"]
+# How long a history move waits for Dungeondraft to be free (saving, exporting,
+# the three locked frames after the previous move) before it gives up.
+const JOB_PATIENCE_MSEC := 8000
 # The bridge's token and settings live in Dungeondraft's user folder (user://,
 # the folder that holds config.ini), where the Python server reads them too.
 const TOKEN_FILE := "user://mcp_bridge_token"
@@ -52,7 +60,7 @@ const READ_ONLY_CMDS := [
 	"native_targets", "native_describe", "native_get", "ui_tree",
 	"spatial_snapshot", "asset_footprint", "list_spatial_regions", "list_checkpoints",
 	"get_map_style", "list_prefabs", "generator_options", "select_elements", "clear_selection",
-	"get_snap_settings", "preview_assets",
+	"get_snap_settings", "preview_assets", "get_selection", "get_cursor",
 ]
 # Neutral opaque tint for pattern floors when no color is given. PatternShapeTool
 # has no per-texture default (and its .Color leaks across calls), so we apply a
@@ -86,12 +94,18 @@ const COLLECTIONS := {
 
 var _server : TCP_Server = null
 var _conns := []         # array of { "peer": StreamPeerTCP, "buf": String }
-var _undo_stack := []    # bridge-managed undo ops (see _build_op / _apply_op)
+var _native := false     # true: steps live in Dungeondraft's own History (see "Shared history")
+var _steps := {}         # native mode: serial -> { "op", "shell" } for every step Dungeondraft still holds
+var _adopted := {}       # native mode: instance ids of the records Dungeondraft made itself during a bridge command
+var _job = null          # native mode: the history move in flight (see _start_job)
+var _pressed_mark = null # native mode: history as it was when ui_action pressed a button (see _adopt_pressed)
+var _on_canvas = null    # is the pointer on the map view rather than on a panel; null until known (see _watch_canvas)
+var _undo_stack := []    # fallback mode: bridge-managed undo ops (see _build_op / _apply_op)
 var _redo_stack := []
 var _op_serial := 0      # numbers every op pushed; checkpoints remember where they stood
 var _lost_serial := 0    # the newest serial dropped from history (see _push_op)
 var _groups := []        # open undo groups, innermost last (begin_undo_group / end_undo_group)
-var _checkpoints := {}   # label -> { "label", "after": serial, "opened": msec }
+var _checkpoints := {}   # label -> { "label", "opened": msec } + "after": serial, or "anchor"/"first"/"lost" (native)
 var _token := ""         # the shared secret every request must carry (see _ensure_token)
 var _require_token := true
 var _paused := false     # "Pause AI edits" in the panel: only READ_ONLY_CMDS run
@@ -101,6 +115,26 @@ var _last_request := ""
 var _asset_sets := {}    # category -> { asset path: true }, see _asset_known
 var _colorable = null    # lazily built set of "Colorable"-tagged texture paths
 var _export = null       # export in flight: { grid_was, cam: {anchor, pos, zoom} }; see _finish_export
+
+
+# One step of the bridge in Dungeondraft's History. Dungeondraft's
+# CustomHistoryRecord calls undo() / redo() on it: for Ctrl+Z, the toolbar
+# arrows, and the bridge's own `undo`. It holds no map data, only where the
+# bridge keeps the step (`_steps`), and the bridge by id, not by reference:
+# a record that outlives its bridge (Reload Mods) does nothing.
+class McpStep extends Reference:
+	var bridge_id := 0
+	var serial := 0
+
+	func undo():
+		var bridge = instance_from_id(bridge_id)
+		if bridge != null:
+			bridge._apply_step(serial, true)
+
+	func redo():
+		var bridge = instance_from_id(bridge_id)
+		if bridge != null:
+			bridge._apply_step(serial, false)
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +154,11 @@ func start():
 	_require_token = bool(settings.get("require_token", true))
 	_paused = bool(settings.get("paused", false))   # a pause outlives a restart; the user lifts it
 	_token = _ensure_token()
+	# "native_history": false in the settings file keeps the bridge's own stacks.
+	_native = bool(settings.get("native_history", true)) and _native_available()
+	print("[mcp-bridge] undo history: %s" % ("shared with Dungeondraft (Ctrl+Z)" if _native
+		else "the bridge's own, separate from Ctrl+Z"))
+	_watch_canvas()
 	_register_tool()
 	var prev = Engine.get_meta(META_SERVER) if Engine.has_meta(META_SERVER) else null
 	if prev != null and prev is TCP_Server and prev.is_listening():
@@ -155,24 +194,31 @@ func update(delta : float):
 		peer.set_no_delay(true)
 		_conns.append({ "peer": peer, "buf": "" })
 
+	if _pressed_mark != null:
+		_adopt_pressed()
+	if _job != null:
+		_job_tick()
+
 	var still_open := []
 	for c in _conns:
 		var peer : StreamPeerTCP = c["peer"]
 		if peer.get_status() != StreamPeerTCP.STATUS_CONNECTED:
 			continue
+		still_open.append(c)
+		if _job != null:
+			continue   # requests wait their turn behind a history move
 		var avail = peer.get_available_bytes()
 		if avail > 0:
 			var res = peer.get_data(avail)   # [err, PoolByteArray]
 			if res[0] == OK:
 				c["buf"] += res[1].get_string_from_utf8()
 		var nl = c["buf"].find("\n")
-		while nl != -1:
+		while nl != -1 and _job == null:
 			var line = c["buf"].substr(0, nl).strip_edges()
 			c["buf"] = c["buf"].substr(nl + 1)
 			if line != "":
 				_handle_line(peer, line)
 			nl = c["buf"].find("\n")
-		still_open.append(c)
 	_conns = still_open
 
 
@@ -195,7 +241,16 @@ func _handle_line(peer : StreamPeerTCP, line : String):
 			resp = _err("paused: the user paused AI edits in Dungeondraft's MCP Bridge panel " +
 				"(Settings > MCP Bridge). Read-only commands still work; make no edits until they resume.")
 		else:
+			if _native:
+				_watch_checkpoints()
+				if cmd in HISTORY_MOVES:
+					_start_job(peer, req)   # answers by itself, now or some frames on
+					return
 			resp = _record_and_dispatch(req)
+	_answer(peer, resp)
+
+
+func _answer(peer, resp : Dictionary) -> void:
 	_refresh_panel()
 	peer.put_data((JSON.print(resp) + "\n").to_utf8())
 
@@ -293,10 +348,9 @@ func _clock() -> String:
 	return "%02d:%02d:%02d" % [t.hour, t.minute, t.second]
 
 
-# Runs a command and, if it succeeded and is a reversible map edit, pushes an op
-# onto the bridge-managed undo stack. We do NOT use Dungeondraft's
-# History.CreateCustomRecord — on 3.4.2 it invokes undo() unreliably and never
-# round-trips redo(). Our own stacks are deterministic and fully under control.
+# Runs a command and, if it succeeded and is a reversible map edit, records an
+# op for it: as a step in Dungeondraft's History (_settle), or on the bridge's
+# own undo stack in fallback mode (_push_op).
 # Pre-edit state (transform / terrain splat) is captured before the command runs.
 func _record_and_dispatch(req : Dictionary) -> Dictionary:
 	var cmd = req.get("cmd", "")
@@ -329,16 +383,23 @@ func _record_and_dispatch(req : Dictionary) -> Dictionary:
 	if bool(req.get("snap", false)):
 		_snap_request(req)
 
+	# What Dungeondraft's history holds before the command, to tell afterwards
+	# which records the command made Dungeondraft add by itself (see _settle).
+	var mark = _history_mark() if _native and not (cmd in READ_ONLY_CMDS) else null
+
 	var result = _safe_dispatch(req)
+	var op = null
 	if typeof(result) == TYPE_DICTIONARY and result.get("ok", false):
 		# Handlers that know their own before/after state hand over a ready op
 		# (see _ok_op); the older commands are reconstructed from the pre-state.
-		var op = result.get("op")
+		op = result.get("op")
 		result.erase("op")
 		if op == null:
 			op = _build_op(cmd, req, result, pre, terrain_before, cave_before)
-		if op != null:
-			_push_op(op)
+	if mark != null:
+		_settle(op, mark)
+	elif op != null and not _native:
+		_push_op(op)
 	return result
 
 
@@ -358,17 +419,17 @@ func _build_op(cmd, req, result, pre, terrain_before, cave_before = null):
 	elif cmd in TERRAIN_CMDS and terrain_before != null:
 		var lvl = Global.World.GetCurrentLevel()
 		if lvl != null:
-			return { "kind": "terrain", "before": terrain_before, "after": _terrain_snapshot(lvl) }
+			return { "kind": "terrain", "level": lvl, "before": terrain_before, "after": _terrain_snapshot(lvl) }
 	elif cmd in CAVE_CMDS and cave_before != null:
 		var after = _cave_snapshot()
 		if after != null:
-			return { "kind": "cave", "before": cave_before, "after": after }
+			return { "kind": "cave", "mesh": _cave_mesh(), "before": cave_before, "after": after }
 	return null
 
 
-# Record an op: into the innermost open group, or onto the undo stack with a
-# serial number. A fresh edit invalidates the redo branch, and history past
-# MAX_UNDO_OPS drops its oldest step.
+# Fallback mode. Record an op: into the innermost open group, or onto the undo
+# stack with a serial number. A fresh edit invalidates the redo branch, and
+# history past MAX_UNDO_OPS drops its oldest step.
 func _push_op(op) -> void:
 	if not _groups.empty():
 		_groups.back()["entries"].append(op)
@@ -419,7 +480,8 @@ func _do_undo() -> Dictionary:
 	var op = _undo_stack.pop_back()
 	_apply_op(op, true)
 	_redo_stack.append(op)
-	return _ok(_op_summary(op, { "undone": true, "undo_depth": _undo_stack.size() }))
+	return _ok(_op_summary(op, { "undone": true, "by": "assistant", "undo_depth": _undo_stack.size(),
+		"redo_depth": _redo_stack.size() }))
 
 
 func _do_redo() -> Dictionary:
@@ -430,7 +492,8 @@ func _do_redo() -> Dictionary:
 	_op_serial += 1
 	op["serial"] = _op_serial   # the newest edit again, for checkpoints
 	_undo_stack.append(op)
-	return _ok(_op_summary(op, { "redone": true, "redo_depth": _redo_stack.size() }))
+	return _ok(_op_summary(op, { "redone": true, "by": "assistant", "undo_depth": _undo_stack.size(),
+		"redo_depth": _redo_stack.size() }))
 
 
 # --- undo groups: several edits that undo() and redo() treat as one step ----
@@ -450,11 +513,17 @@ func _end_group(req : Dictionary) -> Dictionary:
 	if str(_groups.back().get("token", "")) != str(req.get("undo_group", "")):
 		return _err("the open undo group belongs to another request")
 	var steps = _close_group()
-	return _ok({ "steps": steps, "open_groups": _groups.size(), "undo_depth": _undo_stack.size() })
+	return _ok({ "steps": steps, "open_groups": _groups.size(), "undo_depth": _undo_depth() })
+
+
+func _undo_depth() -> int:
+	return _dd_bookmark() + 1 if _native else _undo_stack.size()
 
 
 func _close_group() -> int:
 	var group = _groups.pop_back()
+	if _native:
+		return int(group.get("count", 0))   # its ops are on the timeline already (see _settle)
 	var entries = group["entries"]
 	if entries.size() == 1:
 		_push_op(entries[0])
@@ -476,16 +545,30 @@ func _checkpoint(req : Dictionary) -> Dictionary:
 		return _err("'label' is required, up to 64 characters")
 	if not _checkpoints.has(label) and _checkpoints.size() >= MAX_CHECKPOINTS:
 		return _err("%d checkpoints are open; roll one back or reuse a label" % MAX_CHECKPOINTS)
+	if _native:
+		# The mark is the newest step that is done right now: a rollback undoes
+		# down to it. With nothing to undo there is no step to hold on to; see
+		# _watch_checkpoints for how that case is kept honest.
+		var records = _dd_records()
+		var at = _dd_bookmark()
+		var anchor = _record_key(records[at]) if at >= 0 and at < records.size() else 0
+		_checkpoints[label] = { "label": label, "anchor": anchor, "first": 0, "lost": false,
+			"opened": OS.get_ticks_msec() }
+		return _ok({ "label": label, "undo_depth": at + 1, "history_limit": _max_undos(),
+			"history": _history_mode() })
 	_checkpoints[label] = { "label": label, "after": _op_serial, "opened": OS.get_ticks_msec() }
-	return _ok({ "label": label, "undo_depth": _undo_stack.size(), "history_limit": MAX_UNDO_OPS })
+	return _ok({ "label": label, "undo_depth": _undo_stack.size(), "history_limit": MAX_UNDO_OPS,
+		"history": _history_mode() })
 
 
 func _checkpoint_view(cp : Dictionary) -> Dictionary:
+	if _native:
+		return _native_checkpoint_view(cp)
 	var steps := 0
 	for op in _undo_stack:
 		if int(op.get("serial", 0)) > int(cp["after"]):
 			steps += 1
-	return { "label": cp["label"], "steps_since": steps,
+	return { "label": cp["label"], "steps_since": steps, "user_steps": 0,
 		"reachable": _lost_serial <= int(cp["after"]),
 		"age_ms": OS.get_ticks_msec() - int(cp["opened"]) }
 
@@ -497,9 +580,10 @@ func _list_checkpoints() -> Dictionary:
 	return _ok({ "checkpoints": out })
 
 
-# Undo every step recorded since the checkpoint, newest first. The checkpoint
-# stays open, so the next attempt can be rolled back to the same point. Refuses,
-# changing nothing, once history has dropped a step made after it.
+# Fallback mode (the shared history rolls back through _start_job). Undo every
+# step recorded since the checkpoint, newest first. The checkpoint stays open,
+# so the next attempt can be rolled back to the same point. Refuses, changing
+# nothing, once history has dropped a step made after it.
 func _rollback_checkpoint(req : Dictionary) -> Dictionary:
 	var label = str(req.get("label", "")).strip_edges()
 	if not _checkpoints.has(label):
@@ -515,8 +599,492 @@ func _rollback_checkpoint(req : Dictionary) -> Dictionary:
 		if not res.get("ok", false) or not res["result"].get("undone", false):
 			break
 		kinds.append(res["result"]["kind"])
-	return _ok({ "label": label, "rolled_back": kinds.size(), "kinds": kinds,
+	return _ok({ "label": label, "rolled_back": kinds.size(), "kinds": kinds, "user_steps": 0,
 		"undo_depth": _undo_stack.size(), "redo_depth": _redo_stack.size() })
+
+
+# ---------------------------------------------------------------------------
+# Shared history: the bridge's steps on Dungeondraft's own undo timeline
+# ---------------------------------------------------------------------------
+#
+# Dungeondraft keeps one History (Global.Editor.History): a list of records
+# and a bookmark on the newest one that is done. Ctrl+Z / Ctrl+Y and the
+# toolbar arrows move the bookmark and call the record's Undo() / Redo(). A
+# mod adds a record with History.CreateCustomRecord(reference); Dungeondraft
+# then calls undo() / redo() on that reference (McpStep).
+#
+# In native mode every step of the bridge is such a record, so the user's
+# edits and the assistant's share one timeline and Ctrl+Z walks through both.
+# The bridge's own undo / redo / rollback_checkpoint call History.Undo() /
+# Redo() too, with the guards Dungeondraft's toolbar gets from its disabled
+# buttons and any other caller has to bring along:
+#   - Undo() at the bottom and Redo() at the top index past the list: nothing
+#     checks the bounds, the bookmark ends up off by one and the history stays
+#     locked for good;
+#   - both hold a lock for three frames and silently drop a call made in the
+#     meantime, and both refuse while Dungeondraft is saving or exporting.
+# So a history request is a job (_start_job / _job_tick): one move whenever
+# Dungeondraft is free, answered once the last move has settled.
+#
+# `bookmark`, `locked` and the record list are private to Dungeondraft's
+# History class. They are reachable from GDScript all the same; start() checks
+# that each is there (_native_available) and otherwise leaves the bridge on
+# its own stacks, as does "native_history": false in the settings file.
+
+func _history_mode() -> String:
+	return "dungeondraft" if _native else "bridge"
+
+
+# True when this Dungeondraft's History has everything native mode relies on.
+# `bookmark` must also be writable: that is how the bridge takes back the
+# records Dungeondraft adds of its own accord inside a bridge command (_settle).
+func _native_available() -> bool:
+	var h = Global.Editor.get("History")
+	if h == null or typeof(h) != TYPE_OBJECT:
+		return false
+	for method in ["CreateCustomRecord", "Undo", "Redo", "Clear"]:
+		if not h.has_method(method):
+			return false
+	if typeof(h.get("locked")) != TYPE_BOOL or typeof(h.get("history")) != TYPE_ARRAY:
+		return false
+	var was = h.get("bookmark")
+	if typeof(was) != TYPE_INT:
+		return false
+	h.set("bookmark", was - 1)
+	var writable = h.get("bookmark") == was - 1
+	h.set("bookmark", was)
+	return writable and h.get("bookmark") == was
+
+
+func _dd_history():
+	return Global.Editor.get("History")
+
+
+# The records in Dungeondraft's history, oldest first (a copy of its list).
+func _dd_records() -> Array:
+	var records = _dd_history().get("history")
+	if typeof(records) != TYPE_ARRAY:
+		return []
+	return records
+
+
+# Index of the newest record that is done; -1 when there is nothing to undo.
+func _dd_bookmark() -> int:
+	return int(_dd_history().get("bookmark"))
+
+
+# True while Dungeondraft would drop an Undo() / Redo(): inside the three
+# frames after the last one, or while it is saving, exporting or closing.
+func _dd_history_busy() -> bool:
+	if bool(_dd_history().get("locked")):
+		return true
+	var master = Global.Editor.get_parent()
+	if master == null:
+		return false
+	var busy = master.get("IsBusy")
+	return typeof(busy) == TYPE_BOOL and busy
+
+
+# Dungeondraft's "Max undos" preference: how many steps its history keeps.
+# The Preferences object is a plain C# object, not a Godot one, and reading it
+# from GDScript crashed Dungeondraft 1.2.0.1; this reads what the Preferences
+# window saved instead.
+func _max_undos() -> int:
+	var cfg = ConfigFile.new()
+	if cfg.load("user://config.ini") != OK:
+		return 32
+	return int(cfg.get_value("Preferences", "max_undos", 32))
+
+
+# The McpStep behind a history record, or null for a record that is not a
+# bridge step (Dungeondraft's own records have no ScriptInstance).
+func _shell_of(record):
+	if record == null or not is_instance_valid(record):
+		return null
+	var shell = record.get("ScriptInstance")
+	if shell == null or typeof(shell) != TYPE_OBJECT or not is_instance_valid(shell):
+		return null
+	if shell.get("bridge_id") == null or shell.get("serial") == null:
+		return null
+	return shell
+
+
+# The serial of the step a record stands for, or 0 when the record is not a
+# step this bridge instance still keeps.
+func _serial_of(record) -> int:
+	var shell = _shell_of(record)
+	if shell == null or int(shell.get("bridge_id")) != get_instance_id():
+		return 0
+	var serial = int(shell.get("serial"))
+	return serial if _steps.has(serial) else 0
+
+
+# Whose step a record is. The assistant's: a bridge step, or a record
+# Dungeondraft made itself while it ran a bridge command. Anything else was
+# made by hand.
+func _record_owner(record) -> String:
+	if _shell_of(record) != null or _adopted.has(record.get_instance_id()):
+		return "assistant"
+	return "user"
+
+
+# What a checkpoint remembers a record by. A bridge step is recorded again in
+# place while its undo group grows (a new record object for the same step), so
+# it goes by its serial, negated to stay apart from instance ids; any other
+# record goes by its instance id.
+func _record_key(record) -> int:
+	var serial = _serial_of(record)
+	return -serial if serial > 0 else record.get_instance_id()
+
+
+func _record_index(records : Array, key : int) -> int:
+	for i in range(records.size()):
+		if _record_key(records[i]) == key:
+			return i
+	return -1
+
+
+# What undo / redo / rollback_checkpoint report about a record.
+func _record_summary(record) -> Dictionary:
+	var out := { "by": _record_owner(record) }
+	var serial = _serial_of(record)
+	if serial > 0:
+		return _op_summary(_steps[serial]["op"], out)
+	out["kind"] = "dungeondraft"   # a step Dungeondraft recorded and undoes itself
+	return out
+
+
+# The records in Dungeondraft's history by instance id: taken before a
+# command runs, for _made_since.
+func _history_mark() -> Dictionary:
+	var mark := {}
+	for record in _dd_records():
+		mark[record.get_instance_id()] = true
+	return mark
+
+
+# The records Dungeondraft added by itself since `mark`, newest first: some of
+# its methods record their own history step (a free-standing portal, a pattern
+# floor, water, a prefab, a generated layout). They sit on top of the done
+# steps, above everything that was there before and above the bridge's steps.
+func _made_since(mark : Dictionary, records : Array, at : int) -> Array:
+	var made := []
+	var i = at
+	while i >= 0 and i < records.size():
+		var record = records[i]
+		if mark.has(record.get_instance_id()) or _shell_of(record) != null:
+			break
+		made.append(record)
+		i -= 1
+	return made
+
+
+# Put a finished command on the timeline.
+#
+# With an op, the bridge's step is the one record for the command: whatever
+# Dungeondraft recorded for it by itself is taken back first (the bookmark is
+# moved under those records, and recording the step cuts them off, exactly as
+# a new edit cuts off a redo branch). Left in, one command would be two presses
+# of Ctrl+Z, the second undoing something that is already gone.
+#
+# Inside an undo group the ops share one record, there from the first op on:
+# a later op joins it for as long as it is still the newest step. If the user
+# edited or undid in between, the rest of the group starts a record of its own.
+#
+# Without an op (a command the bridge cannot reverse itself), Dungeondraft's
+# own records of it stay and count as the assistant's.
+func _settle(op, mark : Dictionary) -> void:
+	var records = _dd_records()
+	var at = _dd_bookmark()
+	var made = _made_since(mark, records, at)
+	if op == null:
+		if not made.empty():
+			for record in made:
+				_adopted[record.get_instance_id()] = true
+			_history_changed()   # a new record cut off whatever could be redone
+		return
+	var under = at - made.size()   # the newest step from before the command
+	var live = int(_groups[0].get("serial", 0)) if not _groups.empty() else 0
+	if live > 0 and under >= 0 and under < records.size() and _serial_of(records[under]) == live:
+		var step = _steps[live]
+		if bool(step["op"].get("live", false)):
+			step["op"]["entries"].append(op)
+		else:
+			step["op"] = { "kind": "group", "label": str(_groups[0].get("label", "")),
+				"entries": [step["op"], op], "live": true }
+		if made.size() > 0 or under < records.size() - 1:
+			# Something lies above the step (Dungeondraft's records of this
+			# command, or steps the user undid): record it again in its place.
+			_put_step(step["shell"], under - 1, at)
+	else:
+		_op_serial += 1
+		var shell = McpStep.new()
+		shell.bridge_id = get_instance_id()
+		shell.serial = _op_serial
+		_steps[_op_serial] = { "op": op, "shell": shell }
+		if not _groups.empty():
+			_groups[0]["serial"] = _op_serial
+		_put_step(shell, under, at)
+	for group in _groups:
+		group["count"] = int(group.get("count", 0)) + 1
+
+
+# Record a step as the newest one, with the bookmark first moved from `at` to
+# `under`, the newest record that is to stay: the recording cuts off what lay
+# above it. Like every call into Dungeondraft the result is checked: if the
+# step is not the newest record afterwards, the bookmark goes back and the
+# edit simply cannot be undone.
+func _put_step(shell, under : int, at : int) -> void:
+	var h = _dd_history()
+	if under != at:
+		h.set("bookmark", under)
+	h.CreateCustomRecord(shell)
+	var records = _dd_records()
+	var now = _dd_bookmark()
+	if now < 0 or now >= records.size() or records[now].get("ScriptInstance") != shell:
+		if under != at and now == under and at < records.size():
+			h.set("bookmark", at)
+		print("[mcp-bridge] Dungeondraft did not record a step; that edit cannot be undone")
+	_history_changed(records)
+
+
+# Dungeondraft's record list changed under the bridge's hand: drop the steps
+# it no longer holds and look after the checkpoints.
+func _history_changed(records = null) -> void:
+	if records == null:
+		records = _dd_records()
+	_prune_steps(records)
+	_watch_checkpoints(records)
+
+
+# Forget the steps Dungeondraft no longer holds: dropped off the bottom past
+# "Max undos", cut off as a redo branch by a new edit, or cleared. Nodes such
+# a step still kept out of the tree are freed here, on the main thread.
+func _prune_steps(records = null) -> void:
+	if records == null:
+		records = _dd_records()
+	var held := {}
+	var present := {}
+	for record in records:
+		present[record.get_instance_id()] = true
+		var serial = _serial_of(record)
+		if serial > 0:
+			held[serial] = true
+	for serial in _steps.keys():
+		if not held.has(serial):
+			_release_op(_steps[serial]["op"])
+			_steps.erase(serial)
+	for id in _adopted.keys():
+		if not present.has(id):
+			_adopted.erase(id)
+
+
+# ui_action presses a button after its reply is out, so what Dungeondraft
+# records for the press is not there yet when the command settles. The next
+# frame picks it up: those records are the assistant's, like the ones made
+# inside a command.
+func _adopt_pressed() -> void:
+	var made = _made_since(_pressed_mark, _dd_records(), _dd_bookmark())
+	_pressed_mark = null
+	if made.empty():
+		return
+	for record in made:
+		_adopted[record.get_instance_id()] = true
+	_history_changed()
+
+
+# Dungeondraft is undoing or redoing one of the bridge's steps (McpStep).
+func _apply_step(serial : int, undo : bool) -> void:
+	if not _steps.has(serial):
+		return
+	_apply_op(_steps[serial]["op"], undo)
+	_refresh_panel()
+
+
+# Begin a history move: undo, redo or rollback_checkpoint. It answers the
+# request itself, at once when there is nothing to do or the move is refused,
+# otherwise from _job_tick when the last move has settled.
+func _start_job(peer, req : Dictionary) -> void:
+	_close_all_groups()
+	var cmd = str(req.get("cmd", ""))
+	var job := { "peer": peer, "cmd": cmd, "redo": cmd == "redo",
+		"include_user": bool(req.get("include_user", false)),
+		"moves": [], "left": 1, "since": OS.get_ticks_msec() }
+	if cmd == "rollback_checkpoint":
+		var label = str(req.get("label", "")).strip_edges()
+		if not _checkpoints.has(label):
+			_answer(peer, _err("no checkpoint '%s'; open ones: %s" % [label, str(_checkpoints.keys())]))
+			return
+		var view = _checkpoint_view(_checkpoints[label])
+		if not view["reachable"]:
+			_answer(peer, _err(("history no longer reaches checkpoint '%s': a step made after it was " +
+				"dropped or replaced (Dungeondraft keeps %d steps, its 'Max undos' preference, and a " +
+				"map resize or a deleted level clears them). Nothing was changed; undo step by step, " +
+				"or reopen the last saved map.") % [label, _max_undos()]))
+			return
+		if int(view["user_steps"]) > 0 and not bool(job["include_user"]):
+			_answer(peer, _err(("%d of the %d steps since checkpoint '%s' are the user's own edits, made " +
+				"by hand in Dungeondraft. Nothing was changed. A rollback would undo those too: do it " +
+				"only if the user asked for that, with include_user=true.") % [
+				int(view["user_steps"]), int(view["steps_since"]), label]))
+			return
+		job["label"] = label
+		job["left"] = int(view["steps_since"])
+	_job = job
+	_job_tick()
+
+
+# Advance the history move in flight. Called every frame from update().
+func _job_tick() -> void:
+	var job = _job
+	if job["peer"].get_status() != StreamPeerTCP.STATUS_CONNECTED:
+		_job = null   # the caller gave up: no further moves on its behalf
+		return
+	if job["cmd"] == "rollback_checkpoint":
+		var cp = _checkpoints.get(job["label"])
+		job["left"] = int(_checkpoint_view(cp)["steps_since"]) if cp != null else 0
+	if int(job["left"]) <= 0 and job["moves"].empty():
+		_finish_job(_job_result(job, ""))   # nothing to do
+		return
+	if _dd_history_busy():
+		if OS.get_ticks_msec() - int(job["since"]) > JOB_PATIENCE_MSEC:
+			_finish_job(_job_result(job, "Dungeondraft stayed busy (saving, exporting, or its history is locked)"))
+		return
+	if int(job["left"]) <= 0:
+		_finish_job(_job_result(job, ""))   # the last move has settled
+		return
+	var refusal = _job_move(job)
+	if refusal != "":
+		_finish_job(_job_result(job, refusal))
+
+
+# One Undo() or Redo() for the job. Returns "" when the move was made, else
+# why not.
+func _job_move(job : Dictionary) -> String:
+	var move = _guarded_move(bool(job["redo"]), bool(job["include_user"]))
+	if not move["moved"]:
+		if move.has("by"):
+			job["blocked_by"] = move["by"]
+		return str(move["reason"])
+	job["moves"].append(move["summary"])
+	job["left"] = int(job["left"]) - 1
+	job["since"] = OS.get_ticks_msec()
+	return ""
+
+
+# One Undo() or Redo() with the checks Dungeondraft leaves to its caller:
+# there is a step to move to, it is one this caller may touch, and the
+# bookmark did move. The caller sees to it that Dungeondraft is free
+# (_dd_history_busy). Returns { "moved": true, "summary" } or
+# { "moved": false, "reason", "by"? }.
+func _guarded_move(redo : bool, include_user : bool) -> Dictionary:
+	var records = _dd_records()
+	var at = _dd_bookmark()
+	var index = at + 1 if redo else at
+	if index < 0 or index >= records.size():
+		return { "moved": false, "reason": "nothing to redo" if redo else "nothing to undo" }
+	var record = records[index]
+	if _record_owner(record) == "user" and not include_user:
+		if redo:
+			return { "moved": false, "by": "user", "reason": ("the step to redo is the user's own edit, " +
+				"made by hand in Dungeondraft. Leave it unless the user asked: redo(include_user=true) " +
+				"brings it back, and they can press Ctrl+Y themselves") }
+		return { "moved": false, "by": "user", "reason": ("the newest step is the user's own edit, made " +
+			"by hand in Dungeondraft. Leave it unless the user asked for it to be undone: " +
+			"undo(include_user=true) takes it back, and they can press Ctrl+Z themselves") }
+	var summary = _record_summary(record)
+	if redo:
+		_dd_history().Redo()
+	else:
+		_dd_history().Undo()
+	if _dd_bookmark() == at:
+		return { "moved": false, "reason": "Dungeondraft did not take the step" }
+	return { "moved": true, "summary": summary }
+
+
+func _job_result(job : Dictionary, refusal : String) -> Dictionary:
+	var at = _dd_bookmark()
+	var redo_depth = _dd_records().size() - 1 - at
+	var moves = job["moves"]
+	if job["cmd"] == "rollback_checkpoint":
+		var kinds := []
+		var user := 0
+		for move in moves:
+			kinds.append(move["kind"])
+			if move["by"] == "user":
+				user += 1
+		var rolled := { "label": job["label"], "rolled_back": moves.size(), "kinds": kinds,
+			"user_steps": user, "undo_depth": at + 1, "redo_depth": redo_depth }
+		if refusal != "":
+			rolled["stopped"] = refusal   # short of the checkpoint
+		return _ok(rolled)
+	var key = "redone" if job["redo"] else "undone"
+	if moves.empty():
+		var none := { key: false, "reason": refusal }
+		if job.has("blocked_by"):
+			none["by"] = job["blocked_by"]
+		return _ok(none)
+	var done := { key: true }
+	for field in moves[0]:
+		done[field] = moves[0][field]
+	done["undo_depth"] = at + 1
+	done["redo_depth"] = redo_depth
+	return _ok(done)
+
+
+func _finish_job(resp : Dictionary) -> void:
+	var peer = _job["peer"]
+	_job = null
+	_answer(peer, resp)
+
+
+# A checkpoint taken with nothing to undo has no step to hold on to. It stays
+# reachable for as long as the oldest step made since is still in history, so
+# that step is noted the first time one is seen. The checkpoint is given up
+# when that step is gone, or when history was already full by then (steps may
+# have dropped off the bottom unseen). When everything since has been undone
+# the map is at the checkpoint again, and the next step made is the one to
+# note. Runs before every request and after every change to the record list;
+# it reads nothing unless such a checkpoint is open.
+func _watch_checkpoints(records = null) -> void:
+	for label in _checkpoints:
+		var cp = _checkpoints[label]
+		if not cp.has("first") or int(cp["anchor"]) != 0 or bool(cp["lost"]):
+			continue
+		if records == null:
+			records = _dd_records()
+		var at = _dd_bookmark()
+		if int(cp["first"]) == 0:
+			if at >= 0 and not records.empty():
+				cp["first"] = _record_key(records[0])
+				cp["lost"] = records.size() >= _max_undos()
+		elif _record_index(records, int(cp["first"])) < 0:
+			cp["lost"] = true
+		elif at < 0:
+			cp["first"] = 0
+
+
+# A checkpoint on the shared timeline: the steps done since it, how many of
+# them the user made, and whether undoing them still leads back to it. It no
+# longer does when the step it was placed after is gone from history: dropped
+# off the bottom, or undone by hand and then replaced by a new edit.
+func _native_checkpoint_view(cp : Dictionary) -> Dictionary:
+	var records = _dd_records()
+	var at = int(min(_dd_bookmark(), records.size() - 1))
+	var keep := -1   # index of the newest step a rollback leaves done
+	var reachable = not bool(cp.get("lost", false))
+	if int(cp.get("anchor", 0)) != 0:
+		keep = _record_index(records, int(cp["anchor"]))
+		reachable = keep >= 0
+	var steps := 0
+	var user := 0
+	if reachable:
+		for i in range(keep + 1, at + 1):
+			steps += 1
+			if _record_owner(records[i]) == "user":
+				user += 1
+	return { "label": cp["label"], "steps_since": steps, "user_steps": user, "reachable": reachable,
+		"age_ms": OS.get_ticks_msec() - int(cp["opened"]) }
 
 
 func _apply_op(op, undo : bool):
@@ -552,9 +1120,12 @@ func _apply_op(op, undo : bool):
 		"transform":
 			_apply_props(Global.World.GetNodeByID(int(op["id"])), op["old"] if undo else op["new"])
 		"terrain":
-			_restore_splat(op["before"] if undo else op["after"])
+			# On the level it was painted on, whichever level is showing when
+			# the user presses Ctrl+Z; a level deleted since takes nothing back.
+			if not op.has("level") or is_instance_valid(op["level"]):
+				_restore_splat(op["before"] if undo else op["after"], op.get("level"))
 		"cave":
-			_restore_cave(op["before"] if undo else op["after"])
+			_restore_cave(op["before"] if undo else op["after"], op.get("mesh"))
 		"wall":
 			if Global.World.HasNodeID(int(op["id"])):
 				var wall = Global.World.GetNodeByID(int(op["id"]))
@@ -774,10 +1345,16 @@ func _cave_snapshot():
 # Restore a snapshotted cave BitMap and rebuild the mesh (mirror of _restore_splat
 # for the cave layer). A duplicate(true) of the stored snapshot is pushed so the
 # op's snapshot stays pristine across repeated undo/redo.
-func _restore_cave(bm):
+func _restore_cave(bm, mesh = null):
 	if bm == null:
 		return
-	var cave = _cave_mesh()
+	# An op names the mesh it dug (its level's): restoring must neither follow
+	# the user to another level nor switch their tool to the Cave Brush.
+	var cave = mesh
+	if cave == null:
+		cave = _cave_mesh()
+	elif not is_instance_valid(cave):
+		return   # that level is gone
 	if cave == null or not cave.has_method("SetBitmap"):
 		return
 	cave.call("SetBitmap", bm.duplicate(true))
@@ -808,7 +1385,7 @@ func _safe_dispatch(req : Dictionary) -> Dictionary:
 		# --- read / query ---
 		"ping": return _ok({ "pong": true, "protocol": PROTOCOL_VERSION, "engine": Engine.get_version_info(),
 			"auth": "token" if _require_token else "off", "authenticated": _authenticated(req),
-			"paused": _paused })
+			"paused": _paused, "history": _history_mode() })
 		"get_status": return _get_status()
 		"list_asset_categories": return _ok({ "categories": ASSET_CATEGORIES })
 		"list_assets": return _list_assets(req)
@@ -884,7 +1461,8 @@ func _safe_dispatch(req : Dictionary) -> Dictionary:
 		"focus_element": return _focus_element(req)
 		"fit_elements": return _fit_elements(req)
 		"reset_camera": return _reset_camera()
-		# --- history (bridge-managed undo/redo of the model's own edits) ---
+		# --- history (fallback mode; the shared history answers undo, redo and
+		# rollback_checkpoint from _start_job before they get here) ---
 		"undo": return _do_undo()
 		"redo": return _do_redo()
 		"begin_undo_group": return _begin_group(req)
@@ -895,6 +1473,8 @@ func _safe_dispatch(req : Dictionary) -> Dictionary:
 		# --- selection ---
 		"select_elements": return _select_elements(req)
 		"clear_selection": return _clear_selection()
+		"get_selection": return _get_selection()
+		"get_cursor": return _get_cursor()
 		# --- native access (Dungeondraft's own API and UI) ---
 		"native_targets": return _native_targets()
 		"native_describe": return _native_describe(req)
@@ -942,6 +1522,7 @@ func _get_status() -> Dictionary:
 		"counts": counts,
 		"active_tool": Global.Editor.ActiveToolName,
 		"paused": _paused,
+		"history": _history_mode(),
 	})
 
 
@@ -1717,12 +2298,16 @@ func _add_text(req : Dictionary) -> Dictionary:
 		var tt = Global.Editor.Tools["TextTool"]
 		var saved_size = tt.FontSize
 		var saved_color = tt.FontColor
+		var saved_focus = tt.get("focus")
 		tt.FontSize = size
 		tt.FontColor = col
 		tt.focus = text
 		tt.UpdateText(text)
 		tt.FontSize = saved_size
 		tt.FontColor = saved_color
+		# The tool's focus is the text the user is editing: get_selection reads
+		# it, so it must not be left on a text the bridge made.
+		tt.focus = saved_focus if _live_text(saved_focus) else null
 	else:
 		# No tool available: best-effort direct set.
 		text.fontSize = size
@@ -2683,9 +3268,14 @@ func _delete_level(req : Dictionary) -> Dictionary:
 	Global.Editor.UpdateLevelOptions()
 	if Global.World.GetCurrentLevel() == null:
 		Global.World.SetLevel(0, false)
+	if _native:
+		# As deleting a level in Dungeondraft's own window does: steps that
+		# refer to what was on the level, the user's included, cannot be undone.
+		_forget_history()
 	var rows = _list_levels()["result"]
 	rows["deleted_id"] = id
 	rows["deleted_label"] = label
+	rows["history_cleared"] = _native
 	return _ok(rows)
 
 
@@ -3261,13 +3851,106 @@ func _select_elements(req : Dictionary) -> Dictionary:
 		if node != null:
 			stool.SelectThing(node, true)
 			n += 1
-	stool.EnableTransformBox(true)
+	# The Select tool makes its transform box the first time the user picks
+	# the tool; before that EnableTransformBox throws inside Dungeondraft.
+	if stool.get("transformBox") != null:
+		stool.EnableTransformBox(true)
 	return _ok({ "selected": n })
 
 
 func _clear_selection() -> Dictionary:
 	Global.Editor.Tools["SelectTool"].DeselectAll()
 	return _ok({ "cleared": true })
+
+
+const MAX_SELECTION := 200
+
+# A Text that is on the map right now.
+func _live_text(node) -> bool:
+	return node != null and typeof(node) == TYPE_OBJECT and is_instance_valid(node) \
+		and _is_text(node) and node.is_inside_tree()
+
+
+# What the user has selected: the Select tool's selection, described like
+# list_elements does, and, while the Text tool is in hand, the text in focus
+# there (texts are not selectable with the Select tool). `bounds` and
+# `center` cover all of it, so "these" has a place as well as ids.
+# Dungeondraft drops the selection when the user switches tool.
+func _get_selection() -> Dictionary:
+	if Global.World.GetCurrentLevel() == null:
+		return _err("no map open")
+	var nodes := []
+	if Global.Editor.Tools.has("SelectTool"):
+		var picked = Global.Editor.Tools["SelectTool"].get("Selected")
+		if typeof(picked) == TYPE_ARRAY:
+			for node in picked:
+				if node != null and is_instance_valid(node) and not (node in nodes):
+					nodes.append(node)
+	if Global.Editor.ActiveToolName == "TextTool" and Global.Editor.Tools.has("TextTool"):
+		var focus = Global.Editor.Tools["TextTool"].get("focus")
+		if _live_text(focus) and not (focus in nodes):
+			nodes.append(focus)
+	var elements := []
+	var bounds = null
+	for node in nodes:
+		var rect = _element_rect(node)
+		if rect != null:
+			bounds = rect if bounds == null else bounds.merge(rect)
+		if elements.size() < MAX_SELECTION:
+			elements.append(_describe(node))
+	var out := { "count": nodes.size(), "elements": elements,
+		"active_tool": Global.Editor.ActiveToolName, "level_index": Global.World.CurrentLevelId }
+	if nodes.size() > elements.size():
+		out["truncated"] = true
+	if bounds != null:
+		out["bounds"] = [bounds.position.x, bounds.position.y, bounds.end.x, bounds.end.y]
+		out["center"] = _vec(bounds.position + bounds.size * 0.5)
+	return _ok(out)
+
+
+# Whether the pointer is on the map view or on one of Dungeondraft's panels is
+# Godot's own hit test: the map view is one Control (Editor's `content`), and
+# it gets mouse_entered / mouse_exited as the pointer moves between it and
+# whatever is drawn over it. Until the first of those the control's rectangle
+# is the best guess.
+func _watch_canvas() -> void:
+	var canvas = Global.Editor.get("content")
+	if canvas == null or typeof(canvas) != TYPE_OBJECT or not (canvas is Control):
+		return
+	canvas.connect("mouse_entered", self, "_on_canvas_pointer", [true])
+	canvas.connect("mouse_exited", self, "_on_canvas_pointer", [false])
+	_on_canvas = canvas.get_global_rect().has_point(canvas.get_global_mouse_position())
+
+
+func _on_canvas_pointer(inside : bool) -> void:
+	_on_canvas = inside
+
+
+# Where the user's pointer is on the map, for "here": the woxel position, the
+# same point on the user's snap grid (what a placement with snap=true would
+# use), and the tile it is in. The position is where the pointer last was
+# inside Dungeondraft's window: `window_focused` false with `moving` false is
+# the usual picture while the user types in another window with the pointer
+# parked on the map. `over_map` false means it rests on a panel or toolbar, or
+# off the map's edge: the position is then not a place the user pointed at.
+func _get_cursor() -> Dictionary:
+	if Global.World.GetCurrentLevel() == null:
+		return _err("no map open")
+	var pos = Global.WorldUI.get("MousePosition")
+	if typeof(pos) != TYPE_VECTOR2:
+		return _err("this Dungeondraft does not report the cursor position")
+	var size = Global.World.WoxelDimensions
+	var out := {
+		"position": _vec(pos),
+		"snapped": _vec(_snap_point(pos)),
+		"tile": [int(floor(pos.x / 256.0)), int(floor(pos.y / 256.0))],
+		"over_map": _on_canvas != false and pos.x >= 0.0 and pos.y >= 0.0 and pos.x <= size.x and pos.y <= size.y,
+		"moving": bool(Global.WorldUI.get("IsMouseMoving")),
+		"window_focused": OS.is_window_focused(),
+		"active_tool": Global.Editor.ActiveToolName,
+		"level_index": Global.World.CurrentLevelId,
+	}
+	return _ok(out)
 
 
 # ---------------------------------------------------------------------------
@@ -3641,6 +4324,12 @@ func _native_property_type(obj, prop : String) -> int:
 	return typeof(_native_read(obj, prop))
 
 
+# History.Undo() and Redo() check no bounds: one call too many leaves the
+# user's undo broken until Dungeondraft restarts. The history commands bring
+# the checks; native_set and native_call stay off the object.
+const HISTORY_HANDS_OFF := ("Dungeondraft's History is not for native_set / native_call: use undo, redo, " +
+	"checkpoint and rollback_checkpoint, which make its moves safely")
+
 func _native_set(req : Dictionary) -> Dictionary:
 	var target = str(req.get("target", "Level"))
 	var obj = _native_object(target)
@@ -3648,6 +4337,7 @@ func _native_set(req : Dictionary) -> Dictionary:
 	var prop = str(req.get("property", ""))
 	if prop == "" or prop.begins_with("_") or prop == "script" or prop.find("<") != -1:
 		return _err("bad property name: " + prop)
+	if obj == Global.Editor.get("History"): return _err(HISTORY_HANDS_OFF)
 	if obj.has_method("get_" + prop) and not obj.has_method("set_" + prop):
 		return _err("property '%s' is read-only (it has no setter)" % prop)
 	var u = _native_unpack(req.get("value"))
@@ -3668,6 +4358,7 @@ func _native_call(req : Dictionary) -> Dictionary:
 	var method = str(req.get("method", ""))
 	if not _native_callable(method):
 		return _err("only Dungeondraft's own methods (PascalCase) can be called: " + method)
+	if obj == Global.Editor.get("History"): return _err(HISTORY_HANDS_OFF)
 	var args = req.get("args", [])
 	if typeof(args) != TYPE_ARRAY: return _err("'args' must be a list")
 	# A C# default argument is NOT filled in for a call from here, and a call
@@ -3796,6 +4487,8 @@ func _ui_action(req : Dictionary) -> Dictionary:
 			if node.toggle_mode:
 				node.call_deferred("set_pressed", not node.pressed)
 			node.call_deferred("emit_signal", "pressed")
+			if _native:
+				_pressed_mark = _history_mark()   # what the press records is the assistant's step
 			return _ok({ "target": target, "pressed": true })
 		"set":
 			var bad = _ui_set(node, req.get("value"))
@@ -4900,6 +5593,13 @@ func _shift_regions(delta : Vector2) -> void:
 
 func _forget_history() -> void:
 	_close_all_groups()
+	if _native:
+		_dd_history().Clear()
+		_prune_steps()
+		for label in _checkpoints:
+			_checkpoints[label]["lost"] = true
+			_checkpoints[label]["anchor"] = 0
+		return
 	for op in _undo_stack:
 		_release_op(op)
 	_undo_stack = []
@@ -5089,8 +5789,12 @@ func _generator_options() -> Dictionary:
 	return _ok({ "design": str(gen.get("Design")), "designs": WIZARD_DESIGNS, "dials": _generator_dials(gen) })
 
 
-# Run Dungeondraft's own Map Wizard generator on the current level. Not
-# undoable through the bridge: a layout is thousands of nodes.
+# Run Dungeondraft's own Map Wizard generator on the current level. The
+# bridge builds no undo op for it (a layout is thousands of nodes), but
+# Dungeondraft records the generation in its own history: on the shared
+# timeline that record is the assistant's step (see _settle), and undo takes
+# it back as far as Dungeondraft's own undo does. On 1.2.0.1 that is all of a
+# "Dungeon"; a "Cave" keeps its walls.
 func _generate_dungeon(req : Dictionary) -> Dictionary:
 	var level = Global.World.GetCurrentLevel()
 	if level == null: return _err("no map open")
@@ -5110,6 +5814,7 @@ func _generate_dungeon(req : Dictionary) -> Dictionary:
 	var before := {}
 	for kind in COLLECTIONS:
 		before[kind] = _collection(level, kind).get_child_count()
+	var mark = _history_mark() if _native else null
 	var was_active = _tool_take("Generator", gen)
 	if design != "":
 		gen.Design = design
@@ -5121,9 +5826,12 @@ func _generate_dungeon(req : Dictionary) -> Dictionary:
 	var after := {}
 	for kind in COLLECTIONS:
 		after[kind] = _collection(level, kind).get_child_count()
+	var recorded = mark != null and not _made_since(mark, _dd_records(), _dd_bookmark()).empty()
 	return _ok({ "design": str(gen.get("Design")), "dials": _generator_dials(gen),
-		"counts_before": before, "counts_after": after, "level_id": level.ID,
-		"note": "not undoable through the bridge; the layout was added to the current level" })
+		"counts_before": before, "counts_after": after, "level_id": level.ID, "undoable": recorded,
+		"note": ("added to the current level; undo() takes it back the way Dungeondraft's own Ctrl+Z " +
+			"does (a Cave keeps its walls)") if recorded
+			else "not undoable through the bridge; the layout was added to the current level" })
 
 
 # ---------------------------------------------------------------------------
@@ -5267,8 +5975,12 @@ func _refresh_panel() -> void:
 		token_text = "Token: could not be created, edits refused (see the log)"
 	_set_panel_text("token", token_text)
 	_set_panel_text("last", "Last request: " + (_last_request if _last_request != "" else "none yet"))
-	_set_panel_text("history", "Assistant history: %d of %d steps%s" % [_undo_stack.size(), MAX_UNDO_OPS,
-		" (paused)" if _paused else ""])
+	if _native:
+		_set_panel_text("history", "Undo history: shared with Ctrl+Z, %d assistant steps%s" % [
+			_steps.size() + _adopted.size(), " (paused)" if _paused else ""])
+	else:
+		_set_panel_text("history", "Assistant history: %d of %d steps%s" % [_undo_stack.size(), MAX_UNDO_OPS,
+			" (paused)" if _paused else ""])
 
 
 func _on_panel_pause(pressed : bool) -> void:
@@ -5280,6 +5992,10 @@ func _on_panel_pause(pressed : bool) -> void:
 
 func _on_panel_undo() -> void:
 	_close_all_groups()
+	if _native:
+		_last_request = _panel_undo_shared()
+		_refresh_panel()
+		return
 	var result = _do_undo()
 	if result.get("ok", false) and result["result"].get("undone", false):
 		_last_request = "undone from the panel at %s (%s)" % [_clock(), str(result["result"].get("kind", ""))]
@@ -5288,6 +6004,19 @@ func _on_panel_undo() -> void:
 	else:
 		_last_request = "could not undo: " + str(result.get("error", ""))
 	_refresh_panel()
+
+
+# The panel's undo on the shared timeline: only when the newest step is the
+# assistant's. The user's own steps are theirs to undo with Ctrl+Z.
+func _panel_undo_shared() -> String:
+	if _job != null or _dd_history_busy():
+		return "Dungeondraft is busy; try again in a moment"
+	var move = _guarded_move(false, false)
+	if move["moved"]:
+		return "undone from the panel at %s (%s)" % [_clock(), str(move["summary"].get("kind", ""))]
+	if move.get("by") == "user":
+		return "the newest step is your own: Ctrl+Z undoes it"
+	return str(move["reason"])
 
 
 func _on_panel_require_token(pressed : bool) -> void:

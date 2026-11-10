@@ -42,7 +42,13 @@ paused AI edits in Dungeondraft's MCP Bridge panel: tell them, and make no edits
 until they resume (read-only tools still work). If a call fails with a token
 error, this server could not read the token Dungeondraft wrote, or a
 DD_BRIDGE_TOKEN / DD_BRIDGE_TOKEN_FILE override points elsewhere: say so and
-stop; the user fixes the override or restarts Dungeondraft."""
+stop; the user fixes the override or restarts Dungeondraft.
+
+The user works in the same map. When they say "these" or "this one", read
+get_selection; when they say "here", read get_cursor. Your edits and theirs
+share Dungeondraft's undo history (Ctrl+Z): undo and rollback_checkpoint leave
+a step the user made by hand alone unless you pass include_user=True, which is
+for when the user asked for it."""
 
 mcp = FastMCP("dungeondraft", instructions=INSTRUCTIONS)
 
@@ -218,6 +224,10 @@ def ping() -> dict:
     authenticated=False with auth="token" means the mod and this server do
     not share the bridge token. paused=True means every editing tool will be
     refused until the user resumes in Dungeondraft's MCP Bridge panel.
+    history says where undo steps live: "dungeondraft" when your edits are in
+    Dungeondraft's own history, shared with the user's Ctrl+Z (see undo), or
+    "bridge" when this Dungeondraft build lacks that and the bridge keeps a
+    separate list of your edits only.
     """
     return bridge.request("ping")
 
@@ -227,6 +237,7 @@ def get_status() -> dict:
     """Report the current map: whether one is open, its size and center in woxels, per-type element counts, level info, and whether AI edits are paused.
 
     Call this first — map_center is the default placement point, and counts tell you what's already on the map.
+    history is "dungeondraft" when your edits share Dungeondraft's own undo history with the user (see undo), else "bridge".
     """
     return bridge.request("get_status")
 
@@ -1657,6 +1668,46 @@ def clear_selection() -> dict:
     return bridge.request("clear_selection")
 
 
+@_tool()
+def get_selection() -> dict:
+    """What the user has selected in Dungeondraft right now: read it when they say "these", "this one" or "the selected ...".
+
+    Returns count and elements, each described as list_elements does (id,
+    kind, position, asset, layer, and so on), so the ids go straight into
+    move_element, modify_*, delete_elements or fit_elements. bounds
+    [x0, y0, x1, y1] and center cover the whole selection in woxels: "next to
+    these" or "between them" has a place as well as ids. While the user has
+    the Text tool in hand, the text they are editing counts as selected.
+    active_tool is the tool the user has in hand.
+
+    count 0 means nothing is selected: Dungeondraft drops the selection when
+    the user switches tool, so ask them to select with the Select tool and
+    leave it selected. Read-only: it works while AI edits are paused.
+    """
+    return bridge.request("get_selection")
+
+
+@_tool()
+def get_cursor() -> dict:
+    """Where the user's mouse pointer is on the map: read it when they say "here", "over there" or "where I'm pointing".
+
+    position is the woxel point under the pointer; snapped is the same point
+    on the user's snap grid (what a placement with snap=True would use); tile
+    is the [column, row] of the grid cell it is in. over_map is False when the
+    pointer rests on one of Dungeondraft's panels or toolbars, or outside
+    the map's edge: the position is then not a place the user pointed at.
+
+    The position is where the pointer last was inside Dungeondraft's window.
+    While the user types to you the pointer is usually parked on the spot they
+    mean: window_focused False with moving False is that picture. If over_map
+    is False, or the spot makes no sense for the request, ask the user to rest
+    the pointer on the place and say so again; for several elements,
+    get_selection is the sturdier signal. Read-only: it works while AI edits
+    are paused.
+    """
+    return bridge.request("get_cursor")
+
+
 # --------------------------------------------------------------------------
 # Layout checks — sizes, collisions and regions (geometry in spatial.py)
 # --------------------------------------------------------------------------
@@ -1943,22 +1994,40 @@ def ui_action(target: str, action: str, value: Any = None) -> dict:
 # --------------------------------------------------------------------------
 
 @_tool()
-def undo() -> dict:
-    """Reverse the last reversible edit you made (create / delete / move / modify / terrain / cave / water / material).
+def undo(include_user: bool = False) -> dict:
+    """Undo the newest step in the map's history: what Ctrl+Z would undo.
 
-    The bridge keeps its own undo/redo stack, so this reliably steps back through
-    your own edits; it is independent of Dungeondraft's Ctrl+Z. A batch, a
-    scatter, a built room or a multi-element delete is one step. Not
-    reversible: delete_level, set_terrain_slot, and native_* / ui_* calls.
-    History keeps the last 200 steps.
+    Your edits are steps in Dungeondraft's own undo history, in one timeline
+    with the edits the user makes by hand, and the user's Ctrl+Z / Ctrl+Y walk
+    the same steps. A batch, a scatter, a built room or a multi-element delete
+    is one step. Returns undone, by ("assistant" or "user"), kind, and
+    undo_depth / redo_depth (steps left to undo and to redo, the user's
+    included).
+
+    If the newest step is one the user made by hand, nothing is undone and
+    the result says so (undone False, by "user"): your own step lies under
+    theirs and cannot be reached without undoing theirs first. Tell the user,
+    and pass include_user=True only when they asked for their edit to be
+    undone too.
+
+    Not reversible: delete_level and a map resize (both clear the history),
+    set_terrain_slot, and native_* / ui_* calls. History keeps as many steps
+    as Dungeondraft's "Max undos" preference (32 unless the user changed it).
+    When ping reports history "bridge", this steps back through your own edits
+    only, in a list of up to 200 that Ctrl+Z does not touch.
     """
-    return bridge.request("undo")
+    return bridge.request("undo", include_user=include_user)
 
 
 @_tool()
-def redo() -> dict:
-    """Re-apply the last edit reversed by undo()."""
-    return bridge.request("redo")
+def redo(include_user: bool = False) -> dict:
+    """Redo the step undone last: what Ctrl+Y would redo.
+
+    Works on the same shared history as undo(), and with the same rule: a
+    step the user made by hand is redone only with include_user=True. Any new
+    edit, yours or the user's, discards the steps that could be redone.
+    """
+    return bridge.request("redo", include_user=include_user)
 
 
 # --------------------------------------------------------------------------
@@ -2227,7 +2296,8 @@ def set_map_size(width: int, height: int, left: int = 0, top: int = 0) -> dict:
     Dungeondraft's own shift gets wrong: the terrain paint, the cave borders
     and the trace image. Shrinking does not delete what then lies outside the
     map (crop_map does). Every level is resized together and read back; the
-    bridge's undo history is cleared, as Dungeondraft clears its own.
+    undo history is cleared, the user's steps included, as Dungeondraft's own
+    Change Map Size does, and open checkpoints can no longer be rolled back.
     save_map first if in doubt. Returns the new size, the previous one and
     content_shift_woxels.
     """
@@ -2375,8 +2445,10 @@ def generate_dungeon(
     omitted, the wizard's current choice. boundary, complexity, density: the
     wizard's dials, within the ranges generator_options reports. The layout
     is ADDED to the current level, so run it on an empty level (add_level,
-    then set_level) and save_map first: it is NOT undoable through the
-    bridge. Returns the element counts before and after.
+    then set_level) and save_map first. Returns the element counts before
+    and after, and undoable: True when Dungeondraft recorded the generation
+    in the shared history, so undo() takes it back the way Ctrl+Z after the
+    wizard does (a Cave keeps its walls); otherwise it cannot be undone.
     """
     params: dict = {}
     if design:
@@ -2610,29 +2682,39 @@ def checkpoint(label: str) -> dict:
     """Mark a point in history, so everything after it can be undone in one call.
 
     Call it before a multi-step change (a room, a set piece, a lighting
-    pass); rollback_checkpoint(label) then undoes every edit made since,
-    newest first. Reusing a label moves its mark to now. History keeps the
-    last 200 steps, so a checkpoint older than that can no longer be reached.
+    pass); rollback_checkpoint(label) then undoes every step made since,
+    newest first. Reusing a label moves its mark to now. history_limit is how
+    many steps the history keeps (Dungeondraft's "Max undos" preference, 32 by
+    default): once a step made after the checkpoint drops off the far end,
+    the checkpoint can no longer be reached. A batch is one step, so prefer
+    batch and place_objects for long builds.
     """
     return bridge.request("checkpoint", label=label)
 
 
 @_tool()
-def rollback_checkpoint(label: str) -> dict:
-    """Undo every edit made since checkpoint(label), in one call.
+def rollback_checkpoint(label: str, include_user: bool = False) -> dict:
+    """Undo every step made since checkpoint(label), in one call.
 
-    Reports how many steps it reversed and their kinds. The checkpoint stays
-    open, so a second attempt can be rolled back to the same point. Refuses,
-    changing nothing, when history no longer reaches it. Edits that are not
-    undoable (delete_level, set_terrain_slot, native_* and ui_* calls) are
-    not reversed.
+    Reports how many steps it reversed, their kinds, and how many of them
+    were the user's (user_steps). The checkpoint stays open, so a second
+    attempt can be rolled back to the same point.
+
+    The history is shared with the user, so the steps since the checkpoint
+    can include edits they made by hand. Then the rollback refuses, changing
+    nothing, and says how many: taking the map back to the checkpoint would
+    undo their work too. Pass include_user=True only when the user asked for
+    that. It also refuses when history no longer reaches the checkpoint. A
+    result with "stopped" means it ended short of the checkpoint and why.
+    Edits that are not undoable (set_terrain_slot, native_* and ui_* calls)
+    are not reversed.
     """
-    return bridge.request("rollback_checkpoint", label=label)
+    return bridge.request("rollback_checkpoint", label=label, include_user=include_user)
 
 
 @_tool()
 def list_checkpoints() -> dict:
-    """List the open checkpoints: label, steps made since, and whether a rollback still reaches it."""
+    """List the open checkpoints: label, steps made since (steps_since, and user_steps for those the user made by hand), and whether a rollback still reaches it."""
     return bridge.request("list_checkpoints")
 
 
@@ -2685,9 +2767,11 @@ def delete_level(index: int) -> dict:
     """Delete a level (floor) by its index (see list_levels). NOT undoable.
 
     Dungeondraft frees the level and everything on it, so save_map first if
-    in doubt. The last remaining level cannot be deleted; deleting the
-    current level switches the editor to a neighbour first. Returns the
-    level list, with the deleted level's id and label.
+    in doubt. Like deleting a level in Dungeondraft itself, it clears the
+    undo history, the user's steps included (history_cleared), and open
+    checkpoints can no longer be rolled back. The last remaining level cannot
+    be deleted; deleting the current level switches the editor to a neighbour
+    first. Returns the level list, with the deleted level's id and label.
     """
     return bridge.request("delete_level", index=index)
 
@@ -2700,7 +2784,8 @@ def delete_level(index: int) -> dict:
 # the map out from under the rest of the batch, and itself.
 _NOT_BATCHABLE = {"batch", "screenshot", "export_map", "export_uvtt", "open_map", "preview_assets",
                   # these close or wipe the batch's own undo group
-                  "undo", "redo", "checkpoint", "rollback_checkpoint", "list_checkpoints", "set_map_size", "crop_map"}
+                  "undo", "redo", "checkpoint", "rollback_checkpoint", "list_checkpoints", "set_map_size", "crop_map",
+                  "delete_level"}
 
 
 @_tool()
@@ -2713,14 +2798,18 @@ def batch(calls: list[dict], stop_on_error: bool = True, single_undo: bool = Tru
        {"tool": "add_light", "args": {"x": 1024, "y": 768, "range": 1.5}}]
     A later call cannot use an earlier call's result (such as a new id); when
     you need one, end the batch there. Not available inside a batch:
-    screenshot, export_map, export_uvtt, open_map, and the history tools
-    (undo, redo, checkpoints).
+    screenshot, export_map, export_uvtt, open_map, the history tools
+    (undo, redo, checkpoints), and the tools that clear the history
+    (set_map_size, crop_map, delete_level).
 
     Returns one entry per call that ran: {tool, ok, result} or {tool, ok: false,
     error}. With stop_on_error (the default) the batch stops at the first
     failure, leaving the earlier calls done: it is not all-or-nothing. With
     single_undo (the default) every edit in the batch is ONE undo() step;
-    pass False to keep each edit its own step.
+    pass False to keep each edit its own step. The exception is a call the
+    bridge has no undo for but Dungeondraft records itself (generate_dungeon,
+    native_call, ui_action): it is a step of its own, and the edits after it
+    in the batch form a second step.
     """
     if not 1 <= len(calls) <= 100:
         raise ValueError("give 1 to 100 calls")

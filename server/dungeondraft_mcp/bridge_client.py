@@ -60,11 +60,23 @@ class BridgeError(Exception):
     """Raised when the bridge is unreachable or returns an error response."""
 
 
+# Commands the mod answers over several frames, with the seconds to allow
+# them. With the shared history a move goes through Dungeondraft's own
+# History.Undo() / Redo(), which hold a lock for three frames after each step
+# and wait out a save or an export, so an undo takes a few frames and a
+# rollback a few frames per step. See PROTOCOL.md, "History".
+SLOW_COMMANDS = {"undo": 20.0, "redo": 20.0, "rollback_checkpoint": 90.0}
+
+
 class BridgeClient:
     def __init__(self, host: str = "127.0.0.1", port: int = 8787, timeout: float = 5.0):
         self.host = host
         self.port = port
         self.timeout = timeout
+
+    def timeout_for(self, cmd: str) -> float:
+        """Seconds to wait for the answer to `cmd`: never less than the client's own timeout."""
+        return max(self.timeout, SLOW_COMMANDS.get(cmd, 0.0))
 
     def request(self, cmd: str, **params) -> dict:
         payload = {"cmd": cmd, **params}
@@ -72,10 +84,11 @@ class BridgeClient:
         if token:
             payload["token"] = token
         data = (json.dumps(payload) + "\n").encode("utf-8")
+        timeout = self.timeout_for(cmd)
 
         try:
-            with socket.create_connection((self.host, self.port), timeout=self.timeout) as sock:
-                sock.settimeout(self.timeout)
+            with socket.create_connection((self.host, self.port), timeout=timeout) as sock:
+                sock.settimeout(timeout)
                 sock.sendall(data)
                 buf = b""
                 while b"\n" not in buf:

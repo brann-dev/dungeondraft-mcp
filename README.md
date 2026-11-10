@@ -27,7 +27,7 @@ The mod opens a TCP server inside Dungeondraft and polls it every frame from the
 forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
 
 > **Status: working.** Confirmed end-to-end against Dungeondraft on **Godot
-> 3.4.2** — raw TCP from the modding sandbox works, no fallback needed. 101 tools
+> 3.4.2** — raw TCP from the modding sandbox works, no fallback needed. 103 tools
 > across query / create / arrange / modify / terrain / water / materials /
 > levels / layers / layout and scene checks / asset packs / map files / VTT
 > import and export / selection / capture / camera / history / map lifecycle,
@@ -122,6 +122,10 @@ forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
   element), `fit_elements` (frame a group), `reset_camera` (recover a lost
   view) — point the view before a `screenshot` to inspect specific spots like a
   door cut into a wall.
+- **Work alongside you:** `get_selection` reads what you have selected in
+  Dungeondraft (ids, kinds and the bounds of the selection) and `get_cursor`
+  where your mouse pointer rests on the map, so you can select a few things or
+  park the pointer somewhere and say "make these bigger" or "put a chest here".
 - **Native access:** `native_targets`, `native_describe`, `native_get`,
   `native_set`, `native_call` reach Dungeondraft's own objects, and `ui_tree` /
   `ui_action` read and operate its panels and dialogs, for anything without a
@@ -129,13 +133,18 @@ forwards calls as JSON. See [PROTOCOL.md](PROTOCOL.md) for the wire format.
   A last resort: it bypasses undo, so save first.
 - **Batch:** `batch` runs up to 100 tool calls in one request, for long runs
   of independent placements, as one undo step.
-- **Undo:** the bridge keeps its own undo/redo stacks for create / delete /
-  move / modify / layer / terrain / cave / water / material edits, so `undo` /
-  `redo` let the model reliably reverse its own changes (independent of
-  Dungeondraft's Ctrl+Z). A batch, a scatter, a built room, a prefab or a
-  multi-element delete is one step. `checkpoint` marks a point in history and
-  `rollback_checkpoint` undoes everything since in one call; `list_checkpoints`
-  shows what is open. History keeps the last 200 steps.
+- **Undo:** every reversible edit (create / delete / move / modify / layer /
+  terrain / cave / water / material) is a step in Dungeondraft's own undo
+  history, on one timeline with the edits you make by hand. Your Ctrl+Z and
+  Ctrl+Y walk through the assistant's steps as well as your own, and its
+  `undo` / `redo` move the same history; they leave a step you made by hand
+  alone unless you ask for it (`include_user`). A batch, a scatter, a built
+  room, a prefab or a multi-element delete is one step. `checkpoint` marks a
+  point in history and `rollback_checkpoint` undoes everything since in one
+  call; `list_checkpoints` shows what is open. History keeps as many steps as
+  Dungeondraft's **Max undos** preference (32 by default). On a Dungeondraft
+  build that lacks what this needs, the bridge falls back to an undo list of
+  its own, separate from Ctrl+Z, and `ping` says which is in use.
 
 Every element is referenced by an integer `id`; create and list calls return
 ids you feed back into edit calls. Coordinates are woxel (pixel) space — call

@@ -39,14 +39,23 @@ so and make no edits until they resume.
 - **Look at your work**: `screenshot` (current view) and the camera tools
   (`set_camera`, `focus_element`, `fit_elements`) return/aim the view so you can
   inspect what you built and iterate. Use them.
-- The bridge keeps its **own** `undo` / `redo` stacks (independent of DD's
-  Ctrl+Z). Deletes are undoable; `batch`, `scatter_objects`, `build_room`,
-  `place_objects`, `move_elements` and `delete_elements` are each ONE undo
-  step. The placement tools take `snap=True` to land on the user's grid
-  (`get_snap_settings` shows it); `set_map_size` resizes the map and clears
-  the undo history. `checkpoint(label)` before a multi-step change lets
-  `rollback_checkpoint(label)` take all of it back. `delete_level` is not
-  undoable.
+- Edits are steps in **Dungeondraft's own undo history**, one timeline shared
+  with the user: their Ctrl+Z undoes your steps, and `undo` / `redo` /
+  `rollback_checkpoint` move the same history. A step the user made by hand is
+  left alone (`undone: false, by: "user"`) unless you pass
+  `include_user=True`: do that only when the user asked. Deletes are
+  undoable; `batch`, `scatter_objects`, `build_room`, `place_objects`,
+  `move_elements` and `delete_elements` are each ONE step. History keeps
+  Dungeondraft's "Max undos" (32 by default). `checkpoint(label)` before a
+  multi-step change lets `rollback_checkpoint(label)` take all of it back.
+  `set_map_size` and `delete_level` are not undoable and clear the history.
+  `ping` reports `history: "bridge"` on a Dungeondraft where the bridge had
+  to fall back to an undo list of its own (your edits only, no Ctrl+Z).
+- **Selection and pointer:** when the user says "these" or "this one", read
+  `get_selection` (ids, kinds, bounds); for "here", read `get_cursor`
+  (position, snapped point, tile). Both work while edits are paused.
+- The placement tools take `snap=True` to land on the user's grid
+  (`get_snap_settings` shows it).
 - **Furnishing a room:** run `validate_floorplan` first (is every room
   reachable, does every door open onto something), read `get_asset_footprint`
   before choosing a scale (sprites vary wildly in size), place with
@@ -104,3 +113,11 @@ If you change code (not just drive the map), the two halves reload differently:
   restart loads an edited `.gd`.
 - The layout checks live in `server/dungeondraft_mcp/spatial.py` and are unit
   tested offline: `.venv/bin/python -m unittest discover -s server/tests`.
+- The undo code drives Dungeondraft's `History`, which checks nothing itself
+  (PROTOCOL.md, "Shared history"). After changing it, run
+  `tools/test_mod_history.py --godot <headless Godot 3.4.2>` (offline, a
+  stand-in History that counts every unsafe call) and `server/test_history.py`
+  (live).
+- **Never read a plain C# object from GDScript** (a property whose class does
+  not derive from Godot's `Object`, such as `Global.Preferences`): Dungeondraft
+  crashes natively, with no message.
