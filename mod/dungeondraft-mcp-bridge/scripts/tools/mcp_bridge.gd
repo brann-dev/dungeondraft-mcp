@@ -60,7 +60,7 @@ const READ_ONLY_CMDS := [
 	"native_targets", "native_describe", "native_get", "ui_tree",
 	"spatial_snapshot", "asset_footprint", "list_spatial_regions", "list_checkpoints",
 	"get_map_style", "list_prefabs", "generator_options", "select_elements", "clear_selection",
-	"get_snap_settings", "preview_assets",
+	"get_snap_settings", "preview_assets", "get_selection", "get_cursor",
 ]
 # Neutral opaque tint for pattern floors when no color is given. PatternShapeTool
 # has no per-texture default (and its .Color leaks across calls), so we apply a
@@ -1421,6 +1421,8 @@ func _safe_dispatch(req : Dictionary) -> Dictionary:
 		# --- selection ---
 		"select_elements": return _select_elements(req)
 		"clear_selection": return _clear_selection()
+		"get_selection": return _get_selection()
+		"get_cursor": return _get_cursor()
 		# --- native access (Dungeondraft's own API and UI) ---
 		"native_targets": return _native_targets()
 		"native_describe": return _native_describe(req)
@@ -3793,13 +3795,82 @@ func _select_elements(req : Dictionary) -> Dictionary:
 		if node != null:
 			stool.SelectThing(node, true)
 			n += 1
-	stool.EnableTransformBox(true)
+	# The Select tool makes its transform box the first time the user picks
+	# the tool; before that EnableTransformBox throws inside Dungeondraft.
+	if stool.get("transformBox") != null:
+		stool.EnableTransformBox(true)
 	return _ok({ "selected": n })
 
 
 func _clear_selection() -> Dictionary:
 	Global.Editor.Tools["SelectTool"].DeselectAll()
 	return _ok({ "cleared": true })
+
+
+const MAX_SELECTION := 200
+
+# What the user has selected: the Select tool's selection, described like
+# list_elements does, and the text in focus in the Text tool (texts are not
+# selectable with the Select tool). `bounds` and `center` cover all of it, so
+# "these" has a place as well as ids. Dungeondraft drops the selection when
+# the user switches tool.
+func _get_selection() -> Dictionary:
+	if Global.World.GetCurrentLevel() == null:
+		return _err("no map open")
+	var nodes := []
+	if Global.Editor.Tools.has("SelectTool"):
+		var picked = Global.Editor.Tools["SelectTool"].get("Selected")
+		if typeof(picked) == TYPE_ARRAY:
+			for node in picked:
+				if node != null and is_instance_valid(node) and not (node in nodes):
+					nodes.append(node)
+	if Global.Editor.Tools.has("TextTool"):
+		var focus = Global.Editor.Tools["TextTool"].get("focus")
+		if focus != null and typeof(focus) == TYPE_OBJECT and is_instance_valid(focus) \
+				and _is_text(focus) and not (focus in nodes):
+			nodes.append(focus)
+	var elements := []
+	var bounds = null
+	for node in nodes:
+		var rect = _element_rect(node)
+		if rect != null:
+			bounds = rect if bounds == null else bounds.merge(rect)
+		if elements.size() < MAX_SELECTION:
+			elements.append(_describe(node))
+	var out := { "count": nodes.size(), "elements": elements,
+		"active_tool": Global.Editor.ActiveToolName, "level_index": Global.World.CurrentLevelId }
+	if nodes.size() > elements.size():
+		out["truncated"] = true
+	if bounds != null:
+		out["bounds"] = [bounds.position.x, bounds.position.y, bounds.end.x, bounds.end.y]
+		out["center"] = _vec(bounds.position + bounds.size * 0.5)
+	return _ok(out)
+
+
+# Where the user's pointer is on the map, for "here": the woxel position, the
+# same point on the user's snap grid (what a placement with snap=true would
+# use), and the tile it is in. The position is where the pointer last was
+# inside Dungeondraft's window: `window_focused` false with `moving` false is
+# the usual picture while the user types in another window with the pointer
+# parked on the map. `over_map` false means it rests off the map's edge.
+func _get_cursor() -> Dictionary:
+	if Global.World.GetCurrentLevel() == null:
+		return _err("no map open")
+	var pos = Global.WorldUI.get("MousePosition")
+	if typeof(pos) != TYPE_VECTOR2:
+		return _err("this Dungeondraft does not report the cursor position")
+	var size = Global.World.WoxelDimensions
+	var out := {
+		"position": _vec(pos),
+		"snapped": _vec(_snap_point(pos)),
+		"tile": [int(floor(pos.x / 256.0)), int(floor(pos.y / 256.0))],
+		"over_map": pos.x >= 0.0 and pos.y >= 0.0 and pos.x <= size.x and pos.y <= size.y,
+		"moving": bool(Global.WorldUI.get("IsMouseMoving")),
+		"window_focused": OS.is_window_focused(),
+		"active_tool": Global.Editor.ActiveToolName,
+		"level_index": Global.World.CurrentLevelId,
+	}
+	return _ok(out)
 
 
 # ---------------------------------------------------------------------------

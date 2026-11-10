@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live validator for the shared undo history (0.6.0).
+"""Live validator for the shared undo history and the selection / cursor reads (0.6.0).
 
 Run with Dungeondraft open (mod enabled, a map loaded) and no unsaved work
 you care about on the map's undo history: the test walks that history back
@@ -184,6 +184,22 @@ def main() -> int:
     check("what was there before stays", exists(a) and exists(b) and exists(c))
     v = view("history-test")
     check("the checkpoint stays open", v["steps_since"] == 0 and v["reachable"], v)
+
+    # ---- selection and cursor ----
+    s.select_elements([a, b])
+    sel = s.get_selection()
+    check("get_selection lists what is selected", sel.get("count") == 2
+          and sorted(e["id"] for e in sel["elements"]) == sorted([a, b])
+          and all(e["kind"] == "object" for e in sel["elements"]), sel)
+    check("with the bounds and centre of it", len(sel.get("bounds", [])) == 4
+          and sel["bounds"][0] < cx + 2000 < sel["bounds"][2] and len(sel.get("center", [])) == 2, sel)
+    s.clear_selection()
+    sel = s.get_selection()
+    check("and nothing when nothing is", sel.get("count") == 0 and sel.get("elements") == [] and "bounds" not in sel, sel)
+    cur = s.get_cursor()
+    check("get_cursor reports the pointer", len(cur.get("position", [])) == 2 and len(cur.get("snapped", [])) == 2
+          and cur.get("tile") == [int(cur["position"][0] // 256), int(cur["position"][1] // 256)]
+          and isinstance(cur.get("over_map"), bool) and isinstance(cur.get("window_focused"), bool), cur)
 
     # ---- Dungeondraft's History is not for native_call ----
     try:

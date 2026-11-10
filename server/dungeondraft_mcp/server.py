@@ -44,10 +44,11 @@ error, this server could not read the token Dungeondraft wrote, or a
 DD_BRIDGE_TOKEN / DD_BRIDGE_TOKEN_FILE override points elsewhere: say so and
 stop; the user fixes the override or restarts Dungeondraft.
 
-The user works in the same map. Your edits and theirs share Dungeondraft's
-undo history (Ctrl+Z): undo and rollback_checkpoint leave a step the user made
-by hand alone unless you pass include_user=True, which is for when the user
-asked for it."""
+The user works in the same map. When they say "these" or "this one", read
+get_selection; when they say "here", read get_cursor. Your edits and theirs
+share Dungeondraft's undo history (Ctrl+Z): undo and rollback_checkpoint leave
+a step the user made by hand alone unless you pass include_user=True, which is
+for when the user asked for it."""
 
 mcp = FastMCP("dungeondraft", instructions=INSTRUCTIONS)
 
@@ -1665,6 +1666,45 @@ def select_elements(ids: list[int]) -> dict:
 def clear_selection() -> dict:
     """Clear the current selection in Dungeondraft."""
     return bridge.request("clear_selection")
+
+
+@_tool()
+def get_selection() -> dict:
+    """What the user has selected in Dungeondraft right now: read it when they say "these", "this one" or "the selected ...".
+
+    Returns count and elements, each described as list_elements does (id,
+    kind, position, asset, layer, and so on), so the ids go straight into
+    move_element, modify_*, delete_elements or fit_elements. bounds
+    [x0, y0, x1, y1] and center cover the whole selection in woxels: "next to
+    these" or "between them" has a place as well as ids. A text being edited
+    with the Text tool counts as selected. active_tool is the tool the user
+    has in hand.
+
+    count 0 means nothing is selected: Dungeondraft drops the selection when
+    the user switches tool, so ask them to select with the Select tool and
+    leave it selected. Read-only: it works while AI edits are paused.
+    """
+    return bridge.request("get_selection")
+
+
+@_tool()
+def get_cursor() -> dict:
+    """Where the user's mouse pointer is on the map: read it when they say "here", "over there" or "where I'm pointing".
+
+    position is the woxel point under the pointer; snapped is the same point
+    on the user's snap grid (what a placement with snap=True would use); tile
+    is the [column, row] of the grid cell it is in. over_map is False when the
+    pointer rests outside the map's edge.
+
+    The position is where the pointer last was inside Dungeondraft's window.
+    While the user types to you the pointer is usually parked on the spot they
+    mean: window_focused False with moving False is that picture. If over_map
+    is False, or the spot makes no sense for the request, ask the user to rest
+    the pointer on the place and say so again; for several elements,
+    get_selection is the sturdier signal. Read-only: it works while AI edits
+    are paused.
+    """
+    return bridge.request("get_cursor")
 
 
 # --------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-"""The history tools: what each sends to the bridge."""
+"""The history and co-pilot tools: what each sends to the bridge."""
 
 import unittest
 from unittest import mock
@@ -34,8 +34,18 @@ class Sent(unittest.TestCase):
         server.rollback_checkpoint("a", include_user=True)
         self.assertEqual([params["include_user"] for _, params in self.calls], [True, True, True])
 
+    def test_selection_and_cursor_are_plain_reads(self):
+        server.get_selection()
+        server.get_cursor()
+        self.assertEqual(self.calls, [("get_selection", {}), ("get_cursor", {})])
+
 
 class Registered(unittest.TestCase):
+    def test_the_reads_are_tools_and_can_run_in_a_batch(self):
+        for name in ("get_selection", "get_cursor"):
+            self.assertIn(name, server._TOOLS)
+            self.assertNotIn(name, server._NOT_BATCHABLE)
+
     def test_history_moves_stay_out_of_batches(self):
         for name in ("undo", "redo", "checkpoint", "rollback_checkpoint", "list_checkpoints"):
             self.assertIn(name, server._NOT_BATCHABLE)
