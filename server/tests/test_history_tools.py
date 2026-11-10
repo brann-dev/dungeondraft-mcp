@@ -39,6 +39,12 @@ class Sent(unittest.TestCase):
         server.get_cursor()
         self.assertEqual(self.calls, [("get_selection", {}), ("get_cursor", {})])
 
+    def test_a_batch_refuses_delete_level_without_sending_it(self):
+        out = server.batch([{"tool": "delete_level", "args": {"index": 0}}])
+        self.assertEqual(out["failed"], 1)
+        self.assertIn("cannot be used inside a batch", out["results"][0]["error"])
+        self.assertEqual([cmd for cmd, _ in self.calls], ["begin_undo_group", "end_undo_group"])
+
 
 class Registered(unittest.TestCase):
     def test_the_reads_are_tools_and_can_run_in_a_batch(self):
@@ -54,9 +60,6 @@ class Registered(unittest.TestCase):
         # Each of these wipes the batch's own undo group along with the history.
         for name in ("set_map_size", "crop_map", "delete_level"):
             self.assertIn(name, server._NOT_BATCHABLE)
-        out = server.batch([{"tool": "delete_level", "args": {"index": 0}}])
-        self.assertEqual(out["failed"], 1)
-        self.assertIn("cannot be used inside a batch", out["results"][0]["error"])
 
 
 if __name__ == "__main__":
