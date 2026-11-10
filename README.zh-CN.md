@@ -23,7 +23,7 @@ mod/      ── Dungeondraft 模组（GDScript，运行在 DD 内部）
 
 模组在 Dungeondraft 内部开启一个 TCP 服务，并在每帧的 `update(delta)` 回调中轮询；Python 端把每项能力暴露为一个 MCP 工具，并以 JSON 转发调用。通信格式见 [PROTOCOL.md](PROTOCOL.md)（英文）。
 
-> **状态：可用。** 已在基于 **Godot 3.4.2** 的 Dungeondraft 上完成端到端验证：模组沙箱内可以直接使用原生 TCP，无需备用方案。共 101 个工具，涵盖查询、创建、排布、修改、地形、水域、材质、楼层、图层、布局与场景检查、素材包、地图文件、VTT 导入与导出、选择、截图与导出、镜头、历史记录、地图的打开与保存，另有一条直达 Dungeondraft 自身 API 和界面的兜底通道（见下文）。
+> **状态：可用。** 已在基于 **Godot 3.4.2** 的 Dungeondraft 上完成端到端验证：模组沙箱内可以直接使用原生 TCP，无需备用方案。共 103 个工具，涵盖查询、创建、排布、修改、地形、水域、材质、楼层、图层、布局与场景检查、素材包、地图文件、VTT 导入与导出、选择、截图与导出、镜头、历史记录、地图的打开与保存，另有一条直达 Dungeondraft 自身 API 和界面的兜底通道（见下文）。
 
 ## AI 能做什么
 
@@ -40,9 +40,10 @@ mod/      ── Dungeondraft 模组（GDScript，运行在 DD 内部）
 - **地图的打开与保存：** `get_current_map`（当前地图的路径，以及是否正在保存）、`save_map`（保存到当前文件，等同于 DD 的保存按钮）、`open_map`（切换到另一张已保存的地图；它会在新地图加载完成之前返回，请轮询 `get_current_map`；未保存的修改会被直接丢弃且没有提示，所以请先 `save_map`）。
 - **观察：** `screenshot`（当前窗口）和 `export_map`（干净的整图渲染，`grid=False` 时不带网格）会返回图像，模型可以看到自己的成果并反复调整。`set_grid` 显示或隐藏编辑器网格。`export_uvtt` 导出 Universal VTT 的 `.dd2vtt` 文件（图像 + 墙体、门、灯光），可导入 Foundry 或 Roll20；`import_dd2vtt` 则把这样的文件重建到当前打开的地图上：穿过每个门洞重新接合的墙体、门和窗、灯光与环境光，并把导出文件中的图像垫在下方作为描摹底图。
 - **镜头：** `get_camera`、`set_camera`、`focus_element`（对准某个元素）、`fit_elements`（框住一组元素）、`reset_camera`（找回丢失的视图）。截图之前先调整视图，就能查看具体位置，例如墙上开出的门洞。
+- **与你协作：** `get_selection` 读取你在 Dungeondraft 中选中的内容（id、类型以及选区的范围），`get_cursor` 读取鼠标指针停在地图上的位置，因此你可以选中几样东西，或者把指针停在某处，然后说“把这些放大一点”或“在这里放一个宝箱”。
 - **原生访问：** `native_targets`、`native_describe`、`native_get`、`native_set`、`native_call` 可以直接访问 Dungeondraft 自身的对象，`ui_tree` / `ui_action` 可以读取并操作它的面板和对话框，用于没有专用工具的功能（地形平滑混合、笔刷大小、生物群系预设等）。这是最后的手段：它绕过撤销机制，使用前请先保存。
 - **批量：** `batch` 可在一次请求中执行最多 100 个工具调用，适合大量相互独立的放置操作，整体算作一步撤销。
-- **撤销：** 桥接维护自己的撤销/重做栈，覆盖创建、删除、移动、修改、图层、地形、洞穴、水域和材质的编辑，因此模型可以用 `undo` / `redo` 可靠地回退自己的改动（与 Dungeondraft 的 Ctrl+Z 相互独立）。一次批量调用、一次散布、一间生成的房间、一个预制组合或一次多元素删除都算作一步。`checkpoint` 在历史中做一个标记，`rollback_checkpoint` 一次调用就撤销此后的全部改动；`list_checkpoints` 列出尚未回滚的标记。历史记录保留最近 200 步。
+- **撤销：** 每一次可逆的编辑（创建、删除、移动、修改、图层、地形、洞穴、水域、材质）都是 Dungeondraft 自身撤销历史中的一步，与你手动做的编辑同在一条时间线上。你的 Ctrl+Z 和 Ctrl+Y 既能回退你自己的步骤，也能回退助手的步骤，助手的 `undo` / `redo` 操作的也是同一份历史；除非你提出要求（`include_user`），它们不会动你手动做的那一步。一次批量调用、一次散布、一间生成的房间、一个预制组合或一次多元素删除都算作一步。`checkpoint` 在历史中做一个标记，`rollback_checkpoint` 一次调用就撤销此后的全部改动；`list_checkpoints` 列出尚未回滚的标记。历史记录保留的步数等于 Dungeondraft 的 **Max undos** 首选项（默认 32）。如果某个 Dungeondraft 版本缺少这一功能所需的条件，桥接会退回到自己的撤销列表，与 Ctrl+Z 相互独立，`ping` 会说明当前使用的是哪一种。
 
 每个元素都用一个整数 `id` 标识；创建和列表类调用会返回 id，供后续的编辑调用使用。坐标采用 woxel（世界像素）空间，调用 `get_status` 可得到 `map_center`。素材路径用 `list_assets` 查询。
 

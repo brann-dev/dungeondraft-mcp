@@ -27,13 +27,15 @@ a sandboxed app, a web page talking to localhost). It is not encryption.
 
 The same panel has **Pause AI edits**. While paused, only read-only commands
 run (`READ_ONLY_CMDS` in the mod: ping, status, listings, the terrain and
-spatial read-backs, screenshot and export, camera, selection, `native_get` /
-`native_describe` / `native_targets`, `ui_tree`); everything else is refused
+spatial read-backs, screenshot and export, camera, selection (`get_selection`
+and `get_cursor` included), `native_get` / `native_describe` /
+`native_targets`, `ui_tree`); everything else is refused
 with `error: "paused: ..."`. `ping` and `get_status` report `paused`; `ping`
 also reports `auth` ("token" / "off") and `authenticated`. The pause persists
 across restarts until the user lifts it. **Undo the assistant's last step**
-in the panel pops the bridge's own undo stack. The panel and its controls are
-unreachable through `native_*` and `ui_action`.
+in the panel undoes the newest step in history when it is the assistant's
+(see History); the user's own steps are theirs to undo with Ctrl+Z. The panel
+and its controls are unreachable through `native_*` and `ui_action`.
 
 ## Request
 
@@ -80,8 +82,8 @@ Coordinates are **woxel** (world pixel) space; map center is in
 
 | cmd | params | result |
 | --- | --- | --- |
-| `ping` | — (no token needed) → `{ pong: true, protocol, engine, auth: "token"|"off", authenticated, paused }` |
-| `get_status` | — | `{ map_open, level_id, level_index, level_count, map_size_woxels, map_center, terrain_slots (4 or 8), terrain_visible, counts{}, active_tool }`, `paused` |
+| `ping` | — (no token needed) → `{ pong: true, protocol, engine, auth: "token"|"off", authenticated, paused, history: "dungeondraft"|"bridge" }` (`history`: where undo steps live, see History) |
+| `get_status` | — | `{ map_open, level_id, level_index, level_count, map_size_woxels, map_center, terrain_slots (4 or 8), terrain_visible, counts{}, active_tool }`, `paused`, `history` |
 | `list_asset_categories` | — | `{ categories[] }` |
 | `list_assets` | `category="Objects"`, `search=""`, `limit=100` | `{ category, total, matched, returned, assets[] }` |
 | `list_elements` | `kind="objects"`, `limit=200` | `{ kind, count, elements[] }` | Walls and paths also report `points` (world space) and `loop`, roofs `bounds` [x0, y0, x1, y1] from their `GlobalRect`: for all three `position` is the origin.
@@ -187,8 +189,8 @@ polygon, >= 3 points, with some area).
 | `clone_level` | `index`, `label?` → `{ id, label, index: 0, current_index }` |
 | `reorder_levels` | `ids[]` (every level id once, top floor first) → level list |
 | `compare_levels` | `index=-1` (-1 = off), `reference_opacity=0.35`, `current_opacity=1` → `{ comparing, ... }` |
-| `delete_level` | `index` → level list + `{ deleted_id, deleted_label }`; refuses the last level; **not** undoable |
-| `set_map_size` | `width`, `height` (tiles, 8–128), `left=0`, `top=0` (tiles added, or trimmed when negative, on those edges, each within ±128; the rest goes right/bottom) → `{ width_tiles, height_tiles, previous_tiles, changed, map_size_woxels, content_shift_woxels, steps, history_cleared }`. Drives the Change Map Size window (`Master.ChangeMapSize`, which shifts every element by left/top). Dungeondraft's own terrain shift blits with the new size as the source rect and loses paint at the far edges, and its cave mesh is left unfinalised, so the mod snapshots every level's splat before a shifting step and restores a correctly offset copy (`_resize_repair`), finalises every cave mesh, moves the trace image and shifts the level's spatial regions. The bridge's history is cleared. **Not** undoable. |
+| `delete_level` | `index` → level list + `{ deleted_id, deleted_label, history_cleared }`; refuses the last level; **not** undoable. With the shared history it clears Dungeondraft's history, as deleting a level in its own window does |
+| `set_map_size` | `width`, `height` (tiles, 8–128), `left=0`, `top=0` (tiles added, or trimmed when negative, on those edges, each within ±128; the rest goes right/bottom) → `{ width_tiles, height_tiles, previous_tiles, changed, map_size_woxels, content_shift_woxels, steps, history_cleared }`. Drives the Change Map Size window (`Master.ChangeMapSize`, which shifts every element by left/top). Dungeondraft's own terrain shift blits with the new size as the source rect and loses paint at the far edges, and its cave mesh is left unfinalised, so the mod snapshots every level's splat before a shifting step and restores a correctly offset copy (`_resize_repair`), finalises every cave mesh, moves the trace image and shifts the level's spatial regions. The undo history is cleared (Dungeondraft clears its own; the bridge's steps and open checkpoints go with it). **Not** undoable. |
 | `add_layer` | `layer` (z, -4096..4096), `label?` → layer list |
 | `configure_level` | `ambient_light?`, `lighting?`, `terrain_visible?`, `smooth_terrain?`, `water_shoreline?` → `{ level_id, ambient_light, lighting, terrain_visible, smooth_terrain, water_shoreline }` (no params = just read) |
 | `set_trace_image` | `path` (empty = remove), `x?`, `y?`, `scale=1`, `opacity=0.5` → `{ trace_image, path?, position?, scale?, opacity?, image_size? }` |
@@ -199,9 +201,11 @@ polygon, >= 3 points, with some area).
 | `list_prefabs` | `set?` → `{ sets, set, prefabs }` (the Prefab tool's Set dropdown and List; the tool is enabled for the read and disabled again unless it was active) |
 | `place_prefab` | `name`, `set?`, `x?`, `y?` → `{ prefab, ids, count, centre, unmoved?, note? }`. Selects the list item (`PrefabTool.OnSelectPrefab` deserialises the prefab into the level), shifts the movable pieces (props, lights, free portals, texts) so their centre lands on x,y, then `Confirm()`. One `group` undo op of the created nodes. |
 | `generator_options` | — → `{ design, designs, dials: { boundary, complexity, density: {value, min, max, step} } }` (the Generator tool's `Design` and Range controls) |
-| `generate_dungeon` | `design?` (Dungeon / Cave), `boundary?`, `complexity?`, `density?` → `{ design, dials, counts_before, counts_after, level_id }`; runs `Generator.Generate()` on the current level. **Not** undoable. |
+| `generate_dungeon` | `design?` (Dungeon / Cave), `boundary?`, `complexity?`, `density?` → `{ design, dials, counts_before, counts_after, level_id, undoable, note }`; runs `Generator.Generate()` on the current level. The bridge has no undo op for it; `undoable` is true when Dungeondraft recorded the generation in the shared history, where `undo` takes it back the way Ctrl+Z does (a Cave keeps its walls). |
 | `select_elements` | `ids[]` |
 | `clear_selection` | — |
+| `get_selection` | — → `{ count, elements[], truncated?, bounds?: [x0,y0,x1,y1], center?: [x,y], active_tool, level_index }`. What the user has selected: the Select tool's `Selected`, each element as `list_elements` describes it (up to 200), plus the text in focus in the Text tool. `bounds` / `center` enclose all of it. Dungeondraft drops the selection when the user switches tool. Read-only |
+| `get_cursor` | — → `{ position: [x,y], snapped: [x,y], tile: [col,row], over_map, moving, window_focused, active_tool, level_index }`. Where the user's pointer is: `WorldUI.MousePosition` in woxels, the same point on the snap grid (as `"snap": true` would place it), and the 256-woxel tile it is in. It is where the pointer last was inside Dungeondraft's window; `over_map` is false outside the map's edge. Read-only |
 
 ### Map lifecycle
 
@@ -296,7 +300,10 @@ an object, `{ "$type": "Texture", "category", "asset" }` for an asset texture,
 value/min/max/step?, selected?, items?, selected_items?, color? }`.
 `ui_action` `set` takes `true`/`false` for a toggle, a number for a slider or
 spin box, a string for a text field, an item index or its exact text for an
-option or item list, a color for a color picker.
+option or item list, a color for a color picker. `native_set` and
+`native_call` refuse `Editor.History`: its `Undo()` and `Redo()` check no
+bounds, and one call too many leaves the user's undo locked until Dungeondraft
+restarts. The history commands make those moves with the checks.
 
 ### Capture
 
@@ -334,36 +341,73 @@ the rect's midpoint; `fit_elements` frames the union of all rects.
 
 ### History
 
-The bridge keeps its **own** undo/redo stacks (it does not use Dungeondraft's
-`History.CreateCustomRecord`, which is unreliable on 3.4.2 — see notes). Every
-reversible edit (creates including `import_image`, `move_element`,
+Every reversible edit of the bridge is a step in **Dungeondraft's own undo
+history** (`Global.Editor.History`), recorded with
+`History.CreateCustomRecord`. The user's edits and the assistant's share one
+timeline: Ctrl+Z, Ctrl+Y and the toolbar arrows undo and redo the bridge's
+steps in order with the user's own, and `undo` / `redo` /
+`rollback_checkpoint` move the same history. `ping` and `get_status` report
+this mode as `history: "dungeondraft"`.
+
+Reversible edits: creates including `import_image`, `move_element`,
 `modify_object`, `modify_wall`, `modify_light`, `modify_text`,
 `set_element_layer`, `fill_terrain`, `fill_region`, `paint_terrain`,
 `paint_path`, `dig_cave`, `clear_caves`, `draw_water`, `draw_material`,
-`place_pattern`, `delete_element`, `delete_elements`) pushes an op; a fresh
-edit clears the redo stack. Terrain ops snapshot the splat images
-before/after; `dig_cave` and `draw_material` snapshot their `BitMap` the same
-way, `draw_water` the water mesh's saved state, `modify_wall` the wall's points,
-texture, tint and flags. A deleted object is serialised (`Prop.Save`) and
-rebuilt by `LoadObject` on undo with its id; any other deleted node is detached
-from the tree and held by the op. History keeps the last 200 ops; past that
-the oldest is dropped (and freed, if it held a detached node).
+`place_pattern`, `place_prefab`, `set_map_style`, `delete_element`,
+`delete_elements`. Terrain ops snapshot the splat images before/after, on the
+level they were painted on; `dig_cave` and `draw_material` snapshot their
+`BitMap` the same way, `draw_water` the water mesh's saved state, `modify_wall`
+the wall's points, texture, tint and flags. A deleted object is serialised
+(`Prop.Save`) and rebuilt by `LoadObject` on undo with its id; any other
+deleted node is detached from the tree and held by the step.
 
 | cmd | params | result |
 | --- | --- | --- |
-| `undo` | — | `{ undone, kind?, steps?, label?, undo_depth? }` / `{ undone: false, reason }` |
-| `redo` | — | `{ redone, kind?, steps?, label?, redo_depth? }` / `{ redone: false, reason }` |
+| `undo` | `include_user=false` | `{ undone: true, by, kind, steps?, label?, undo_depth, redo_depth }` / `{ undone: false, reason, by? }` |
+| `redo` | `include_user=false` | `{ redone: true, by, kind, steps?, label?, undo_depth, redo_depth }` / `{ redone: false, reason, by? }` |
 | `begin_undo_group` | `label?`, `undo_group` (token) | `{ open_groups, label }` |
 | `end_undo_group` | `undo_group` (token) | `{ steps, open_groups, undo_depth }` |
-| `checkpoint` | `label` (≤64 chars; reusing a label moves it) | `{ label, undo_depth, history_limit }` |
-| `list_checkpoints` | — | `{ checkpoints: [{ label, steps_since, reachable, age_ms }] }` |
-| `rollback_checkpoint` | `label` | `{ label, rolled_back, kinds[], undo_depth, redo_depth }`; refuses if history no longer reaches the mark |
+| `checkpoint` | `label` (≤64 chars; reusing a label moves it) | `{ label, undo_depth, history_limit, history }` |
+| `list_checkpoints` | — | `{ checkpoints: [{ label, steps_since, user_steps, reachable, age_ms }] }` |
+| `rollback_checkpoint` | `label`, `include_user=false` | `{ label, rolled_back, kinds[], user_steps, undo_depth, redo_depth, stopped? }`; refuses if history no longer reaches the mark, or if steps of the user's are in the way and `include_user` is false |
 
-**Undo groups.** Between `begin_undo_group` and `end_undo_group`, every
-recorded op joins the group instead of the stack; the group is pushed as one
-op of kind `group` (undone newest entry first, redone in order), or as the
-lone entry when only one edit was recorded, or not at all when none was. The
-server opens a group around `batch`, `scatter_objects`, `place_objects` and
+**Whose step.** `by` is `"assistant"` for a step of the bridge and `"user"` for
+one made by hand in Dungeondraft. `undo` and `redo` act on the newest step
+(the one Ctrl+Z / Ctrl+Y would take). When that step is the user's they do
+nothing and answer `{ undone: false, by: "user", reason }`, unless
+`include_user` is true: the assistant's own step lies under the user's and a
+linear history cannot reach it without undoing theirs first, which is the
+user's call. `rollback_checkpoint` counts the user's steps since the mark and
+refuses with an error, changing nothing, when there are any and `include_user`
+is false. `kind` is the op's kind (`create`, `transform`, `terrain`, `group`,
+...) or `"dungeondraft"` for a step Dungeondraft recorded and undoes itself:
+the user's, or its own record of a bridge command that has no op (see below).
+`undo_depth` / `redo_depth` count every step that can be undone / redone now,
+whoever made it.
+
+**Timing.** `History.Undo()` and `Redo()` run the step at once, then stay
+locked for three frames and drop a call made meanwhile; they also refuse
+while Dungeondraft is saving or exporting. The mod therefore answers a history
+move only when the step has settled (a few frames later), makes one move per
+free frame for a rollback, and holds every other request until then. A client
+should allow these commands longer than the rest: the server uses 20 s for
+`undo` / `redo` and 90 s for `rollback_checkpoint`. A move that waits more
+than 8 s for Dungeondraft is given up: `undo` answers `{ undone: false,
+reason }`, a rollback returns what it did with `stopped: "<why>"`.
+
+**Depth.** History keeps as many steps as Dungeondraft's **Max undos**
+preference (32 by default, `history_limit` in `checkpoint`'s result), the
+user's and the assistant's together; the oldest drops off past that. A new
+edit by either side discards the steps that could be redone.
+
+**Undo groups.** Between `begin_undo_group` and `end_undo_group` every
+recorded op joins one step: the step is recorded with the group's first op, so
+Ctrl+Z in the middle of a batch undoes what the batch has done so far, and
+later ops join it for as long as it is still the newest step. If the user
+edited or undid by hand in between, the rest of the group becomes a second
+step. A step with several ops reports `kind: "group"`, `steps` and the
+outermost group's `label`; nested groups are flattened into it. The server
+opens a group around `batch`, `scatter_objects`, `place_objects` and
 `move_elements`, and the mod around `build_room`'s wall and floor, so each is
 one undo step. Every request made inside a group carries the group's token as
 `undo_group`; a request without the open group's token closes the group first
@@ -371,15 +415,26 @@ one undo step. Every request made inside a group carries the group's token as
 edits swallowed into a stale group. `undo`, `redo` and the checkpoint commands
 close any open group before they run.
 
-**Checkpoints** remember the serial number of the newest op at the time; a
-rollback undoes while the top op is newer than that. Ops pushed get increasing
-serials (a redo gets a fresh one), and `_lost_serial` records the newest op
-dropped from history: a checkpoint older than it is reported `reachable:
-false` and refused.
+**Checkpoints** remember the newest step that was done when they were taken; a
+rollback undoes down to it. `reachable` turns false, and a rollback refuses,
+once that step is gone from history: dropped off the far end past Max undos,
+or undone by hand and then replaced by a new edit. A checkpoint taken with
+nothing to undo holds on to the first step made after it instead. A map resize
+and a deleted level clear the history and with it every open checkpoint.
 
-Not recorded: `delete_level`, `set_terrain_slot`, levels, selection, capture
-and native/UI commands. This stack is independent of the user's Ctrl+Z in
-Dungeondraft.
+Not recorded: `set_terrain_slot`, levels, selection, capture and
+`native_set`. `delete_level` and `set_map_size` clear the history.
+`native_call` and `ui_action` record nothing themselves, but when
+Dungeondraft records a step for what they did (as it does for
+`generate_dungeon`), that step is on the timeline as the assistant's.
+
+**Fallback.** `history: "bridge"` means this Dungeondraft's `History` lacks
+something the shared mode reads (see the notes), or `"native_history": false`
+is set in `user://mcp_bridge_settings.json`. The bridge then keeps undo/redo
+stacks of its own, as it did before protocol 31: `undo` / `redo` /
+`rollback_checkpoint` cover the assistant's edits only (`by` is always
+`"assistant"`, `user_steps` 0, `include_user` is ignored), answer at once, keep
+the last 200 steps, and Ctrl+Z does not touch them.
 
 `color` accepts `"#rrggbb"` / `"#rrggbbaa"` (the `#` is optional) or `[r,g,b]`
 / `[r,g,b,a]` floats 0..1. Colors in results use the same form, with the alpha
@@ -466,15 +521,71 @@ pair only when the color is not opaque.
   the Master node like `IsSaving`) in `update()` and restores levels, grid and a
   camera snapshot when it drops. `export_finish` is the explicit fallback and
   also clears a stuck `IsExporting`; `reset_camera` rescues a view left off-map.
-- **`undo` / `redo`** — bridge-managed stacks, not DD's history. DD 3.4.2's
-  `History.CreateCustomRecord` does not record programmatic creates, invokes
-  custom `undo()` inconsistently, and never round-trips `redo()`, so the bridge
-  uses its own. Create ops detach/re-attach the node (remove_child / add_child,
-  keeping a reference and a stable id); transform ops restore a property
-  snapshot; terrain ops restore the cloned splat images. Handlers that know
-  their own before/after state (`modify_wall`, `draw_water`, `draw_material`)
-  return the op next to their result (`_ok_op`); `_record_and_dispatch` strips
-  it from the response and pushes it.
+- **`undo` / `redo` ops** — create ops detach/re-attach the node
+  (remove_child / add_child, keeping a reference and a stable id); transform
+  ops restore a property snapshot; terrain ops restore the cloned splat
+  images. Handlers that know their own before/after state (`modify_wall`,
+  `draw_water`, `draw_material`) return the op next to their result
+  (`_ok_op`); `_record_and_dispatch` strips it from the response and records
+  it. An op must not depend on which level is showing or which tool is
+  active when it is undone: the user can press Ctrl+Z at any moment. Terrain
+  ops carry their level and cave ops their `CaveMesh` for that reason.
+- **Shared history** — Dungeondraft's `History` (`Global.Editor.History`, a new
+  one with every map) is a `List<HistoryRecord>` plus a private `bookmark`,
+  the index of the newest record that is done. `Record()` cuts off everything
+  above the bookmark, appends, and drops the oldest record past
+  `Preferences.MaxUndos`. `CreateCustomRecord(reference)` records a
+  `CustomHistoryRecord` whose `Undo()` / `Redo()` call `undo()` / `redo()` on
+  the given Reference.
+  - **Why the first attempt (protocol 4) looked unreliable.** `Undo()` is
+    `history[bookmark--].Undo()` and `Redo()` is `history[++bookmark].Redo()`
+    with no bounds check: one call too many throws after the bookmark has
+    moved, and since the method is `async void` that sets `locked = true`
+    first and clears it only after three awaited frames, the exception leaves
+    the history locked for good. A call made inside those three frames, or
+    while `Master.IsBusy`, is silently dropped. The toolbar never hits either
+    case because `OnHistoryChanged` disables its buttons; a caller that goes
+    straight to `History` has to check `bookmark`, the list and `locked`
+    itself. The mod does (`_job_move`, `_dd_history_busy`) and makes one move
+    per free frame (`_job_tick`).
+  - **What is read.** `bookmark` and `locked` are private fields and
+    `history` a public one; all three are reachable from GDScript (see
+    "Calling DD's C# from the mod"), and `history` arrives as a copy of the
+    list, one Object per record. A record's `ScriptInstance` is the Reference
+    it was made with, which is how the mod finds its own steps again. `start()`
+    probes all of it, and that `bookmark` can be written, before choosing the
+    shared mode.
+  - **The record is a shell.** `McpStep` (an inner class, a Reference) holds
+    the bridge's instance id and a serial; the op lives in the mod's `_steps`.
+    Dungeondraft drops records without telling anyone (past Max undos, as a
+    cut-off redo branch, on `Clear()`), and a Reference that only the C# side
+    still holds is freed from the finalizer thread, so nothing that needs
+    cleaning up may hang off the record. The mod compares `_steps` with the
+    list after every recording and frees what a forgotten step still held
+    out of the tree (`_prune_steps`). `CustomHistoryRecord.Dispose` frees a
+    mod script when the Reference has a `Script` property holding one, so the
+    shell must not have one.
+  - **Dungeondraft records some of the bridge's commands itself**: a
+    free-standing portal (`Level.CreateFreestandingPortal`), a pattern floor
+    (`PatternShapes.Draw*`), water (`WaterMesh`), a confirmed prefab, a
+    generated layout. Left alone, one command would be two presses of Ctrl+Z,
+    the second undoing what is already gone. The mod notes which records
+    exist before a command and, when the command has an op, moves `bookmark`
+    back under the records Dungeondraft added and records its own step, which
+    cuts them off exactly as a new edit cuts off a redo branch (`_settle`).
+    That write to `bookmark` is the one place the mod changes Dungeondraft's
+    history other than through its methods, and `Record()` runs in the same
+    call. A command without an op keeps Dungeondraft's records, marked as the
+    assistant's (`_adopted`); `ui_action`'s deferred press is picked up one
+    frame later.
+  - **Side effects that come with it.** `OnHistoryChanged` marks the map
+    modified (the title's asterisk, autosave backups, the unsaved-changes
+    prompt), which bridge edits did not do before. `OnUndoOrRedo` clears the
+    Select tool's transform selection.
+  - **Offline test.** `tools/test_mod_history.py` runs this code in the stock
+    Godot binary against a stand-in `History` with the same rules, which counts
+    every dropped or out-of-bounds call (`tools/mod_history_test.gd`). CI runs
+    it next to the compile check.
 - **`paint_terrain` / `fill_region` / `paint_path`** — all edit the splat weight
   image directly (`CloneSplatImage` → raise the target slot's channel per pixel →
   `RestoreSplat`) rather than `Terrain.Paint(...)`, which does not modify the
@@ -688,6 +799,12 @@ pair only when the color is not opaque.
     `get_method_list()` lists them like public ones. Generic containers cross
     only when Godot can marshal them: `List<T>` and `Dictionary<K,V>` do,
     `SortedDictionary` and `HashSet` read as `null`.
+  - **A plain C# object must not be read at all.** A property whose value is
+    a C# class that does not derive from Godot's `Object` cannot be turned
+    into a Variant, and asking for it crashed Dungeondraft natively:
+    `Global.Preferences` (reached as `get_node("/root/Global").get("Preferences")`)
+    took 1.2.0.1 down with no message. Read such settings some other way; the
+    mod takes Max undos from `user://config.ini`.
   - One more trap of the same kind: `Script.GetAssetTexture` throws (and so
     returns `null`) for an asset path it does not know. The bridge's "could not
     load ... asset" errors rely on that `null`; each one also leaves an

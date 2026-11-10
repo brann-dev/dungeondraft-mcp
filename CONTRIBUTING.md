@@ -45,11 +45,16 @@ A new or changed command touches both halves and the docs:
 5. **README.md:** the tool list and the tool count. The README has six
    translations (`README.*.md`); update them too, or say in the pull request
    that they still need it.
-6. **Undo:** an edit the user could want to reverse should push an undo op
-   (see `_ok_op` and `_apply_op` in the mod).
+6. **Undo:** an edit the user could want to reverse should hand back an undo
+   op (see `_ok_op` and `_apply_op` in the mod). The op becomes a step in
+   Dungeondraft's own history, so the user's Ctrl+Z runs it too, at any
+   moment: it must not depend on which level is showing or which tool is
+   active. PROTOCOL.md ("Shared history") explains how the steps are kept.
 7. **Tests:** a check in `server/test_bridge.py` if the command can clean up
    after itself, and unit tests in `server/tests/` for logic that runs without
-   Dungeondraft.
+   Dungeondraft. A change to the history code also runs
+   `tools/test_mod_history.py` (offline, with the Godot binary of the compile
+   check) and `server/test_history.py` (live).
 
 ## Rules for the mod
 
@@ -70,6 +75,10 @@ whole editor down:
 - **Add a class-level `var` only if you need one.** Reload Mods crashes
   Dungeondraft when a script's member variables have changed, so such a change
   needs a full restart. Say so in the pull request.
+- **Read only Godot values from Dungeondraft's objects.** A property that
+  holds a plain C# object (`Global.Preferences` is one) crashes Dungeondraft
+  when GDScript asks for it. And leave `Editor.History` to the history code:
+  its `Undo()` and `Redo()` check nothing themselves.
 
 ## Rules for the whole project
 
