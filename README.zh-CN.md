@@ -180,7 +180,7 @@ PROTOCOL.md                    通信协议 + 实现笔记（英文）
 
 扩展地形槽、墙体编辑、图片导入、水域、材质、楼层与图层工具、布局检查、原生与界面访问、灯光与文字编辑、散布和批量调用，最初由 Li-Jiaquan 在本项目的分支 [dungeondraft-mcp-bridge](https://github.com/Li-Jiaquan/dungeondraft-mcp-bridge) 中实现，之后移植回本仓库。
 
-共用墙体、整次请求算作一步的撤销与可撤销的删除、平面图与场景检查、素材包读取、地图文件检视、Universal VTT 导入、排布工具，以及灯光使用 Dungeondraft 自身的 Range，最初由 thekannen 在 [battlemap-mcp](https://github.com/thekannen/battlemap-mcp) 中实现（该项目是对本项目六月原型的重写），之后在这里对照 Dungeondraft 自身的代码重新推导实现。
+整次请求算作一步的撤销与可撤销的删除、检查点、排布工具与共用墙体、平面图与场景检查、素材包的列出、搜索与准备、预览总图、地图文件检视、Universal VTT 导入、预制组合与地图向导生成器、地图样式、灯光使用 Dungeondraft 自身的 Range 以及门的默认设置、桥接令牌与暂停面板、地图大小调整与裁剪，以及对 Custom Snap Mod 的支持，最初由 [@thekannen](https://github.com/thekannen) 在 [battlemap-mcp](https://github.com/thekannen/battlemap-mcp)（对本项目的重写）中实现，之后在这里对照 Dungeondraft 自身的代码重新推导实现。
 
 ## 许可
 

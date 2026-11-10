@@ -180,7 +180,7 @@ PROTOCOL.md                    通信プロトコル + 実装メモ（英語）
 
 拡張地形スロット、壁の編集、画像のインポート、水域、マテリアル、レベルとレイヤーのツール、レイアウトチェック、ネイティブ/UI アクセス、ライトとテキストの編集、スキャッター、バッチは、Li-Jiaquan 氏がこのプロジェクトのフォーク [dungeondraft-mcp-bridge](https://github.com/Li-Jiaquan/dungeondraft-mcp-bridge) で最初に実装し、そこから移植したものです。
 
-共有壁、リクエスト全体を 1 回で取り消すアンドゥと取り消せる削除、間取りとシーンのチェック、アセットパックの読み取り、マップファイルの検査、Universal VTT のインポート、配置ツール、ライトへの Dungeondraft 自身の Range の採用は、thekannen 氏が [battlemap-mcp](https://github.com/thekannen/battlemap-mcp)（このプロジェクトの 6 月のプロトタイプを作り直したもの）で最初に実装し、ここでは Dungeondraft 自身のコードに照らして改めて導き出したものです。
+リクエスト全体を 1 回で取り消すアンドゥと取り消せる削除、チェックポイント、配置ツールと共有壁、間取りとシーンのチェック、アセットパックの一覧・検索・準備、プレビューのコンタクトシート、マップファイルの検査、Universal VTT のインポート、プレハブとマップウィザードのジェネレーター、マップスタイル、ライトへの Dungeondraft 自身の Range の採用とドアの既定値、ブリッジのトークンと一時停止パネル、マップのサイズ変更と切り取り、Custom Snap Mod への対応は、[@thekannen](https://github.com/thekannen) 氏が [battlemap-mcp](https://github.com/thekannen/battlemap-mcp)（このプロジェクトを作り直したもの）で最初に実装し、ここでは Dungeondraft 自身のコードに照らして改めて導き出したものです。
 
 ## ライセンス
 

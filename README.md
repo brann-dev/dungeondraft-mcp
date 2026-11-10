@@ -328,12 +328,15 @@ scatter and batch were first built by Li-Jiaquan in
 [dungeondraft-mcp-bridge](https://github.com/Li-Jiaquan/dungeondraft-mcp-bridge),
 a fork of this project, and were ported back from there.
 
-Shared walls, whole-request undo and undoable deletes, the floorplan and scene
-checks, asset pack reading, map-file inspection, the Universal VTT import, the
-arrangement tool and Dungeondraft's own Range for lights were first built by
-thekannen in [battlemap-mcp](https://github.com/thekannen/battlemap-mcp), a
-rebuild of this project's June prototype, and were re-derived here against
-Dungeondraft's own code.
+Whole-request undo and undoable deletes, checkpoints, the arrangement tool and
+shared walls, the floorplan and scene checks, asset pack listing, search and
+preparation, the preview sheets, map-file inspection, the Universal VTT import,
+prefabs and the Map Wizard generator, map style, Dungeondraft's own Range for
+lights and the door default, the bridge token and the pause panel, map resize
+and crop, and Custom Snap Mod support were first built in
+[battlemap-mcp](https://github.com/thekannen/battlemap-mcp) by
+[@thekannen](https://github.com/thekannen), a rebuild of this project, and were
+re-derived here against Dungeondraft's own code.
 
 ## License
 
